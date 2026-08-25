@@ -1,0 +1,1 @@
+"""Construction acceptance tests."""
