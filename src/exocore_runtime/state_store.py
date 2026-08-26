@@ -4,13 +4,18 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+import hashlib
 import json
 from pathlib import Path
 import sqlite3
 from typing import Iterator
 from uuid import UUID
 
-from exocore_runtime.contracts import GenerationSpec, RuntimeEvent
+from exocore_runtime.contracts import (
+    GenerationSpec,
+    RuntimeEvent,
+    generation_identity as contract_generation_identity,
+)
 from exocore_runtime.errors import ConflictError, NotFoundError, RetiredError
 
 
@@ -21,9 +26,11 @@ TERMINAL_REQUEST_STATES = frozenset({"completed", "failed", "cancelled", "indete
 class GenerationRecord:
     binding_id: str
     identity_hash: str
+    runtime_kind: str
     status: str
     provider_session_id: str | None
     provider_model_id: str
+    bootstrap_sent: bool
 
 
 @dataclass(frozen=True)
@@ -90,6 +97,7 @@ class RuntimeStateStore:
                     bootstrap_fingerprint TEXT NOT NULL,
                     config_fingerprint TEXT NOT NULL,
                     provider_session_id TEXT,
+                    bootstrap_sent INTEGER NOT NULL DEFAULT 0 CHECK(bootstrap_sent IN (0, 1)),
                     status TEXT NOT NULL CHECK(status IN ('starting', 'active', 'retired', 'failed')),
                     retired_reason TEXT,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -129,11 +137,61 @@ class RuntimeStateStore:
                 ON events(binding_id, request_id) WHERE is_terminal = 1;
                 """
             )
+            generation_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(generations)").fetchall()
+            }
+            if "bootstrap_sent" not in generation_columns:
+                connection.execute(
+                    "ALTER TABLE generations ADD COLUMN bootstrap_sent INTEGER NOT NULL DEFAULT 0"
+                )
+            connection.execute("PRAGMA secure_delete = ON")
+            if self._migrate_legacy_generation_identities(connection):
+                connection.execute("VACUUM")
+                connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+    @staticmethod
+    def _identity_payload(spec_data: dict[str, object]) -> dict[str, object]:
+        instructions = spec_data.pop("system_instructions", None)
+        spec_data["system_instructions_sha256"] = (
+            hashlib.sha256(str(instructions).strip().encode("utf-8")).hexdigest()
+            if instructions is not None
+            else None
+        )
+        return spec_data
 
     @staticmethod
     def generation_identity(spec: GenerationSpec) -> str:
-        immutable = spec.model_dump(mode="json")
-        return json.dumps(immutable, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        return contract_generation_identity(spec)
+
+    @classmethod
+    def _migrate_legacy_generation_identities(cls, connection: sqlite3.Connection) -> bool:
+        rows = connection.execute(
+            "SELECT binding_id, identity_hash FROM generations"
+        ).fetchall()
+        migrated = False
+        for row in rows:
+            existing = row["identity_hash"]
+            if len(existing) == 64 and all(character in "0123456789abcdef" for character in existing):
+                continue
+            try:
+                legacy = json.loads(existing)
+                if not isinstance(legacy, dict):
+                    raise TypeError("legacy generation identity is not an object")
+                canonical = json.dumps(
+                    cls._identity_payload(legacy),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                ).encode("utf-8")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                canonical = existing.encode("utf-8")
+            connection.execute(
+                "UPDATE generations SET identity_hash = ? WHERE binding_id = ?",
+                (hashlib.sha256(canonical).hexdigest(), row["binding_id"]),
+            )
+            migrated = True
+        return migrated
 
     def ensure_generation(
         self,
@@ -155,8 +213,9 @@ class RuntimeStateStore:
                 """
                 INSERT INTO generations(
                     binding_id, identity_hash, runtime_kind, provider_model_id,
-                    bootstrap_fingerprint, config_fingerprint, provider_session_id, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'starting')
+                    bootstrap_fingerprint, config_fingerprint, provider_session_id,
+                    bootstrap_sent, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'starting')
                 """,
                 (
                     binding_id,
@@ -166,6 +225,7 @@ class RuntimeStateStore:
                     spec.bootstrap_fingerprint,
                     spec.config_fingerprint,
                     spec.provider_session_id,
+                    0,
                 ),
             )
             row = connection.execute(
@@ -200,14 +260,16 @@ class RuntimeStateStore:
             ).fetchone()
             return self._generation_from_row(updated)
 
-    def fail_generation(self, binding_id: str) -> None:
+    def fail_generation(self, binding_id: str, *, include_active: bool = False) -> None:
+        statuses = ("starting", "active") if include_active else ("starting",)
+        placeholders = ",".join("?" for _ in statuses)
         with self._transaction() as connection:
             connection.execute(
-                """
+                f"""
                 UPDATE generations SET status = 'failed', updated_at = CURRENT_TIMESTAMP
-                WHERE binding_id = ? AND status = 'starting'
+                WHERE binding_id = ? AND status IN ({placeholders})
                 """,
-                (binding_id,),
+                (binding_id, *statuses),
             )
 
     def get_generation(self, binding_id: str) -> GenerationRecord:
@@ -238,11 +300,25 @@ class RuntimeStateStore:
                     """,
                     (reason, binding_id),
                 )
+                self._terminalize_open_requests(
+                    connection,
+                    binding_id=binding_id,
+                    prepared_code="retired_before_send",
+                    sent_code="indeterminate_on_retire",
+                )
                 row = connection.execute(
                     "SELECT * FROM generations WHERE binding_id = ?",
                     (binding_id,),
                 ).fetchone()
             return self._generation_from_row(row), changed
+
+    def terminalize_open_requests_for_shutdown(self) -> int:
+        with self._transaction() as connection:
+            return self._terminalize_open_requests(
+                connection,
+                prepared_code="shutdown_before_send",
+                sent_code="indeterminate_on_shutdown",
+            )
 
     def fail_inherited_starting_generations(self) -> int:
         """Make ambiguous generation acquisition from an earlier lifecycle explicit."""
@@ -356,8 +432,25 @@ class RuntimeStateStore:
             ).fetchone()
         return self._request_from_row(row) if row is not None else None
 
-    def mark_sent(self, binding_id: str, request_id: str, owner_id: str) -> RequestRecord:
+    def mark_sent(
+        self,
+        binding_id: str,
+        request_id: str,
+        owner_id: str,
+        *,
+        consume_bootstrap: bool = False,
+    ) -> RequestRecord:
         with self._transaction() as connection:
+            generation = connection.execute(
+                "SELECT status FROM generations WHERE binding_id = ?",
+                (binding_id,),
+            ).fetchone()
+            if generation is None:
+                raise NotFoundError("generation not found")
+            if generation["status"] == "retired":
+                raise RetiredError("generation is retired")
+            if generation["status"] != "active":
+                raise ConflictError("generation is not active")
             cursor = connection.execute(
                 """
                 UPDATE requests
@@ -368,6 +461,17 @@ class RuntimeStateStore:
             )
             if cursor.rowcount != 1:
                 raise ConflictError("request send boundary is already owned")
+            if consume_bootstrap:
+                generation_cursor = connection.execute(
+                    """
+                    UPDATE generations
+                    SET bootstrap_sent = 1, updated_at = CURRENT_TIMESTAMP
+                    WHERE binding_id = ? AND bootstrap_sent = 0
+                    """,
+                    (binding_id,),
+                )
+                if generation_cursor.rowcount != 1:
+                    raise ConflictError("generation bootstrap was already consumed")
             row = connection.execute(
                 "SELECT * FROM requests WHERE binding_id = ? AND request_id = ?",
                 (binding_id, request_id),
@@ -497,6 +601,49 @@ class RuntimeStateStore:
             ).fetchone()
         return int(row["count"])
 
+    @classmethod
+    def _terminalize_open_requests(
+        cls,
+        connection: sqlite3.Connection,
+        *,
+        prepared_code: str,
+        sent_code: str,
+        binding_id: str | None = None,
+    ) -> int:
+        where = "WHERE status IN ('prepared', 'sent')"
+        parameters: tuple[object, ...] = ()
+        if binding_id is not None:
+            where += " AND binding_id = ?"
+            parameters = (binding_id,)
+        rows = connection.execute(
+            f"SELECT * FROM requests {where} ORDER BY binding_id, request_id",
+            parameters,
+        ).fetchall()
+        for row in rows:
+            was_sent = row["status"] == "sent"
+            code = sent_code if was_sent else prepared_code
+            status = "indeterminate" if was_sent else "failed"
+            sequence = int(row["last_sequence"]) + 1
+            payload = cls._canonical_payload({"code": code})
+            connection.execute(
+                """
+                INSERT INTO events(
+                    binding_id, request_id, sequence, event_type, payload_json, is_terminal
+                ) VALUES (?, ?, ?, 'error', ?, 1)
+                """,
+                (row["binding_id"], row["request_id"], sequence, payload),
+            )
+            connection.execute(
+                """
+                UPDATE requests
+                SET status = ?, terminal_code = ?, last_sequence = ?, owner_id = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE binding_id = ? AND request_id = ?
+                """,
+                (status, code, sequence, row["binding_id"], row["request_id"]),
+            )
+        return len(rows)
+
     @staticmethod
     def _canonical_payload(payload: dict[str, object]) -> str:
         return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
@@ -506,9 +653,11 @@ class RuntimeStateStore:
         return GenerationRecord(
             binding_id=row["binding_id"],
             identity_hash=row["identity_hash"],
+            runtime_kind=row["runtime_kind"],
             status=row["status"],
             provider_session_id=row["provider_session_id"],
             provider_model_id=row["provider_model_id"],
+            bootstrap_sent=bool(row["bootstrap_sent"]),
         )
 
     @staticmethod

@@ -20,6 +20,16 @@ class RuntimeProviderAdapter(Protocol):
         spec: GenerationSpec,
     ) -> ProviderGeneration: ...
 
+    async def prepare_turn(
+        self,
+        binding_id: str,
+        request: TurnRequest,
+        *,
+        is_first_turn: bool,
+        generation_identity_hash: str,
+        expected_provider_session_id: str | None,
+    ) -> None: ...
+
     def stream_turn(
         self,
         binding_id: str,
@@ -29,3 +39,5 @@ class RuntimeProviderAdapter(Protocol):
     async def cancel(self, binding_id: str, request_id: str) -> None: ...
 
     async def retire(self, binding_id: str, reason: str) -> None: ...
+
+    async def shutdown(self) -> None: ...

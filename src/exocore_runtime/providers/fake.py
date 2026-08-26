@@ -33,6 +33,17 @@ class DeterministicFakeAdapter:
             observed_model=spec.provider_model_id,
         )
 
+    async def prepare_turn(
+        self,
+        binding_id: str,
+        request: TurnRequest,
+        *,
+        is_first_turn: bool,
+        generation_identity_hash: str,
+        expected_provider_session_id: str | None,
+    ) -> None:
+        return None
+
     async def stream_turn(
         self,
         binding_id: str,
@@ -77,4 +88,7 @@ class DeterministicFakeAdapter:
         self._cancel_signals.setdefault((binding_id, request_id), asyncio.Event()).set()
 
     async def retire(self, binding_id: str, reason: str) -> None:
+        return None
+
+    async def shutdown(self) -> None:
         return None

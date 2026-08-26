@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from contextlib import asynccontextmanager
 import hmac
 from uuid import UUID
 
@@ -12,6 +14,11 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from exocore_runtime.config import RuntimeConfig
 from exocore_runtime.contracts import GenerationSpec, RetireRequest, TurnRequest
 from exocore_runtime.errors import InvalidRequestError, RuntimeGatewayError
+from exocore_runtime.providers.antigravity.adapter import AntigravityAdapter
+from exocore_runtime.providers.antigravity.process import (
+    AgyProcessConfig,
+    AgyProcessSupervisor,
+)
 from exocore_runtime.providers.base import RuntimeProviderAdapter
 from exocore_runtime.providers.fake import DeterministicFakeAdapter
 from exocore_runtime.service import RuntimeService
@@ -20,20 +27,44 @@ from exocore_runtime.state_store import RuntimeStateStore
 
 def create_app(
     config: RuntimeConfig,
-    provider: RuntimeProviderAdapter | None = None,
+    provider: RuntimeProviderAdapter | Mapping[str, RuntimeProviderAdapter] | None = None,
     store: RuntimeStateStore | None = None,
 ) -> FastAPI:
     """Create one isolated app lifecycle; configuration is validated before this call."""
 
     runtime_store = store or RuntimeStateStore(config.state_path)
-    runtime_provider = provider or DeterministicFakeAdapter()
+    if provider is None:
+        process_config = AgyProcessConfig.official(
+            config.agy_executable,
+            init_timeout_seconds=config.agy_init_timeout,
+            idle_timeout_seconds=config.agy_idle_timeout,
+            hard_timeout_seconds=config.agy_hard_timeout,
+            close_timeout_seconds=config.agy_close_timeout,
+        )
+        runtime_provider: RuntimeProviderAdapter | Mapping[str, RuntimeProviderAdapter] = {
+            "fake": DeterministicFakeAdapter(),
+            "antigravity": AntigravityAdapter(
+                config.effective_provider_data_root,
+                AgyProcessSupervisor(process_config),
+                mailbox_ttl_seconds=config.agy_mailbox_ttl,
+            ),
+        }
+    else:
+        runtime_provider = provider
     service = RuntimeService(runtime_store, runtime_provider, (config.token,))
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        yield
+        await service.shutdown()
+
     app = FastAPI(
         title="ExoCore Runtime Gateway",
         version="v1",
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
+        lifespan=lifespan,
     )
     app.state.runtime_service = service
     app.state.runtime_store = runtime_store

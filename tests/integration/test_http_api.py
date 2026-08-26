@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 import socket
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -14,17 +16,19 @@ import uvicorn
 from exocore_runtime.api import create_app
 from exocore_runtime.config import RuntimeConfig
 from exocore_runtime.errors import NotFoundError
+from exocore_runtime.providers.antigravity.adapter import AntigravityAdapter
+from exocore_runtime.providers.antigravity.process import AgyProcessConfig, AgyProcessSupervisor
 from exocore_runtime.providers.fake import DeterministicFakeAdapter
 
 
 class LiveGateway:
-    def __init__(self, state_path: Path, token: str) -> None:
+    def __init__(self, state_path: Path, token: str, provider=None) -> None:
         probe = socket.socket()
         probe.bind(("127.0.0.1", 0))
         self.port = probe.getsockname()[1]
         probe.close()
         self.token = token
-        self.provider = DeterministicFakeAdapter()
+        self.provider = provider or DeterministicFakeAdapter()
         config = RuntimeConfig("127.0.0.1", self.port, token, state_path)
         self.app = create_app(config, provider=self.provider)
         uvicorn_config = uvicorn.Config(
@@ -54,7 +58,7 @@ class LiveGateway:
         if self.thread.is_alive():
             raise RuntimeError("test server did not stop")
 
-    def open_stream_and_disconnect(self, path, body):
+    def open_stream_and_disconnect(self, path, body, before_disconnect=None):
         payload = json.dumps(body).encode("utf-8")
         request = (
             f"POST {path} HTTP/1.1\r\n"
@@ -74,6 +78,8 @@ class LiveGateway:
                     break
                 response_head += chunk
             self.assert_response_started(response_head)
+            if before_disconnect is not None:
+                before_disconnect()
         finally:
             connection.close()
 
@@ -296,6 +302,172 @@ class RuntimeHttpTests(unittest.TestCase):
                 1,
             )
             self.assertEqual(gateway.provider.turn_sends[key], 1)
+
+    def test_antigravity_http_selection_contract_and_fake_control_rejection(self) -> None:
+        binding_id = uuid4()
+        request_id = uuid4()
+        generation_path = f"/v1/generations/{binding_id}"
+        turn_path = f"{generation_path}/turns"
+        fixture = Path(__file__).resolve().parents[1] / "fixtures" / "fake_agy.py"
+        data_root = Path(self.temp.name) / "providers"
+        evidence = Path(self.temp.name) / "evidence.jsonl"
+        supervisor = AgyProcessSupervisor(
+            AgyProcessConfig(
+                command_prefix=(sys.executable, str(fixture)),
+                init_timeout_seconds=1,
+                idle_timeout_seconds=1,
+                hard_timeout_seconds=3,
+                close_timeout_seconds=1,
+                require_official_executable=False,
+                environment_overrides={
+                    "FAKE_AGY_SCENARIO": "normal",
+                    "FAKE_AGY_EVIDENCE": str(evidence),
+                    "PYTHONPATH": str(Path(__file__).resolve().parents[2] / "src"),
+                },
+            )
+        )
+        antigravity = AntigravityAdapter(data_root, supervisor)
+        providers = {"fake": DeterministicFakeAdapter(), "antigravity": antigravity}
+        spec = {
+            "runtime_kind": "antigravity",
+            "provider_model_id": "gemini-3.1-pro-high",
+            "bootstrap_fingerprint": "bootstrap",
+            "config_fingerprint": "config",
+            "system_instructions": "private system contract",
+        }
+        with LiveGateway(self.state_path, self.token, providers) as gateway:
+            unknown = {**spec, "runtime_kind": "unknown"}
+            unknown_status, unknown_body = gateway.request(
+                "PUT", generation_path, unknown, self.token
+            )
+            self.assertEqual(unknown_status, 422)
+            self.assertEqual(json.loads(unknown_body), {"error": "invalid_request"})
+            with self.assertRaises(NotFoundError):
+                gateway.app.state.runtime_store.get_generation(str(binding_id))
+
+            status, body = gateway.request("PUT", generation_path, spec, self.token)
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(body)["status"], "active")
+            rejected = {
+                "request_id": str(request_id),
+                "user_message": "must reject",
+                "bootstrap_context": {"history": []},
+                "behavior": "exception",
+            }
+            rejected_status, rejected_body = gateway.request(
+                "POST", turn_path, rejected, self.token
+            )
+            self.assertEqual(rejected_status, 400)
+            self.assertEqual(json.loads(rejected_body), {"error": "invalid_request"})
+            self.assertIsNone(
+                gateway.app.state.runtime_store.get_request(
+                    str(binding_id), str(request_id)
+                )
+            )
+
+            turn = {
+                "request_id": str(uuid4()),
+                "user_message": "hello through HTTP",
+                "bootstrap_context": {"history": []},
+                "ephemeral_current": "http-ephemeral-canary",
+            }
+            turn_status, turn_body = gateway.request(
+                "POST", turn_path, turn, self.token
+            )
+            self.assertEqual(turn_status, 200)
+            events = [json.loads(line) for line in turn_body.splitlines()]
+            self.assertEqual(events[-1]["event_type"], "done")
+            self.assertNotIn("http-ephemeral-canary", turn_body.decode("utf-8"))
+
+    def test_antigravity_http_owner_disconnect_closes_process_tree(self) -> None:
+        binding_id = uuid4()
+        request_id = uuid4()
+        generation_path = f"/v1/generations/{binding_id}"
+        turn_path = f"{generation_path}/turns"
+        fixture = Path(__file__).resolve().parents[1] / "fixtures" / "fake_agy.py"
+        evidence_path = Path(self.temp.name) / "disconnect-evidence.jsonl"
+        supervisor = AgyProcessSupervisor(
+            AgyProcessConfig(
+                command_prefix=(sys.executable, str(fixture)),
+                init_timeout_seconds=1,
+                idle_timeout_seconds=30,
+                hard_timeout_seconds=60,
+                close_timeout_seconds=0.5,
+                require_official_executable=False,
+                environment_overrides={
+                    "FAKE_AGY_SCENARIO": "slow_tree",
+                    "FAKE_AGY_EVIDENCE": str(evidence_path),
+                    "PYTHONPATH": str(Path(__file__).resolve().parents[2] / "src"),
+                },
+            )
+        )
+        antigravity = AntigravityAdapter(
+            Path(self.temp.name) / "disconnect-providers",
+            supervisor,
+        )
+        providers = {"fake": DeterministicFakeAdapter(), "antigravity": antigravity}
+        spec = {
+            "runtime_kind": "antigravity",
+            "provider_model_id": "gemini-3.1-pro-high",
+            "bootstrap_fingerprint": "bootstrap",
+            "config_fingerprint": "config",
+            "system_instructions": "private system contract",
+        }
+        turn = {
+            "request_id": str(request_id),
+            "user_message": "disconnect owner",
+            "bootstrap_context": {"history": []},
+        }
+        with LiveGateway(self.state_path, self.token, providers) as gateway:
+            self.assertEqual(
+                gateway.request("PUT", generation_path, spec, self.token)[0],
+                200,
+            )
+            process_ids = []
+
+            def wait_until_provider_child_exists():
+                for _ in range(300):
+                    if evidence_path.exists():
+                        evidence = [
+                            json.loads(line)
+                            for line in evidence_path.read_text(encoding="utf-8").splitlines()
+                        ]
+                        spawns = [item for item in evidence if item["kind"] == "spawn"]
+                        children = [item for item in evidence if item["kind"] == "child"]
+                        if spawns and children:
+                            process_ids.extend(
+                                (spawns[-1]["pid"], children[-1]["child_pid"])
+                            )
+                            return
+                    time.sleep(0.01)
+                raise AssertionError("provider child did not start before disconnect")
+
+            gateway.open_stream_and_disconnect(
+                turn_path,
+                turn,
+                wait_until_provider_child_exists,
+            )
+            for _ in range(300):
+                record = gateway.app.state.runtime_store.get_request(
+                    str(binding_id),
+                    str(request_id),
+                )
+                if record is not None and record.status == "cancelled":
+                    break
+                time.sleep(0.01)
+            self.assertIsNotNone(record)
+            self.assertEqual(record.status, "cancelled")
+            self.assertEqual(len(process_ids), 2)
+            self.assertNotIn(str(binding_id), antigravity._prepared)
+            self.assertNotIn(str(binding_id), supervisor._sessions)
+            for process_id in process_ids:
+                check = subprocess.run(
+                    ["tasklist", "/FI", f"PID eq {process_id}", "/FO", "CSV", "/NH"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertNotIn(str(process_id), check.stdout)
 
     def test_restart_replays_completed_request_without_provider_send(self) -> None:
         binding_id = uuid4()

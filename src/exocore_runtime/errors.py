@@ -36,3 +36,26 @@ class RetiredError(RuntimeGatewayError):
 class ProviderProtocolError(RuntimeGatewayError):
     code = "provider_protocol_error"
     status_code = 502
+
+
+class ProviderAdapterError(RuntimeGatewayError):
+    """Safe typed provider failure with no raw process or request projection."""
+
+    status_code = 502
+
+    def __init__(
+        self,
+        code: str,
+        *,
+        terminal_status: str = "failed",
+        fatal_generation: bool = False,
+        status_code: int = 502,
+    ) -> None:
+        super().__init__(code)
+        self.code = code
+        self.terminal_status = terminal_status
+        self.fatal_generation = fatal_generation
+        self.status_code = status_code
+
+    def __str__(self) -> str:
+        return self.code

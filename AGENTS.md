@@ -10,7 +10,9 @@ This sibling service is an outbound provider runtime. It must remain independent
 - Never log or persist the bearer token.
 - SQLite state and its event journal are the durable truth; in-memory adapters are not.
 - A `sqlite3.Connection` context manager commits/rolls back but does not close the handle. Every connection owner must close explicitly so Windows restart/cleanup can release the database file.
-- Milestone A uses only the deterministic fake provider. Real CLI/provider work requires a later explicit checkpoint.
+- Milestone A fake behavior remains a deterministic test surface. Milestone B adds only the official AGY 1.1.20-compatible adapter; never add API-key, SDK, Vertex, shell, or unofficial executable fallback.
+- AGY profiles, custom agents, hooks, workspace, temp/cache roots, and mailbox artifacts must remain generation-private under the configured provider data root. Retire deletes only that generation root.
+- SQLite owns send/bootstrap/terminal truth. AGY process ownership must survive Gateway hard exit through the Windows Job Object, and shutdown/retire must terminalize open requests before cleanup.
 
 ## Commands
 
