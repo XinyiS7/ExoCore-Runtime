@@ -51,6 +51,8 @@ class ProviderAdapterError(RuntimeGatewayError):
         fatal_generation: bool = False,
         status_code: int = 502,
     ) -> None:
+        if terminal_status not in {"failed", "indeterminate"}:
+            raise ValueError("invalid provider terminal status")
         super().__init__(code)
         self.code = code
         self.terminal_status = terminal_status

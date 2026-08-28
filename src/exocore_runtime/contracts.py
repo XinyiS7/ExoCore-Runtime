@@ -8,7 +8,7 @@ import json
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, model_validator
 
 
 class StrictContract(BaseModel):
@@ -140,6 +140,22 @@ class RuntimeEvent(StrictContract):
     ]
     payload: dict[str, Any] = Field(default_factory=dict)
     terminal: bool = False
+    terminal_status: Literal[
+        "completed",
+        "failed",
+        "cancelled",
+        "indeterminate",
+    ] | None = None
+    bootstrap_consumed: StrictBool | None = None
+
+    @model_validator(mode="after")
+    def validate_terminal_truth(self) -> "RuntimeEvent":
+        if self.terminal:
+            if self.terminal_status is None or self.bootstrap_consumed is None:
+                raise ValueError("terminal events require complete terminal truth")
+        elif self.terminal_status is not None or self.bootstrap_consumed is not None:
+            raise ValueError("non-terminal events cannot carry terminal truth")
+        return self
 
 
 class CancelResult(StrictContract):

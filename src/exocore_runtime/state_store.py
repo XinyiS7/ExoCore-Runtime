@@ -127,6 +127,10 @@ class RuntimeStateStore:
                     event_type TEXT NOT NULL,
                     payload_json TEXT NOT NULL,
                     is_terminal INTEGER NOT NULL CHECK(is_terminal IN (0, 1)),
+                    terminal_status TEXT CHECK(terminal_status IN (
+                        'completed', 'failed', 'cancelled', 'indeterminate'
+                    )),
+                    bootstrap_consumed INTEGER CHECK(bootstrap_consumed IN (0, 1)),
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     PRIMARY KEY(binding_id, request_id, sequence),
                     FOREIGN KEY(binding_id, request_id)
@@ -144,6 +148,24 @@ class RuntimeStateStore:
             if "bootstrap_sent" not in generation_columns:
                 connection.execute(
                     "ALTER TABLE generations ADD COLUMN bootstrap_sent INTEGER NOT NULL DEFAULT 0"
+                )
+            event_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(events)").fetchall()
+            }
+            if "terminal_status" not in event_columns:
+                connection.execute(
+                    """
+                    ALTER TABLE events ADD COLUMN terminal_status TEXT
+                    CHECK(terminal_status IN ('completed', 'failed', 'cancelled', 'indeterminate'))
+                    """
+                )
+            if "bootstrap_consumed" not in event_columns:
+                connection.execute(
+                    """
+                    ALTER TABLE events ADD COLUMN bootstrap_consumed INTEGER
+                    CHECK(bootstrap_consumed IN (0, 1))
+                    """
                 )
             connection.execute("PRAGMA secure_delete = ON")
             if self._migrate_legacy_generation_identities(connection):
@@ -349,13 +371,14 @@ class RuntimeStateStore:
                     sort_keys=True,
                     separators=(",", ":"),
                 )
-                connection.execute(
-                    """
-                    INSERT INTO events(
-                        binding_id, request_id, sequence, event_type, payload_json, is_terminal
-                    ) VALUES (?, ?, ?, 'error', ?, 1)
-                    """,
-                    (row["binding_id"], row["request_id"], sequence, payload),
+                self._insert_terminal_event(
+                    connection,
+                    binding_id=row["binding_id"],
+                    request_id=row["request_id"],
+                    sequence=sequence,
+                    event_type="error",
+                    payload_json=payload,
+                    terminal_status="indeterminate",
                 )
                 connection.execute(
                     """
@@ -521,6 +544,8 @@ class RuntimeStateStore:
             event_type,
             json.loads(payload_json),
             False,
+            None,
+            None,
         )
 
     def append_terminal(
@@ -543,41 +568,38 @@ class RuntimeStateStore:
             if row is None:
                 raise NotFoundError("request not found")
             record = self._request_from_row(row)
-            if record.terminal:
-                event_row = connection.execute(
+            changed = not record.terminal
+            if changed:
+                sequence = record.last_sequence + 1
+                self._insert_terminal_event(
+                    connection,
+                    binding_id=binding_id,
+                    request_id=request_id,
+                    sequence=sequence,
+                    event_type=event_type,
+                    payload_json=payload_json,
+                    terminal_status=status,
+                )
+                connection.execute(
                     """
-                    SELECT * FROM events
-                    WHERE binding_id = ? AND request_id = ? AND is_terminal = 1
+                    UPDATE requests
+                    SET status = ?, terminal_code = ?, last_sequence = ?, owner_id = NULL,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE binding_id = ? AND request_id = ?
                     """,
-                    (binding_id, request_id),
-                ).fetchone()
-                return self._event_from_row(event_row), False
-            sequence = record.last_sequence + 1
-            connection.execute(
+                    (status, terminal_code, sequence, binding_id, request_id),
+                )
+            event_row = connection.execute(
                 """
-                INSERT INTO events(
-                    binding_id, request_id, sequence, event_type, payload_json, is_terminal
-                ) VALUES (?, ?, ?, ?, ?, 1)
+                SELECT * FROM events
+                WHERE binding_id = ? AND request_id = ? AND is_terminal = 1
                 """,
-                (binding_id, request_id, sequence, event_type, payload_json),
-            )
-            connection.execute(
-                """
-                UPDATE requests
-                SET status = ?, terminal_code = ?, last_sequence = ?, owner_id = NULL,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE binding_id = ? AND request_id = ?
-                """,
-                (status, terminal_code, sequence, binding_id, request_id),
-            )
-        return self._runtime_event(
-            binding_id,
-            request_id,
-            sequence,
-            event_type,
-            json.loads(payload_json),
-            True,
-        ), True
+                (binding_id, request_id),
+            ).fetchone()
+            if event_row is None:
+                raise ConflictError("terminal request is missing its durable event")
+            event = self._event_from_row(event_row)
+        return event, changed
 
     def read_events(self, binding_id: str, request_id: str) -> list[RuntimeEvent]:
         with self._read_connection() as connection:
@@ -625,13 +647,14 @@ class RuntimeStateStore:
             status = "indeterminate" if was_sent else "failed"
             sequence = int(row["last_sequence"]) + 1
             payload = cls._canonical_payload({"code": code})
-            connection.execute(
-                """
-                INSERT INTO events(
-                    binding_id, request_id, sequence, event_type, payload_json, is_terminal
-                ) VALUES (?, ?, ?, 'error', ?, 1)
-                """,
-                (row["binding_id"], row["request_id"], sequence, payload),
+            cls._insert_terminal_event(
+                connection,
+                binding_id=row["binding_id"],
+                request_id=row["request_id"],
+                sequence=sequence,
+                event_type="error",
+                payload_json=payload,
+                terminal_status=status,
             )
             connection.execute(
                 """
@@ -643,6 +666,43 @@ class RuntimeStateStore:
                 (status, code, sequence, row["binding_id"], row["request_id"]),
             )
         return len(rows)
+
+    @staticmethod
+    def _insert_terminal_event(
+        connection: sqlite3.Connection,
+        *,
+        binding_id: str,
+        request_id: str,
+        sequence: int,
+        event_type: str,
+        payload_json: str,
+        terminal_status: str,
+    ) -> None:
+        if terminal_status not in TERMINAL_REQUEST_STATES:
+            raise ValueError("invalid terminal request status")
+        generation = connection.execute(
+            "SELECT bootstrap_sent FROM generations WHERE binding_id = ?",
+            (binding_id,),
+        ).fetchone()
+        if generation is None:
+            raise NotFoundError("generation not found")
+        connection.execute(
+            """
+            INSERT INTO events(
+                binding_id, request_id, sequence, event_type, payload_json, is_terminal,
+                terminal_status, bootstrap_consumed
+            ) VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+            """,
+            (
+                binding_id,
+                request_id,
+                sequence,
+                event_type,
+                payload_json,
+                terminal_status,
+                int(bool(generation["bootstrap_sent"])),
+            ),
+        )
 
     @staticmethod
     def _canonical_payload(payload: dict[str, object]) -> str:
@@ -680,6 +740,8 @@ class RuntimeStateStore:
         event_type: str,
         payload: dict[str, object],
         terminal: bool,
+        terminal_status: str | None,
+        bootstrap_consumed: bool | None,
     ) -> RuntimeEvent:
         return RuntimeEvent(
             binding_id=UUID(binding_id),
@@ -688,14 +750,23 @@ class RuntimeStateStore:
             event_type=event_type,
             payload=payload,
             terminal=terminal,
+            terminal_status=terminal_status,
+            bootstrap_consumed=bootstrap_consumed,
         )
 
     def _event_from_row(self, row: sqlite3.Row) -> RuntimeEvent:
+        terminal = bool(row["is_terminal"])
+        terminal_status = row["terminal_status"]
+        bootstrap_value = row["bootstrap_consumed"]
+        if terminal and (terminal_status is None or bootstrap_value is None):
+            raise ConflictError("legacy terminal event lacks durable truth")
         return self._runtime_event(
             row["binding_id"],
             row["request_id"],
             int(row["sequence"]),
             row["event_type"],
             json.loads(row["payload_json"]),
-            bool(row["is_terminal"]),
+            terminal,
+            terminal_status,
+            bool(bootstrap_value) if bootstrap_value is not None else None,
         )

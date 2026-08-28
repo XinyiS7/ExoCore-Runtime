@@ -53,6 +53,14 @@ class RuntimeServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual([event.sequence for event in first], list(range(1, len(first) + 1)))
         self.assertEqual(sum(event.terminal for event in first), 1)
+        self.assertEqual(first[-1].terminal_status, "completed")
+        self.assertIs(first[-1].bootstrap_consumed, False)
+        self.assertTrue(
+            all(
+                event.terminal_status is None and event.bootstrap_consumed is None
+                for event in first[:-1]
+            )
+        )
         self.assertEqual(self.store.terminal_count(str(self.binding_id), str(request.request_id)), 1)
 
     async def test_completed_request_replays_after_new_service_lifecycle(self) -> None:
@@ -95,6 +103,8 @@ class RuntimeServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(replay[-1].payload, {"code": "indeterminate_after_restart"})
         self.assertEqual(replay[-1].event_type, "error")
         self.assertTrue(replay[-1].terminal)
+        self.assertEqual(replay[-1].terminal_status, "indeterminate")
+        self.assertIs(replay[-1].bootstrap_consumed, False)
         self.assertEqual(
             self.store.get_request(str(self.binding_id), str(request.request_id)).status,
             "indeterminate",
@@ -123,6 +133,8 @@ class RuntimeServiceTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(record.status, expected_status)
                 self.assertEqual(sum(event.terminal for event in events), 1)
                 self.assertEqual(events[-1].event_type, "error")
+                self.assertEqual(events[-1].terminal_status, expected_status)
+                self.assertIs(events[-1].bootstrap_consumed, False)
                 self.assertEqual(
                     self.store.terminal_count(str(self.binding_id), str(request.request_id)),
                     1,
@@ -145,6 +157,8 @@ class RuntimeServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(first_cancel.changed)
         self.assertFalse(second_cancel.changed)
         self.assertEqual(events[-1].payload, {"code": "cancelled"})
+        self.assertEqual(events[-1].terminal_status, "cancelled")
+        self.assertIs(events[-1].bootstrap_consumed, False)
         self.assertNotIn("late-content", str(events))
         self.assertEqual(self.store.terminal_count(str(self.binding_id), str(request.request_id)), 1)
 

@@ -166,6 +166,15 @@ class RuntimeHttpTests(unittest.TestCase):
             self.assertEqual([event["sequence"] for event in events], list(range(1, 5)))
             self.assertEqual(sum(event["terminal"] for event in events), 1)
             self.assertEqual(events[-1]["event_type"], "done")
+            self.assertEqual(events[-1]["terminal_status"], "completed")
+            self.assertIs(events[-1]["bootstrap_consumed"], False)
+            self.assertTrue(
+                all(
+                    event["terminal_status"] is None
+                    and event["bootstrap_consumed"] is None
+                    for event in events[:-1]
+                )
+            )
             self.assertNotIn(self.token.encode(), first_body)
             self.assertIn(b"[REDACTED]", first_body)
             rejected_status, rejected_body = gateway.request(
@@ -297,6 +306,8 @@ class RuntimeHttpTests(unittest.TestCase):
             self.assertEqual(owner_status, 200)
             owner_events = [json.loads(line) for line in owner_body.splitlines()]
             self.assertEqual(owner_events[-1]["payload"], {"code": "cancelled"})
+            self.assertEqual(owner_events[-1]["terminal_status"], "cancelled")
+            self.assertIs(owner_events[-1]["bootstrap_consumed"], False)
             self.assertEqual(
                 gateway.app.state.runtime_store.terminal_count(*key),
                 1,
