@@ -10,15 +10,16 @@ import unittest
 from unittest.mock import patch
 from uuid import uuid4
 
+from pydantic import ValidationError
+
 from exocore_runtime.contracts import GenerationSpec, TurnRequest
-from exocore_runtime.errors import InvalidRequestError, ProviderAdapterError
+from exocore_runtime.errors import ConflictError, ProviderAdapterError
 from exocore_runtime.providers.antigravity.adapter import AntigravityAdapter
 from exocore_runtime.providers.antigravity.process import AgyProcessConfig, AgyProcessSupervisor
 from exocore_runtime.providers.antigravity.renderer import (
     DENY_POLICY,
     render_agent_markdown,
 )
-from exocore_runtime.providers.fake import DeterministicFakeAdapter
 from exocore_runtime.service import RuntimeService
 from exocore_runtime.state_store import RuntimeStateStore
 
@@ -38,9 +39,7 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.system_canary = "SYSTEM-INSTRUCTIONS-PRIVATE-CANARY"
         self.spec = GenerationSpec(
             runtime_kind="antigravity",
-            provider_model_id="gemini-3.1-pro-high",
             bootstrap_fingerprint="bootstrap-1",
-            config_fingerprint="config-1",
             system_instructions=self.system_canary,
         )
         self.services = []
@@ -79,10 +78,20 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
         )
         service = RuntimeService(
             RuntimeStateStore(self.state_path),
-            {"fake": DeterministicFakeAdapter(), "antigravity": adapter},
+            {"antigravity": adapter},
         )
         self.services.append(service)
         return service, adapter
+
+    def turn(self, *, thinking="auto", bootstrap=None, ephemeral=None, request_id=None):
+        return TurnRequest(
+            request_id=request_id or uuid4(),
+            user_message="CURRENT-USER-CANARY",
+            requested_model_id="gemini-3.1-pro-preview",
+            requested_thinking_level=thinking,
+            bootstrap_context=bootstrap,
+            ephemeral_current=ephemeral,
+        )
 
     def evidence(self):
         if not self.evidence_path.exists():
@@ -92,32 +101,34 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
             for line in self.evidence_path.read_text(encoding="utf-8").splitlines()
         ]
 
+    def session_id(self, service):
+        return service.store.get_generation(str(self.binding_id)).provider_session_id
+
     async def test_first_same_process_restart_resume_and_retire(self) -> None:
         service, adapter = self.build_service()
         generation = await service.ensure_generation(self.binding_id, self.spec)
-        self.assertEqual(generation.status, "active")
-        self.assertEqual(
-            generation.provider_session_id,
-            "11111111-2222-3333-4444-555555555555",
-        )
-        first = TurnRequest(
-            request_id=uuid4(),
-            user_message="CURRENT-USER-CANARY first",
-            bootstrap_context={"continuity_anchor": "ANCHOR-ONE"},
-            ephemeral_current="EPHEMERAL-CANARY first-only",
+        self.assertEqual(generation.status, "starting")
+        self.assertFalse(any(item["kind"] == "spawn" for item in self.evidence()))
+        first_session = None
+
+        first = self.turn(
+            bootstrap={"continuity_anchor": "ANCHOR-ONE"},
+            ephemeral="EPHEMERAL-CANARY first-only",
         )
         first_events = await collect(service, self.binding_id, first)
         self.assertEqual(first_events[-1].event_type, "done")
         self.assertEqual(
-            [event.event_type for event in first_events],
-            ["lifecycle", "lifecycle", "thinking_delta", "content_delta", "usage", "done"],
+            [event.event_type for event in first_events[:2]],
+            ["generation_activated", "execution_resolved"],
         )
+        self.assertEqual(
+            self.session_id(service),
+            "11111111-2222-3333-4444-555555555555",
+        )
+        first_session = self.session_id(service)
         self.assertTrue(service.store.get_generation(str(self.binding_id)).bootstrap_sent)
 
-        second = TurnRequest(
-            request_id=uuid4(),
-            user_message="CURRENT-USER-CANARY second",
-        )
+        second = self.turn()
         second_events = await collect(service, self.binding_id, second)
         self.assertEqual(second_events[-1].event_type, "done")
         replay = await collect(service, self.binding_id, second)
@@ -181,13 +192,12 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.services.remove(service)
         restarted, restarted_adapter = self.build_service()
         resumed = await restarted.ensure_generation(self.binding_id, self.spec)
-        self.assertEqual(resumed.provider_session_id, generation.provider_session_id)
-        third = TurnRequest(
-            request_id=uuid4(),
-            user_message="CURRENT-USER-CANARY resume",
-        )
+        self.assertEqual(resumed.status, "active")
+        self.assertEqual(resumed.provider_session_id, first_session)
+        third = self.turn(thinking="low")
         third_events = await collect(restarted, self.binding_id, third)
         self.assertEqual(third_events[-1].event_type, "done")
+        self.assertEqual(self.session_id(restarted), first_session)
         spawns = [item for item in self.evidence() if item["kind"] == "spawn"]
         self.assertEqual(len(spawns), 2)
         resume_argv = spawns[-1]["argv"]
@@ -197,7 +207,9 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
                 "--agent",
                 f"exocore-runtime-{str(self.binding_id).replace('-', '')}",
                 "--model",
-                "gemini-3.1-pro-high",
+                "gemini-3.1-pro-low",
+                "--effort",
+                "low",
                 "--input-format",
                 "stream-json",
                 "--output-format",
@@ -206,7 +218,7 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
                 "3s",
                 "--sandbox",
                 "--conversation",
-                generation.provider_session_id,
+                first_session,
             ],
         )
         forbidden = {
@@ -232,36 +244,26 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
             await collect(
                 restarted,
                 self.binding_id,
-                TurnRequest(request_id=uuid4(), user_message="after retire"),
+                self.turn(),
             )
         self.assertEqual(restarted_adapter.supervisor.quota_snapshot, {"weekly": 84, "5h": 93})
 
-    async def test_antigravity_rejects_fake_control_and_later_bootstrap_before_request_row(self) -> None:
+    async def test_fake_request_control_is_rejected_and_later_bootstrap_has_no_row(self) -> None:
         service, _ = self.build_service()
         await service.ensure_generation(self.binding_id, self.spec)
-        bad_behavior = TurnRequest(
-            request_id=uuid4(),
-            user_message="bad",
-            bootstrap_context={"history": []},
-            behavior="exception",
-        )
-        with self.assertRaises(InvalidRequestError):
-            service.preflight_turn(self.binding_id, bad_behavior)
-        self.assertIsNone(
-            service.store.get_request(str(self.binding_id), str(bad_behavior.request_id))
-        )
-        first = TurnRequest(
-            request_id=uuid4(),
-            user_message="first",
-            bootstrap_context={"history": []},
-        )
+        with self.assertRaises(ValidationError):
+            TurnRequest(
+                request_id=uuid4(),
+                user_message="bad",
+                requested_model_id="gemini-3.1-pro-preview",
+                requested_thinking_level="auto",
+                bootstrap_context={"history": []},
+                behavior="exception",
+            )
+        first = self.turn(bootstrap={"history": []})
         await collect(service, self.binding_id, first)
-        later_bootstrap = TurnRequest(
-            request_id=uuid4(),
-            user_message="later",
-            bootstrap_context={"history": []},
-        )
-        with self.assertRaises(Exception):
+        later_bootstrap = self.turn(bootstrap={"history": []})
+        with self.assertRaises(ConflictError):
             service.preflight_turn(self.binding_id, later_bootstrap)
         self.assertIsNone(
             service.store.get_request(str(self.binding_id), str(later_bootstrap.request_id))
@@ -270,12 +272,7 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
     async def test_stale_presend_mailbox_fails_once_then_generation_remains_usable(self) -> None:
         service, adapter = self.build_service()
         await service.ensure_generation(self.binding_id, self.spec)
-        request = TurnRequest(
-            request_id=uuid4(),
-            user_message="stale request",
-            bootstrap_context={"history": []},
-            ephemeral_current="STALE-PRIVATE-CANARY",
-        )
+        request = self.turn(bootstrap={"history": []}, ephemeral="STALE-PRIVATE-CANARY")
         mailbox = adapter._mailbox(str(self.binding_id))
         mailbox.prepare(str(request.request_id), request.ephemeral_current)
         pending = json.loads(mailbox.pending_path.read_text(encoding="utf-8"))
@@ -289,16 +286,13 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
             "failed",
         )
         generation = service.store.get_generation(str(self.binding_id))
-        self.assertEqual(generation.status, "active")
+        self.assertEqual(generation.status, "starting")
+        self.assertIsNone(generation.provider_session_id)
         self.assertFalse(generation.bootstrap_sent)
         self.assertFalse(mailbox.pending_path.exists())
         self.assertFalse((mailbox.root / "claimed.json").exists())
 
-        next_request = TurnRequest(
-            request_id=uuid4(),
-            user_message="usable after stale",
-            bootstrap_context={"history": []},
-        )
+        next_request = self.turn(bootstrap={"history": []})
         next_events = await collect(service, self.binding_id, next_request)
         self.assertEqual(next_events[-1].event_type, "done")
         persisted = b"".join(
@@ -308,20 +302,22 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn(b"STALE-PRIVATE-CANARY", persisted)
 
-    async def test_explicit_ensure_identity_failure_removes_pending_plaintext_before_refusal(self) -> None:
+    async def test_identity_failure_fails_before_stdin_and_removes_pending_plaintext(self) -> None:
         service, adapter = self.build_service()
         await service.ensure_generation(self.binding_id, self.spec)
         mailbox = adapter._mailbox(str(self.binding_id))
-        request_id = str(uuid4())
-        mailbox.prepare(request_id, "ENSURE-IDENTITY-PRIVATE-CANARY")
+        request = self.turn(bootstrap={"history": []}, ephemeral="ENSURE-IDENTITY-PRIVATE-CANARY")
+        mailbox.prepare(str(request.request_id), request.ephemeral_current)
         identity_path = mailbox.root / "identity.json"
         identity = json.loads(identity_path.read_text(encoding="utf-8"))
         identity["generation_id"] = "tampered-generation"
         identity_path.write_text(json.dumps(identity), encoding="utf-8")
 
-        with self.assertRaises(ProviderAdapterError) as caught:
-            await service.ensure_generation(self.binding_id, self.spec)
-        self.assertEqual(caught.exception.code, "ephemeral_identity_mismatch")
+        events = await collect(service, self.binding_id, request)
+        self.assertEqual(events[-1].payload, {"code": "ephemeral_identity_mismatch"})
+        generation = service.store.get_generation(str(self.binding_id))
+        self.assertEqual(generation.status, "starting")
+        self.assertIsNone(generation.provider_session_id)
         self.assertFalse(mailbox.pending_path.exists())
         self.assertFalse((mailbox.root / "claimed.json").exists())
         self.assertNotIn(str(self.binding_id), adapter.supervisor._sessions)
@@ -335,12 +331,7 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
     async def test_mailbox_identity_failure_removes_existing_plaintext_and_closes_generation(self) -> None:
         service, adapter = self.build_service()
         await service.ensure_generation(self.binding_id, self.spec)
-        request = TurnRequest(
-            request_id=uuid4(),
-            user_message="identity failure",
-            bootstrap_context={"history": []},
-            ephemeral_current="IDENTITY-PRIVATE-CANARY",
-        )
+        request = self.turn(bootstrap={"history": []}, ephemeral="IDENTITY-PRIVATE-CANARY")
         mailbox = adapter._mailbox(str(self.binding_id))
         mailbox.prepare(str(request.request_id), request.ephemeral_current)
         identity_path = mailbox.root / "identity.json"
@@ -350,10 +341,9 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
 
         events = await collect(service, self.binding_id, request)
         self.assertEqual(events[-1].payload, {"code": "ephemeral_identity_mismatch"})
-        self.assertEqual(
-            service.store.get_generation(str(self.binding_id)).status,
-            "failed",
-        )
+        generation = service.store.get_generation(str(self.binding_id))
+        self.assertEqual(generation.status, "starting")
+        self.assertIsNone(generation.provider_session_id)
         self.assertFalse(mailbox.pending_path.exists())
         self.assertFalse((mailbox.root / "claimed.json").exists())
         self.assertNotIn(str(self.binding_id), adapter.supervisor._sessions)
@@ -364,31 +354,24 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn(b"IDENTITY-PRIVATE-CANARY", persisted)
 
-    async def test_post_mailbox_presend_failure_removes_plaintext_and_fails_generation(self) -> None:
+    async def test_post_mailbox_presend_failure_removes_plaintext_and_closes_process(self) -> None:
         service, adapter = self.build_service()
         await service.ensure_generation(self.binding_id, self.spec)
-        request = TurnRequest(
-            request_id=uuid4(),
-            user_message="render failure",
-            bootstrap_context={"history": []},
-            ephemeral_current="POST-WRITE-PRIVATE-CANARY",
-        )
+        request = self.turn(bootstrap={"history": []}, ephemeral="POST-WRITE-PRIVATE-CANARY")
         with patch(
             "exocore_runtime.providers.antigravity.adapter.render_stdin_line",
             side_effect=TypeError("fixture render failure"),
         ):
             events = await collect(service, self.binding_id, request)
         self.assertEqual(events[-1].payload, {"code": "agy_turn_prepare_failed"})
-        self.assertEqual(
-            service.store.get_generation(str(self.binding_id)).status,
-            "failed",
-        )
-        self.assertFalse(
-            service.store.get_generation(str(self.binding_id)).bootstrap_sent
-        )
+        generation = service.store.get_generation(str(self.binding_id))
+        self.assertEqual(generation.status, "starting")
+        self.assertIsNone(generation.provider_session_id)
+        self.assertFalse(generation.bootstrap_sent)
         mailbox = adapter._mailbox(str(self.binding_id))
         self.assertFalse(mailbox.pending_path.exists())
         self.assertFalse((mailbox.root / "claimed.json").exists())
+        self.assertNotIn(str(self.binding_id), adapter.supervisor._sessions)
         persisted = b"".join(
             path.read_bytes()
             for path in self.data_root.rglob("*")
@@ -417,17 +400,12 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
                 self.evidence_path = scenario_root / "evidence.jsonl"
                 service, _ = self.build_service(scenario)
                 spec = self.spec.model_copy(
-                    update={
-                        "bootstrap_fingerprint": f"bootstrap-{scenario}",
-                        "config_fingerprint": f"config-{scenario}",
-                    }
+                    update={"bootstrap_fingerprint": f"bootstrap-{scenario}"}
                 )
                 await service.ensure_generation(binding_id, spec)
-                request = TurnRequest(
-                    request_id=uuid4(),
-                    user_message="fault",
-                    bootstrap_context={"history": []},
-                    ephemeral_current="EPHEMERAL-CANARY fault",
+                request = self.turn(
+                    bootstrap={"history": []},
+                    ephemeral="EPHEMERAL-CANARY fault",
                 )
                 events = await collect(service, binding_id, request)
                 durable = service.store.get_request(str(binding_id), str(request.request_id))
@@ -444,12 +422,13 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
                 self.data_root = original_data
                 self.evidence_path = original_evidence
 
-    async def test_explicit_ensure_restores_security_artifacts_before_resume_spawn(self) -> None:
+    async def test_resume_restores_security_artifacts_before_resume_spawn(self) -> None:
         service, _ = self.build_service()
         await service.ensure_generation(self.binding_id, self.spec)
+        await collect(service, self.binding_id, self.turn(bootstrap={"history": []}))
+        generation_root = next(self.data_root.iterdir())
         await service.shutdown()
         self.services.remove(service)
-        generation_root = next(self.data_root.iterdir())
         profile = generation_root / "profile"
         hooks_path = profile / ".gemini" / "config" / "hooks.json"
         settings_path = profile / ".gemini" / "antigravity-cli" / "settings.json"
@@ -459,7 +438,6 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
             json.dumps({"modelProvider": "account_default", "permissions": {"deny": []}}),
             encoding="utf-8",
         )
-        agent_path.write_text("tampered custom agent", encoding="utf-8")
         (generation_root / "workspace" / "pollution.txt").write_text(
             "workspace canary",
             encoding="utf-8",
@@ -467,7 +445,12 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
 
         restarted, _ = self.build_service()
         await restarted.ensure_generation(self.binding_id, self.spec)
+        await collect(restarted, self.binding_id, self.turn(thinking="low"))
         self.assertEqual(len([item for item in self.evidence() if item["kind"] == "spawn"]), 2)
+        self.assertEqual(
+            self.session_id(restarted),
+            "11111111-2222-3333-4444-555555555555",
+        )
         hooks = json.loads(hooks_path.read_text(encoding="utf-8"))
         self.assertEqual(set(hooks), {"exocore-runtime-ephemeral"})
         settings = json.loads(settings_path.read_text(encoding="utf-8"))
@@ -479,6 +462,7 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
     async def test_lazy_prepare_fails_before_spawn_when_custom_agent_is_unverifiable(self) -> None:
         service, _ = self.build_service()
         await service.ensure_generation(self.binding_id, self.spec)
+        await collect(service, self.binding_id, self.turn(bootstrap={"history": []}))
         await service.shutdown()
         self.services.remove(service)
         generation_root = next(self.data_root.iterdir())
@@ -488,60 +472,49 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
         agent_path = next(
             (profile / ".gemini" / "config" / "agents").glob("*/agent.md")
         )
-        original_hooks = hooks_path.read_bytes()
-        original_settings = settings_path.read_bytes()
         original_agent = agent_path.read_bytes()
 
         restarted, adapter = self.build_service()
         durable_generation = restarted.store.get_generation(str(self.binding_id))
-        identity_hash = durable_generation.identity_hash
-        expected_session = durable_generation.provider_session_id
-        for path, replacement, expected_code in (
-            (hooks_path, b"{}", "agy_hook_policy_invalid"),
-            (
-                settings_path,
-                b'{"modelProvider":"account_default","permissions":{"deny":[]}}',
-                "agy_deny_policy_invalid",
-            ),
-            (agent_path, b"tampered custom agent", "agy_custom_agent_invalid"),
-        ):
-            with self.subTest(path=path.name):
-                path.write_bytes(replacement)
-                with self.assertRaises(ProviderAdapterError) as caught:
-                    adapter._load_layout(
-                        str(self.binding_id),
-                        identity_hash,
-                        expected_session,
-                    )
-                self.assertEqual(caught.exception.code, expected_code)
-                if path == hooks_path:
-                    path.write_bytes(original_hooks)
-                elif path == settings_path:
-                    path.write_bytes(original_settings)
-                else:
-                    path.write_bytes(original_agent)
+        options = adapter.resolve_execution(
+            "gemini-3.1-pro-preview",
+            "auto",
+        ).process_options
+
+        # Hooks and settings are security artifacts that the v2 adapter
+        # restores before verification: tampering is silently repaired at load.
+        hooks_path.write_bytes(b"{}")
+        settings_path.write_text(
+            json.dumps({"modelProvider": "account_default", "permissions": {"deny": []}}),
+            encoding="utf-8",
+        )
+        adapter._load_layout(durable_generation, options)
+        hooks = json.loads(hooks_path.read_text(encoding="utf-8"))
+        self.assertEqual(set(hooks), {"exocore-runtime-ephemeral"})
+        settings = json.loads(settings_path.read_text(encoding="utf-8"))
+        self.assertEqual(settings["permissions"]["deny"], list(DENY_POLICY))
+
+        # Workspace pollution is also repaired, never fatal, at load.
         pollution = generation_root / "workspace" / "pollution.txt"
         pollution.write_text("workspace canary", encoding="utf-8")
+        adapter._load_layout(durable_generation, options)
+        self.assertFalse(any((generation_root / "workspace").iterdir()))
+
+        # Canonical agent markdown is identity material: any tamper is fatal
+        # before the security restore may run.
+        agent_path.write_text("tampered custom agent", encoding="utf-8")
         with self.assertRaises(ProviderAdapterError) as caught:
-            adapter._load_layout(
-                str(self.binding_id),
-                identity_hash,
-                expected_session,
-            )
-        self.assertEqual(caught.exception.code, "agy_workspace_invalid")
-        pollution.unlink()
+            adapter._load_layout(durable_generation, options)
+        self.assertEqual(caught.exception.code, "agy_custom_agent_invalid")
+        agent_path.write_bytes(original_agent)
 
         metadata_path = generation_root / "generation.json"
         original_metadata = metadata_path.read_bytes()
         metadata = json.loads(original_metadata)
-        metadata["provider_model_id"] = "tampered-provider-model"
+        metadata["bootstrap_fingerprint"] = "tampered-bootstrap"
         metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
         with self.assertRaises(ProviderAdapterError) as caught:
-            adapter._load_layout(
-                str(self.binding_id),
-                identity_hash,
-                expected_session,
-            )
+            adapter._load_layout(durable_generation, options)
         self.assertEqual(caught.exception.code, "agy_artifact_identity_mismatch")
         metadata_path.write_bytes(original_metadata)
 
@@ -549,12 +522,8 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
         metadata["provider_session_id"] = "tampered-provider-session"
         metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
         with self.assertRaises(ProviderAdapterError) as caught:
-            adapter._load_layout(
-                str(self.binding_id),
-                identity_hash,
-                expected_session,
-            )
-        self.assertEqual(caught.exception.code, "agy_artifact_identity_mismatch")
+            adapter._load_layout(durable_generation, options)
+        self.assertEqual(caught.exception.code, "agy_artifact_session_conflict")
         metadata_path.write_bytes(original_metadata)
 
         malicious_agent = render_agent_markdown(
@@ -568,31 +537,26 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
         ).hexdigest()
         metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
         with self.assertRaises(ProviderAdapterError) as caught:
-            adapter._load_layout(
-                str(self.binding_id),
-                identity_hash,
-                expected_session,
-            )
+            adapter._load_layout(durable_generation, options)
         self.assertEqual(caught.exception.code, "agy_custom_agent_invalid")
         metadata_path.write_bytes(original_metadata)
 
         agent_path.write_text("tampered custom agent", encoding="utf-8")
-        request = TurnRequest(
-            request_id=uuid4(),
-            user_message="lazy resume",
-            bootstrap_context={"history": []},
-        )
+        request = self.turn()
         events = await collect(restarted, self.binding_id, request)
         self.assertEqual(events[-1].payload, {"code": "agy_custom_agent_invalid"})
+        # The failed lazy turn must not disturb the already-durable session:
+        # known continuity is preserved and never silently replaced.
         self.assertEqual(
-            restarted.store.get_generation(str(self.binding_id)).status,
-            "failed",
+            restarted.store.get_generation(str(self.binding_id)).provider_session_id,
+            "11111111-2222-3333-4444-555555555555",
         )
         self.assertEqual(len([item for item in self.evidence() if item["kind"] == "spawn"]), 1)
         self.assertNotIn(str(self.binding_id), adapter.supervisor._sessions)
 
     async def test_gateway_and_parent_secrets_are_not_inherited_by_agy(self) -> None:
         service, _ = self.build_service()
+        await service.ensure_generation(self.binding_id, self.spec)
         with patch.dict(
             os.environ,
             {
@@ -600,23 +564,15 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
                 "OTHER_SECRET_VALUE": "parent-secret-canary",
             },
         ):
-            await service.ensure_generation(self.binding_id, self.spec)
+            await collect(service, self.binding_id, self.turn(bootstrap={"history": []}))
         spawn = next(item for item in self.evidence() if item["kind"] == "spawn")
         self.assertEqual(spawn["sensitive_env_present"], [])
 
     async def test_concurrent_distinct_first_turns_terminalize_bootstrap_loser(self) -> None:
         service, _ = self.build_service()
         await service.ensure_generation(self.binding_id, self.spec)
-        first = TurnRequest(
-            request_id=uuid4(),
-            user_message="first contender",
-            bootstrap_context={"anchor": "first"},
-        )
-        second = TurnRequest(
-            request_id=uuid4(),
-            user_message="second contender",
-            bootstrap_context={"anchor": "second"},
-        )
+        first = self.turn(bootstrap={"anchor": "first"})
+        second = self.turn(bootstrap={"anchor": "second"})
         first_events, second_events = await asyncio.gather(
             collect(service, self.binding_id, first),
             collect(service, self.binding_id, second),
@@ -634,42 +590,44 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(len([item for item in self.evidence() if item["kind"] == "turn"]), 1)
 
-    async def test_concurrent_adapter_ensure_launches_one_cli_process(self) -> None:
-        _, adapter = self.build_service()
+    async def test_concurrent_ensure_is_state_only_and_first_turn_launches_once(self) -> None:
+        service, adapter = self.build_service()
         acquired = await asyncio.gather(
-            adapter.ensure_generation(str(self.binding_id), self.spec),
-            adapter.ensure_generation(str(self.binding_id), self.spec),
+            service.ensure_generation(self.binding_id, self.spec),
+            service.ensure_generation(self.binding_id, self.spec),
         )
-        self.assertEqual(acquired[0].provider_session_id, acquired[1].provider_session_id)
+        self.assertEqual([result.status for result in acquired], ["starting", "starting"])
+        self.assertEqual(
+            len([item for item in self.evidence() if item["kind"] == "spawn"]),
+            0,
+        )
+        await collect(service, self.binding_id, self.turn(bootstrap={"history": []}))
         self.assertEqual(
             len([item for item in self.evidence() if item["kind"] == "spawn"]),
             1,
         )
+        self.assertIsNotNone(adapter.supervisor.quota_snapshot)
 
-    async def test_model_mismatch_fails_generation_before_any_user_stdin(self) -> None:
+    async def test_model_mismatch_fails_before_any_user_stdin(self) -> None:
         service, _ = self.build_service("model_mismatch")
-        with self.assertRaises(ProviderAdapterError) as caught:
-            await service.ensure_generation(self.binding_id, self.spec)
-        self.assertEqual(caught.exception.code, "agy_model_mismatch")
-        self.assertEqual(
-            service.store.get_generation(str(self.binding_id)).status,
-            "failed",
-        )
+        await service.ensure_generation(self.binding_id, self.spec)
+        events = await collect(service, self.binding_id, self.turn(bootstrap={"history": []}))
+        self.assertEqual(events[-1].payload, {"code": "agy_model_mismatch"})
+        self.assertEqual(events[-1].terminal_status, "failed")
+        generation = service.store.get_generation(str(self.binding_id))
+        self.assertEqual(generation.status, "starting")
+        self.assertIsNone(generation.provider_session_id)
         self.assertFalse(any(item["kind"] == "turn" for item in self.evidence()))
 
     async def test_delayed_result_tail_is_rejected_before_next_stdin_send(self) -> None:
         service, _ = self.build_service("delayed_event_after_result")
         await service.ensure_generation(self.binding_id, self.spec)
-        first = TurnRequest(
-            request_id=uuid4(),
-            user_message="first",
-            bootstrap_context={"history": []},
-        )
+        first = self.turn(bootstrap={"history": []})
         first_events = await collect(service, self.binding_id, first)
         self.assertEqual(first_events[-1].event_type, "done")
         (self.root / "tail-release").touch()
         await asyncio.sleep(0.1)
-        second = TurnRequest(request_id=uuid4(), user_message="second")
+        second = self.turn()
         second_events = await collect(service, self.binding_id, second)
         self.assertEqual(second_events[-1].payload, {"code": "agy_unsolicited_output"})
         self.assertEqual(
@@ -700,14 +658,16 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
                 self.evidence_path = scenario_root / "evidence.jsonl"
                 service, _ = self.build_service(scenario)
                 spec = self.spec.model_copy(
-                    update={
-                        "bootstrap_fingerprint": f"bootstrap-{scenario}",
-                        "config_fingerprint": f"config-{scenario}",
-                    }
+                    update={"bootstrap_fingerprint": f"bootstrap-{scenario}"}
                 )
-                with self.assertRaises(ProviderAdapterError) as caught:
-                    await service.ensure_generation(uuid4(), spec)
-                self.assertEqual(caught.exception.code, expected_code)
+                binding_id = uuid4()
+                await service.ensure_generation(binding_id, spec)
+                events = await collect(
+                    service,
+                    binding_id,
+                    self.turn(bootstrap={"history": []}),
+                )
+                self.assertEqual(events[-1].payload, {"code": expected_code})
                 self.assertFalse(any(item["kind"] == "turn" for item in self.evidence()))
                 if scenario == "version_timeout":
                     process_id = next(
@@ -727,19 +687,17 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
     async def test_shutdown_attempts_mailbox_cleanup_when_supervisor_cleanup_reports_failure(self) -> None:
         service, adapter = self.build_service()
         await service.ensure_generation(self.binding_id, self.spec)
-        request = TurnRequest(
-            request_id=uuid4(),
-            user_message="shutdown prepare",
-            bootstrap_context={"history": []},
-            ephemeral_current="SHUTDOWN-PRIVATE-CANARY",
-        )
+        request = self.turn(bootstrap={"history": []}, ephemeral="SHUTDOWN-PRIVATE-CANARY")
         generation = service.store.get_generation(str(self.binding_id))
+        resolution = adapter.resolve_execution(
+            request.requested_model_id,
+            request.requested_thinking_level,
+        )
         await adapter.prepare_turn(
-            str(self.binding_id),
+            generation,
             request,
+            resolution.process_options,
             is_first_turn=True,
-            generation_identity_hash=generation.identity_hash,
-            expected_provider_session_id=generation.provider_session_id,
         )
         mailbox = adapter._mailbox(str(self.binding_id))
         self.assertTrue(mailbox.pending_path.exists())
@@ -758,11 +716,7 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
     async def test_shutdown_terminalizes_sent_turn_before_process_cleanup(self) -> None:
         service, _ = self.build_service("slow_tree")
         await service.ensure_generation(self.binding_id, self.spec)
-        request = TurnRequest(
-            request_id=uuid4(),
-            user_message="shutdown",
-            bootstrap_context={"history": []},
-        )
+        request = self.turn(bootstrap={"history": []})
         owner = asyncio.create_task(collect(service, self.binding_id, request))
         for _ in range(200):
             record = service.store.get_request(str(self.binding_id), str(request.request_id))
@@ -785,15 +739,8 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
     async def test_retire_terminalizes_sent_and_queued_prepared_requests(self) -> None:
         service, _ = self.build_service("slow_tree")
         await service.ensure_generation(self.binding_id, self.spec)
-        first = TurnRequest(
-            request_id=uuid4(),
-            user_message="sent before retire",
-            bootstrap_context={"history": []},
-        )
-        second = TurnRequest(
-            request_id=uuid4(),
-            user_message="prepared before retire",
-        )
+        first = self.turn(bootstrap={"history": []})
+        second = self.turn()
         first_owner = asyncio.create_task(collect(service, self.binding_id, first))
         for _ in range(200):
             record = service.store.get_request(str(self.binding_id), str(first.request_id))
@@ -857,11 +804,7 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
     async def test_owner_task_cancellation_closes_process_tree_and_both_ownership_maps(self) -> None:
         service, adapter = self.build_service("slow_tree")
         await service.ensure_generation(self.binding_id, self.spec)
-        request = TurnRequest(
-            request_id=uuid4(),
-            user_message="owner disconnect",
-            bootstrap_context={"history": []},
-        )
+        request = self.turn(bootstrap={"history": []})
         owner = asyncio.create_task(collect(service, self.binding_id, request))
         process_ids = []
         for _ in range(200):
@@ -920,11 +863,7 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
     async def test_idempotent_old_cancel_does_not_cancel_new_active_request(self) -> None:
         service, _ = self.build_service("slow_tree")
         await service.ensure_generation(self.binding_id, self.spec)
-        old = TurnRequest(
-            request_id=uuid4(),
-            user_message="old request",
-            bootstrap_context={"history": []},
-        )
+        old = self.turn(bootstrap={"history": []})
         old_owner = asyncio.create_task(collect(service, self.binding_id, old))
         for _ in range(200):
             record = service.store.get_request(str(self.binding_id), str(old.request_id))
@@ -934,7 +873,7 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
         await service.cancel(self.binding_id, old.request_id)
         await asyncio.wait_for(old_owner, timeout=3)
 
-        current = TurnRequest(request_id=uuid4(), user_message="current request")
+        current = self.turn()
         current_owner = asyncio.create_task(collect(service, self.binding_id, current))
         for _ in range(200):
             record = service.store.get_request(str(self.binding_id), str(current.request_id))
@@ -955,11 +894,7 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
     async def test_cancel_kills_fixture_process_tree_and_persists_cancelled(self) -> None:
         service, _ = self.build_service("slow_tree")
         await service.ensure_generation(self.binding_id, self.spec)
-        request = TurnRequest(
-            request_id=uuid4(),
-            user_message="slow",
-            bootstrap_context={"history": []},
-        )
+        request = self.turn(bootstrap={"history": []})
         owner = asyncio.create_task(collect(service, self.binding_id, request))
         child_pid = None
         for _ in range(200):

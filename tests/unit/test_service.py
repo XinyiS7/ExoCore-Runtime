@@ -16,6 +16,16 @@ async def collect(service, binding_id, request):
     return [event async for event in service.stream_turn(binding_id, request)]
 
 
+def turn(*, request_id=None, thinking="auto", bootstrap=None):
+    return TurnRequest(
+        request_id=request_id or uuid4(),
+        user_message="hello",
+        requested_model_id="gemini-3.1-pro-preview",
+        requested_thinking_level=thinking,
+        bootstrap_context=bootstrap,
+    )
+
+
 class RuntimeServiceTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -24,26 +34,33 @@ class RuntimeServiceTests(unittest.IsolatedAsyncioTestCase):
         self.service = RuntimeService(self.store, self.provider)
         self.binding_id = uuid4()
         self.spec = GenerationSpec(
-            provider_model_id="fake-model",
+            runtime_kind="fake",
             bootstrap_fingerprint="bootstrap-1",
-            config_fingerprint="config-1",
+            system_instructions="system",
         )
         await self.service.ensure_generation(self.binding_id, self.spec)
 
     async def asyncTearDown(self) -> None:
+        await self.service.shutdown()
         self.temp.cleanup()
 
-    async def test_generation_put_is_idempotent_and_identity_is_immutable(self) -> None:
+    async def test_generation_put_is_state_only_idempotent_and_identity_is_immutable(self) -> None:
         repeated = await self.service.ensure_generation(self.binding_id, self.spec)
-        self.assertEqual(repeated.status, "active")
-        self.assertEqual(self.provider.generation_acquisitions[str(self.binding_id)], 1)
-        changed = self.spec.model_copy(update={"provider_model_id": "other-model"})
+        self.assertEqual(repeated.status, "starting")
+        # Staging is an idempotent artifact ensure while the generation is
+        # starting; the process itself must never be spawned by a PUT.
+        self.assertEqual(self.provider.generation_stages[str(self.binding_id)], 2)
+        self.assertEqual(self.provider.process_spawns[str(self.binding_id)], 0)
+        changed = self.spec.model_copy(update={"bootstrap_fingerprint": "bootstrap-2"})
         with self.assertRaises(ConflictError):
             await self.service.ensure_generation(self.binding_id, changed)
-        self.assertEqual(self.provider.generation_acquisitions[str(self.binding_id)], 1)
+        changed_system = self.spec.model_copy(update={"system_instructions": "other"})
+        with self.assertRaises(ConflictError):
+            await self.service.ensure_generation(self.binding_id, changed_system)
+        self.assertEqual(self.provider.generation_stages[str(self.binding_id)], 2)
 
     async def test_completed_request_replays_without_second_send(self) -> None:
-        request = TurnRequest(request_id=uuid4(), user_message="hello")
+        request = turn(bootstrap={"history": []})
         first = await collect(self.service, self.binding_id, request)
         second = await collect(self.service, self.binding_id, request)
         self.assertEqual(first, second)
@@ -54,7 +71,11 @@ class RuntimeServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([event.sequence for event in first], list(range(1, len(first) + 1)))
         self.assertEqual(sum(event.terminal for event in first), 1)
         self.assertEqual(first[-1].terminal_status, "completed")
-        self.assertIs(first[-1].bootstrap_consumed, False)
+        self.assertIs(first[-1].bootstrap_consumed, True)
+        self.assertEqual(
+            [event.event_type for event in first[:2]],
+            ["generation_activated", "execution_resolved"],
+        )
         self.assertTrue(
             all(
                 event.terminal_status is None and event.bootstrap_consumed is None
@@ -64,39 +85,70 @@ class RuntimeServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.terminal_count(str(self.binding_id), str(request.request_id)), 1)
 
     async def test_completed_request_replays_after_new_service_lifecycle(self) -> None:
-        request = TurnRequest(request_id=uuid4(), user_message="restart replay")
+        request = turn(bootstrap={"history": []})
         first = await collect(self.service, self.binding_id, request)
+        await self.service.shutdown()
         restarted_provider = DeterministicFakeAdapter()
         restarted = RuntimeService(RuntimeStateStore(self.store.path), restarted_provider)
         replay = await collect(restarted, self.binding_id, request)
         self.assertEqual(first, replay)
         self.assertEqual(sum(restarted_provider.turn_sends.values()), 0)
+        await restarted.shutdown()
 
     async def test_prepared_request_can_continue_after_restart(self) -> None:
-        request = TurnRequest(request_id=uuid4(), user_message="prepared")
+        request = turn(bootstrap={"history": []})
         payload_hash = self.service._request_hash(request)
         self.store.claim_request(
             str(self.binding_id),
             str(request.request_id),
             payload_hash,
+            request.requested_model_id,
+            request.requested_thinking_level,
             "dead-instance",
         )
+        # No graceful shutdown: the owner process is presumed crashed, so the
+        # durable prepared row is reclaimed by the restarted service owner.
         restarted_provider = DeterministicFakeAdapter()
         restarted = RuntimeService(RuntimeStateStore(self.store.path), restarted_provider)
         events = await collect(restarted, self.binding_id, request)
         self.assertEqual(events[-1].event_type, "done")
         self.assertEqual(sum(restarted_provider.turn_sends.values()), 1)
+        await restarted.shutdown()
 
     async def test_sent_without_terminal_becomes_indeterminate_after_restart(self) -> None:
-        request = TurnRequest(request_id=uuid4(), user_message="sent")
+        request = turn(bootstrap={"history": []})
         payload_hash = self.service._request_hash(request)
         self.store.claim_request(
             str(self.binding_id),
             str(request.request_id),
             payload_hash,
+            request.requested_model_id,
+            request.requested_thinking_level,
             "dead-instance",
         )
-        self.store.mark_sent(str(self.binding_id), str(request.request_id), "dead-instance")
+        resolution = self.provider.resolve_execution(
+            request.requested_model_id,
+            request.requested_thinking_level,
+        )
+        self.store.freeze_resolution(
+            str(self.binding_id),
+            str(request.request_id),
+            "dead-instance",
+            resolution,
+        )
+        self.store.activate_generation(
+            str(self.binding_id),
+            f"session-{self.binding_id}",
+            str(request.request_id),
+        )
+        self.store.mark_sent(
+            str(self.binding_id),
+            str(request.request_id),
+            "dead-instance",
+            consume_bootstrap=True,
+        )
+        # No graceful shutdown: the owner process is presumed crashed, so only
+        # restart recovery may make the sent row indeterminate.
         restarted_provider = DeterministicFakeAdapter()
         restarted = RuntimeService(RuntimeStateStore(self.store.path), restarted_provider)
         replay = await collect(restarted, self.binding_id, request)
@@ -104,12 +156,13 @@ class RuntimeServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(replay[-1].event_type, "error")
         self.assertTrue(replay[-1].terminal)
         self.assertEqual(replay[-1].terminal_status, "indeterminate")
-        self.assertIs(replay[-1].bootstrap_consumed, False)
+        self.assertIs(replay[-1].bootstrap_consumed, True)
         self.assertEqual(
             self.store.get_request(str(self.binding_id), str(request.request_id)).status,
             "indeterminate",
         )
         self.assertEqual(sum(restarted_provider.turn_sends.values()), 0)
+        await restarted.shutdown()
 
     async def test_abnormal_provider_streams_have_one_non_success_terminal(self) -> None:
         cases = {
@@ -123,29 +176,25 @@ class RuntimeServiceTests(unittest.IsolatedAsyncioTestCase):
         }
         for behavior, expected_status in cases.items():
             with self.subTest(behavior=behavior):
-                request = TurnRequest(
-                    request_id=uuid4(),
-                    user_message=behavior,
-                    behavior=behavior,
-                )
-                events = await collect(self.service, self.binding_id, request)
-                record = self.store.get_request(str(self.binding_id), str(request.request_id))
+                binding_id = uuid4()
+                await self.service.ensure_generation(binding_id, self.spec)
+                request = turn(bootstrap={"history": []})
+                self.provider.set_behavior(str(request.request_id), behavior)
+                events = await collect(self.service, binding_id, request)
+                record = self.store.get_request(str(binding_id), str(request.request_id))
                 self.assertEqual(record.status, expected_status)
                 self.assertEqual(sum(event.terminal for event in events), 1)
                 self.assertEqual(events[-1].event_type, "error")
                 self.assertEqual(events[-1].terminal_status, expected_status)
-                self.assertIs(events[-1].bootstrap_consumed, False)
+                self.assertIs(events[-1].bootstrap_consumed, True)
                 self.assertEqual(
-                    self.store.terminal_count(str(self.binding_id), str(request.request_id)),
+                    self.store.terminal_count(str(binding_id), str(request.request_id)),
                     1,
                 )
 
     async def test_cancel_wins_and_late_events_cannot_replace_terminal(self) -> None:
-        request = TurnRequest(
-            request_id=uuid4(),
-            user_message="cancel",
-            behavior="cancel_late",
-        )
+        request = turn(bootstrap={"history": []})
+        self.provider.set_behavior(str(request.request_id), "cancel_late")
         task = asyncio.create_task(collect(self.service, self.binding_id, request))
         for _ in range(100):
             if self.provider.turn_sends[(str(self.binding_id), str(request.request_id))]:
@@ -158,25 +207,25 @@ class RuntimeServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(second_cancel.changed)
         self.assertEqual(events[-1].payload, {"code": "cancelled"})
         self.assertEqual(events[-1].terminal_status, "cancelled")
-        self.assertIs(events[-1].bootstrap_consumed, False)
+        self.assertIs(events[-1].bootstrap_consumed, True)
         self.assertNotIn("late-content", str(events))
         self.assertEqual(self.store.terminal_count(str(self.binding_id), str(request.request_id)), 1)
 
     async def test_retire_is_idempotent_rejects_new_turn_and_preserves_replay(self) -> None:
-        completed = TurnRequest(request_id=uuid4(), user_message="before retire")
+        completed = turn(bootstrap={"history": []})
         original = await collect(self.service, self.binding_id, completed)
         first = await self.service.retire(self.binding_id, "done")
         second = await self.service.retire(self.binding_id, "again")
         self.assertTrue(first.changed)
         self.assertFalse(second.changed)
-        new_request = TurnRequest(request_id=uuid4(), user_message="after retire")
+        new_request = turn()
         with self.assertRaises(RetiredError):
             self.service.preflight_turn(self.binding_id, new_request)
         replay = await collect(self.service, self.binding_id, completed)
         self.assertEqual(original, replay)
 
     async def test_concurrent_duplicate_claim_sends_once_and_returns_same_journal(self) -> None:
-        request = TurnRequest(request_id=uuid4(), user_message="concurrent")
+        request = turn(bootstrap={"history": []})
         first, second = await asyncio.gather(
             collect(self.service, self.binding_id, request),
             collect(self.service, self.binding_id, request),
@@ -188,11 +237,8 @@ class RuntimeServiceTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_duplicate_observer_has_no_poll_limit_and_its_cancellation_preserves_owner(self) -> None:
-        request = TurnRequest(
-            request_id=uuid4(),
-            user_message="long owner",
-            behavior="cancel_late",
-        )
+        request = turn(bootstrap={"history": []})
+        self.provider.set_behavior(str(request.request_id), "cancel_late")
         owner = asyncio.create_task(collect(self.service, self.binding_id, request))
         key = (str(self.binding_id), str(request.request_id))
         for _ in range(100):
@@ -239,8 +285,9 @@ class RuntimeServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.terminal_count(*key), 1)
 
     async def test_different_requests_keep_sequence_and_terminal_isolated(self) -> None:
-        good = TurnRequest(request_id=uuid4(), user_message="good")
-        bad = TurnRequest(request_id=uuid4(), user_message="bad", behavior="exception")
+        good = turn(bootstrap={"history": []})
+        bad = turn()
+        self.provider.set_behavior(str(bad.request_id), "exception")
         good_events, bad_events = await asyncio.gather(
             collect(self.service, self.binding_id, good),
             collect(self.service, self.binding_id, bad),

@@ -61,8 +61,8 @@ class RuntimeConfig:
     def __repr__(self) -> str:
         return (
             f"RuntimeConfig(host={self.host!r}, port={self.port!r}, "
-            f"token='[REDACTED]', state_path={self.state_path!r}, "
-            f"provider_data_root={self.effective_provider_data_root!r})"
+            "token='[REDACTED]', state_path='[PRIVATE]', "
+            "provider_data_root='[PRIVATE]')"
         )
 
     @property

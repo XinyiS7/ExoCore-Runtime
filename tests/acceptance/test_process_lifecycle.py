@@ -37,7 +37,7 @@ class ProcessLifecycleTests(unittest.TestCase):
             try:
                 for _ in range(200):
                     try:
-                        with urlopen(f"http://127.0.0.1:{port}/v1/health", timeout=1) as response:
+                        with urlopen(f"http://127.0.0.1:{port}/v2/health", timeout=1) as response:
                             health = json.loads(response.read())
                         break
                     except OSError:
@@ -47,18 +47,32 @@ class ProcessLifecycleTests(unittest.TestCase):
                         time.sleep(0.01)
                 else:
                     self.fail("gateway did not become healthy")
-                self.assertEqual(health, {"status": "ok", "schema_version": "v1"})
+                self.assertEqual(
+                    health,
+                    {
+                        "status": "ok",
+                        "schema_version": "v2",
+                        "protocol": "subscription-runtime-v2",
+                        "capabilities": [
+                            "generation_state_only",
+                            "durable_control_events",
+                            "requested_effective_execution",
+                            "strict_session_resume",
+                        ],
+                    },
+                )
                 binding_id = "11111111-1111-1111-1111-111111111111"
                 invalid_payload = json.dumps(
                     {
-                        "provider_model_id": "fake-model",
+                        "schema_version": "v2",
+                        "runtime_kind": "fake",
                         "bootstrap_fingerprint": "bootstrap",
-                        "config_fingerprint": "config",
+                        "system_instructions": "system",
                         "extra": "process-secret-canary",
                     }
                 ).encode("utf-8")
                 invalid_request = Request(
-                    f"http://127.0.0.1:{port}/v1/generations/{binding_id}",
+                    f"http://127.0.0.1:{port}/v2/generations/{binding_id}",
                     data=invalid_payload,
                     headers={
                         "Authorization": "Bearer process-secret-canary",

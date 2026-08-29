@@ -12,7 +12,13 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from exocore_runtime.config import RuntimeConfig
-from exocore_runtime.contracts import GenerationSpec, RetireRequest, TurnRequest
+from exocore_runtime.contracts import (
+    PROTOCOL_VERSION,
+    RUNTIME_CAPABILITIES,
+    GenerationSpec,
+    RetireRequest,
+    TurnRequest,
+)
 from exocore_runtime.errors import InvalidRequestError, RuntimeGatewayError
 from exocore_runtime.providers.antigravity.adapter import AntigravityAdapter
 from exocore_runtime.providers.antigravity.process import (
@@ -60,7 +66,7 @@ def create_app(
 
     app = FastAPI(
         title="ExoCore Runtime Gateway",
-        version="v1",
+        version="v2",
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
@@ -72,7 +78,7 @@ def create_app(
 
     @app.middleware("http")
     async def authenticate_non_health(request: Request, call_next):
-        if request.url.path == "/v1/health":
+        if request.url.path == "/v2/health":
             return await call_next(request)
         authorization = request.headers.get("authorization")
         expected = f"Bearer {config.token}"
@@ -115,16 +121,21 @@ def create_app(
             headers=headers,
         )
 
-    @app.get("/v1/health")
-    async def health() -> dict[str, str]:
-        return {"status": "ok", "schema_version": "v1"}
+    @app.get("/v2/health")
+    async def health() -> dict[str, object]:
+        return {
+            "status": "ok",
+            "schema_version": PROTOCOL_VERSION,
+            "protocol": "subscription-runtime-v2",
+            "capabilities": list(RUNTIME_CAPABILITIES),
+        }
 
-    @app.put("/v1/generations/{binding_id}")
+    @app.put("/v2/generations/{binding_id}")
     async def ensure_generation(binding_id: UUID, spec: GenerationSpec):
         reject_secret_echo(spec)
         return await service.ensure_generation(binding_id, spec)
 
-    @app.post("/v1/generations/{binding_id}/turns")
+    @app.post("/v2/generations/{binding_id}/turns")
     async def stream_turn(binding_id: UUID, turn: TurnRequest) -> StreamingResponse:
         reject_secret_echo(turn)
         service.preflight_turn(binding_id, turn)
@@ -135,11 +146,11 @@ def create_app(
 
         return StreamingResponse(lines(), media_type="application/x-ndjson")
 
-    @app.post("/v1/generations/{binding_id}/turns/{request_id}/cancel")
+    @app.post("/v2/generations/{binding_id}/turns/{request_id}/cancel")
     async def cancel(binding_id: UUID, request_id: UUID):
         return await service.cancel(binding_id, request_id)
 
-    @app.post("/v1/generations/{binding_id}/retire")
+    @app.post("/v2/generations/{binding_id}/retire")
     async def retire(binding_id: UUID, body: RetireRequest | None = None):
         if body is not None:
             reject_secret_echo(body)

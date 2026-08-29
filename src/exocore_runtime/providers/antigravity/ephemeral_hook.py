@@ -95,7 +95,7 @@ class EphemeralMailbox:
         payload = ephemeral_current or ""
         payload_hash = _payload_hash(payload)
         expected = {
-            "schema_version": "v1",
+            "schema_version": "v2",
             "binding_id": self.binding_id,
             "generation_id": self.generation_id,
             "request_id": request_id,
@@ -201,7 +201,7 @@ class EphemeralMailbox:
     def _ensure_identity(self) -> None:
         identity_path = self.root / _IDENTITY_FILE
         expected = {
-            "schema_version": "v1",
+            "schema_version": "v2",
             "binding_id": self.binding_id,
             "generation_id": self.generation_id,
             "ttl_seconds": self.ttl_seconds,
@@ -220,7 +220,7 @@ class EphemeralMailbox:
         payload_hash: str,
     ) -> None:
         expected = {
-            "schema_version": "v1",
+            "schema_version": "v2",
             "binding_id": self.binding_id,
             "generation_id": self.generation_id,
             "request_id": request_id,
@@ -266,7 +266,7 @@ def consume_for_hook(root: Path) -> dict[str, object]:
         ):
             raise ProviderAdapterError("ephemeral_pending_mismatch")
         receipt = {
-            "schema_version": "v1",
+            "schema_version": "v2",
             "binding_id": pending["binding_id"],
             "generation_id": pending["generation_id"],
             "request_id": pending["request_id"],

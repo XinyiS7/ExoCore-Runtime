@@ -1,4 +1,4 @@
-"""Provider-neutral generation and turn lifecycle orchestration."""
+"""Runtime v2 generation, resolution, activation, and turn orchestration."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from uuid import UUID, uuid4
 
 from exocore_runtime.contracts import (
     CancelResult,
-    FakeBehavior,
+    EffectiveResolution,
     GenerationResult,
     GenerationSpec,
     ProviderEvent,
@@ -20,14 +20,13 @@ from exocore_runtime.contracts import (
 )
 from exocore_runtime.errors import (
     ConflictError,
-    InvalidRequestError,
     ProviderAdapterError,
     ProviderProtocolError,
     RetiredError,
 )
 from exocore_runtime.event_journal import EventJournal
 from exocore_runtime.providers.base import RuntimeProviderAdapter
-from exocore_runtime.state_store import RuntimeStateStore
+from exocore_runtime.state_store import RequestRecord, RuntimeStateStore
 
 
 _NONTERMINAL_TYPES = frozenset({"thinking_delta", "content_delta", "lifecycle", "usage"})
@@ -35,7 +34,7 @@ _TERMINAL_TYPES = frozenset({"done", "error"})
 
 
 class RuntimeService:
-    """Coordinates adapters through durable state without owning canonical chat data."""
+    """Coordinates durable v2 truth without owning canonical ExoCore chat data."""
 
     def __init__(
         self,
@@ -44,14 +43,9 @@ class RuntimeService:
         secret_values: tuple[str, ...] = (),
     ) -> None:
         self.store = store
-        self.providers = (
-            dict(provider)
-            if isinstance(provider, Mapping)
-            else {"fake": provider}
-        )
+        self.providers = dict(provider) if isinstance(provider, Mapping) else {"fake": provider}
         self.journal = EventJournal(store, secret_values)
         self.instance_id = str(uuid4())
-        self.recovered_starting_generations = self.store.fail_inherited_starting_generations()
         self.recovered_sent_requests = self.store.recover_after_restart()
         self._claim_locks: dict[tuple[str, str], asyncio.Lock] = {}
         self._claim_locks_guard = asyncio.Lock()
@@ -59,42 +53,20 @@ class RuntimeService:
         self._generation_turn_locks_guard = asyncio.Lock()
         self._shutting_down = False
 
-    async def ensure_generation(
-        self,
-        binding_id: UUID,
-        spec: GenerationSpec,
-    ) -> GenerationResult:
+    async def ensure_generation(self, binding_id: UUID, spec: GenerationSpec) -> GenerationResult:
+        """Create or confirm state only; never acquire or reconcile a process."""
         if self._shutting_down:
             raise ConflictError("runtime is shutting down")
         binding = str(binding_id)
         provider = self._provider_for_kind(spec.runtime_kind)
         record, created = self.store.ensure_generation(binding, spec)
-        if not created:
-            if record.status == "active" and record.runtime_kind == "antigravity":
-                try:
-                    acquired = await provider.ensure_generation(binding, spec)
-                    self._validate_acquired_generation(record.provider_session_id, spec, acquired)
-                except Exception:
-                    self.store.fail_generation(binding, include_active=True)
-                    raise
-            return GenerationResult(
-                binding_id=binding_id,
-                status=record.status,
-                provider_session_id=record.provider_session_id,
-            )
-        acquired = None
-        try:
-            acquired = await provider.ensure_generation(binding, spec)
-            self._validate_acquired_generation(spec.provider_session_id, spec, acquired)
-            record = self.store.activate_generation(binding, acquired.provider_session_id)
-        except Exception as original_error:
-            self.store.fail_generation(binding)
-            if acquired is not None:
-                try:
-                    await provider.retire(binding, "generation activation failed")
-                except BaseException:
-                    original_error.add_note("generation acquisition cleanup also failed")
-            raise
+        if created or record.status == "starting":
+            try:
+                provider.stage_generation(binding, spec)
+            except Exception:
+                if created:
+                    self.store.fail_generation(binding)
+                raise
         return GenerationResult(
             binding_id=binding_id,
             status=record.status,
@@ -105,22 +77,19 @@ class RuntimeService:
         if self._shutting_down:
             raise ConflictError("runtime is shutting down")
         binding = str(binding_id)
-        request_id = str(request.request_id)
         payload_hash = self._request_hash(request)
         generation = self.store.get_generation(binding)
         self._provider_for_kind(generation.runtime_kind)
-        self._validate_runtime_turn_fields(generation.runtime_kind, request)
-        existing = self.store.get_request(binding, request_id)
+        existing = self.store.get_request(binding, str(request.request_id))
         if existing is not None:
             if existing.payload_hash != payload_hash:
                 raise ConflictError("request identity is immutable")
             return
         if generation.status == "retired":
             raise RetiredError("generation is retired")
-        if generation.status != "active":
-            raise ConflictError("generation is not active")
-        if generation.runtime_kind == "antigravity":
-            self._validate_bootstrap_state(generation.bootstrap_sent, request)
+        if generation.status not in {"starting", "active"}:
+            raise ConflictError("generation is not executable")
+        self._validate_bootstrap_state(generation.bootstrap_sent, request)
 
     async def stream_turn(
         self,
@@ -131,19 +100,18 @@ class RuntimeService:
             raise ConflictError("runtime is shutting down")
         binding = str(binding_id)
         request_id = str(request.request_id)
-        payload_hash = self._request_hash(request)
         generation = self.store.get_generation(binding)
         provider = self._provider_for_kind(generation.runtime_kind)
-        self._validate_runtime_turn_fields(generation.runtime_kind, request)
         request_lock = await self._get_claim_lock(binding, request_id)
         async with request_lock:
             record, disposition = self.store.claim_request(
                 binding,
                 request_id,
-                payload_hash,
+                self._request_hash(request),
+                request.requested_model_id,
+                request.requested_thinking_level,
                 self.instance_id,
             )
-
         if disposition == "replay":
             for event in self.journal.replay(binding, request_id):
                 yield event
@@ -156,11 +124,7 @@ class RuntimeService:
         generation_lock = await self._get_generation_turn_lock(binding)
         try:
             async with generation_lock:
-                async for event in self._run_owned_turn(
-                    binding_id,
-                    request,
-                    provider,
-                ):
+                async for event in self._run_owned_turn(binding_id, request, provider, record):
                     yield event
         except asyncio.CancelledError as original_error:
             try:
@@ -174,6 +138,7 @@ class RuntimeService:
         binding_id: UUID,
         request: TurnRequest,
         provider: RuntimeProviderAdapter,
+        claimed: RequestRecord,
     ) -> AsyncIterator[RuntimeEvent]:
         binding = str(binding_id)
         request_id = str(request.request_id)
@@ -185,35 +150,79 @@ class RuntimeService:
                 yield event
             return
 
-        generation = self.store.get_generation(binding)
-        is_first_turn = generation.runtime_kind == "antigravity" and not generation.bootstrap_sent
-        if generation.runtime_kind == "antigravity":
+        if current.resolution_status == "pending":
             try:
-                self._validate_bootstrap_state(generation.bootstrap_sent, request)
-            except (ConflictError, InvalidRequestError):
+                resolution = provider.resolve_execution(
+                    current.requested_model_id,
+                    current.requested_thinking_level,
+                )
+            except ProviderAdapterError as exc:
+                if exc.code != "unsupported_requested_execution":
+                    raise
+                self.store.mark_resolution_unsupported(binding, request_id, self.instance_id)
                 terminal, _ = self.journal.terminal(
                     binding,
                     request_id,
                     "error",
-                    {"code": "bootstrap_state_conflict"},
+                    {"code": exc.code},
                     "failed",
-                    "bootstrap_state_conflict",
+                    exc.code,
                 )
                 yield terminal
                 return
-        try:
-            await provider.prepare_turn(
+            current = self.store.freeze_resolution(
                 binding,
-                request,
-                is_first_turn=is_first_turn,
-                generation_identity_hash=generation.identity_hash,
-                expected_provider_session_id=generation.provider_session_id,
+                request_id,
+                self.instance_id,
+                resolution,
             )
+        elif current.resolution_status == "unsupported":
+            terminal, _ = self.journal.terminal(
+                binding,
+                request_id,
+                "error",
+                {"code": "unsupported_requested_execution"},
+                "failed",
+                "unsupported_requested_execution",
+            )
+            yield terminal
+            return
+        resolution = self._resolution_from_record(current)
+
+        generation = self.store.get_generation(binding)
+        is_first_turn = not generation.bootstrap_sent
+        try:
+            self._validate_bootstrap_state(generation.bootstrap_sent, request)
+        except ConflictError:
+            terminal, _ = self.journal.terminal(
+                binding,
+                request_id,
+                "error",
+                {"code": "bootstrap_state_conflict"},
+                "failed",
+                "bootstrap_state_conflict",
+            )
+            yield terminal
+            return
+
+        try:
+            acquired = await provider.prepare_turn(
+                generation,
+                request,
+                resolution.process_options,
+                is_first_turn=is_first_turn,
+            )
+            self._validate_acquired_generation(generation.provider_session_id, resolution, acquired)
+            was_starting = generation.status == "starting"
+            if was_starting:
+                generation = self.store.activate_generation(
+                    binding,
+                    acquired.provider_session_id,
+                    request_id,
+                )
         except asyncio.CancelledError:
             raise
         except ProviderAdapterError as exc:
-            if exc.fatal_generation:
-                self.store.fail_generation(binding, include_active=True)
             terminal, _ = self.journal.terminal(
                 binding,
                 request_id,
@@ -225,7 +234,6 @@ class RuntimeService:
             yield terminal
             return
         except Exception:
-            self.store.fail_generation(binding, include_active=True)
             terminal, _ = self.journal.terminal(
                 binding,
                 request_id,
@@ -237,15 +245,41 @@ class RuntimeService:
             yield terminal
             return
 
+        control_events: list[RuntimeEvent] = []
+        generation = self.store.get_generation(binding)
+        if generation.activation_request_id == request_id:
+            control_events.append(
+                self.store.append_control_event(
+                    binding,
+                    request_id,
+                    "generation_activated",
+                    {"provider_session_id": generation.provider_session_id},
+                )
+            )
+        control_events.append(
+            self.store.append_control_event(
+                binding,
+                request_id,
+                "execution_resolved",
+                {
+                    "effective_provider_model_slug": resolution.provider_model_slug,
+                    "effective_effort": resolution.effort,
+                    "resolver_policy_revision": resolution.resolver_policy_revision,
+                },
+            )
+        )
+        for event in sorted(control_events, key=lambda item: item.sequence):
+            yield event
+
         current = self.store.get_request(binding, request_id)
         if current is None:
             raise ConflictError("request disappeared")
         if current.terminal:
             await provider.cancel(binding, request_id)
             for event in self.journal.replay(binding, request_id):
-                yield event
+                if event.sequence > control_events[-1].sequence:
+                    yield event
             return
-
         try:
             self.store.mark_sent(
                 binding,
@@ -254,12 +288,6 @@ class RuntimeService:
                 consume_bootstrap=is_first_turn,
             )
         except (ConflictError, RetiredError):
-            current = self.store.get_request(binding, request_id)
-            if current is not None and current.terminal:
-                await provider.cancel(binding, request_id)
-                for event in self.journal.replay(binding, request_id):
-                    yield event
-                return
             terminal, _ = self.journal.terminal(
                 binding,
                 request_id,
@@ -282,7 +310,7 @@ class RuntimeService:
     ) -> AsyncIterator[RuntimeEvent]:
         binding = str(binding_id)
         request_id = str(request.request_id)
-        yielded_sequence = 0
+        yielded_sequence = self.store.get_request(binding, request_id).last_sequence
         pending_terminal: ProviderEvent | None = None
         failure_code: str | None = None
         failure_status = "indeterminate"
@@ -323,8 +351,6 @@ class RuntimeService:
         except ProviderAdapterError as exc:
             failure_code = exc.code
             failure_status = exc.terminal_status
-            if exc.fatal_generation:
-                self.store.fail_generation(binding, include_active=True)
         except Exception:
             failure_code = "provider_exception"
             failure_status = "indeterminate"
@@ -337,7 +363,6 @@ class RuntimeService:
                 if event.sequence > yielded_sequence:
                     yield event
             return
-
         if failure_code is not None:
             terminal, _ = self.journal.terminal(
                 binding,
@@ -357,15 +382,10 @@ class RuntimeService:
                 "unexpected_provider_eof",
             )
         elif pending_terminal.event_type == "error":
-            terminal_status = pending_terminal.terminal_status or "failed"
-            terminal_code = str(pending_terminal.payload.get("code", "provider_error"))
+            status = pending_terminal.terminal_status or "failed"
+            code = str(pending_terminal.payload.get("code", "provider_error"))
             terminal, _ = self.journal.terminal(
-                binding,
-                request_id,
-                "error",
-                pending_terminal.payload,
-                terminal_status,
-                terminal_code,
+                binding, request_id, "error", pending_terminal.payload, status, code
             )
         else:
             terminal, _ = self.journal.terminal(
@@ -396,7 +416,7 @@ class RuntimeService:
                 status=record.status,
                 changed=False,
             )
-        terminal, changed = self.journal.terminal(
+        _, changed = self.journal.terminal(
             binding,
             request_key,
             "error",
@@ -425,43 +445,52 @@ class RuntimeService:
     async def shutdown(self) -> None:
         self._shutting_down = True
         self.store.terminalize_open_requests_for_shutdown()
-        unique_providers = {id(provider): provider for provider in self.providers.values()}
+        unique = {id(provider): provider for provider in self.providers.values()}
         results = await asyncio.gather(
-            *(provider.shutdown() for provider in unique_providers.values()),
-            return_exceptions=True,
+            *(provider.shutdown() for provider in unique.values()), return_exceptions=True
         )
-        failures = [result for result in results if isinstance(result, BaseException)]
-        if failures:
+        if any(isinstance(result, BaseException) for result in results):
             raise ProviderAdapterError("provider_shutdown_failed")
 
     def _provider_for_kind(self, runtime_kind: str) -> RuntimeProviderAdapter:
         provider = self.providers.get(runtime_kind)
         if provider is None:
-            raise InvalidRequestError("unsupported runtime kind")
+            raise ConflictError("unsupported runtime kind")
         return provider
 
     @staticmethod
-    def _validate_acquired_generation(expected_session_id, spec, acquired) -> None:
-        if acquired.observed_model != spec.provider_model_id:
-            raise ProviderProtocolError("provider observed model mismatch")
-        if expected_session_id is not None and acquired.provider_session_id != expected_session_id:
-            raise ProviderProtocolError("provider session identity mismatch")
+    def _resolution_from_record(record: RequestRecord) -> EffectiveResolution:
+        if (
+            record.resolution_status != "resolved"
+            or record.effective_provider_model_slug is None
+            or record.effective_effort is None
+            or record.resolver_policy_revision is None
+            or record.process_options is None
+        ):
+            raise ConflictError("request has no complete frozen execution")
+        return EffectiveResolution(
+            provider_model_slug=record.effective_provider_model_slug,
+            effort=record.effective_effort,
+            resolver_policy_revision=record.resolver_policy_revision,
+            process_options=record.process_options,
+        )
 
     @staticmethod
-    def _validate_runtime_turn_fields(runtime_kind: str, request: TurnRequest) -> None:
-        if runtime_kind == "antigravity":
-            if request.behavior != FakeBehavior.NORMAL:
-                raise InvalidRequestError("fake behavior is unavailable for antigravity")
-            return
-        if request.bootstrap_context is not None or request.ephemeral_current is not None:
-            raise InvalidRequestError("fake turns do not accept antigravity context")
+    def _validate_acquired_generation(expected_session_id, resolution, acquired) -> None:
+        if (
+            acquired.observed_model != resolution.provider_model_slug
+            or acquired.observed_effort != resolution.effort
+        ):
+            raise ProviderProtocolError("provider observed execution mismatch")
+        if expected_session_id is not None and acquired.provider_session_id != expected_session_id:
+            raise ProviderAdapterError("resume_identity_mismatch")
 
     @staticmethod
     def _validate_bootstrap_state(bootstrap_sent: bool, request: TurnRequest) -> None:
         if bootstrap_sent and request.bootstrap_context is not None:
             raise ConflictError("generation bootstrap was already consumed")
         if not bootstrap_sent and request.bootstrap_context is None:
-            raise InvalidRequestError("first antigravity turn requires bootstrap context")
+            raise ConflictError("first turn requires bootstrap context")
 
     async def _get_claim_lock(self, binding_id: str, request_id: str) -> asyncio.Lock:
         key = (binding_id, request_id)
@@ -473,9 +502,7 @@ class RuntimeService:
             return self._generation_turn_locks.setdefault(binding_id, asyncio.Lock())
 
     async def _wait_and_replay(
-        self,
-        binding_id: str,
-        request_id: str,
+        self, binding_id: str, request_id: str
     ) -> AsyncIterator[RuntimeEvent]:
         while True:
             record = self.store.get_request(binding_id, request_id)

@@ -7,13 +7,16 @@ from uuid import uuid4
 from pydantic import ValidationError
 
 from exocore_runtime.contracts import (
+    EffectiveResolution,
     GenerationSpec,
+    ProcessExecutionOptions,
     ProviderEvent,
     ProviderGeneration,
     RuntimeEvent,
     TurnRequest,
 )
-from exocore_runtime.errors import ConflictError, ProviderAdapterError
+from exocore_runtime.errors import ProviderAdapterError, StateResetRequiredError
+from exocore_runtime.providers.fake import DeterministicFakeAdapter
 from exocore_runtime.service import RuntimeService
 from exocore_runtime.state_store import RuntimeStateStore
 
@@ -22,23 +25,62 @@ async def collect(service, binding_id, request):
     return [event async for event in service.stream_turn(binding_id, request)]
 
 
+def store_resolution() -> EffectiveResolution:
+    options = ProcessExecutionOptions(
+        provider_model_slug="fake-model-high",
+        effort="high",
+        security_policy_revision="fake-security-v1",
+        launch_environment_revision="fake-launch-v1",
+    )
+    return EffectiveResolution(
+        provider_model_slug=options.provider_model_slug,
+        effort=options.effort,
+        resolver_policy_revision="fake-policy-v1",
+        process_options=options,
+    )
+
+
 class BootstrapBoundaryAdapter:
+    """Adapter whose protocol failures terminate at prepare or after send.
+
+    The legacy v1-era "invalid_status" boundary is structurally impossible in
+    v2: ProviderAdapterError refuses terminal_status values outside
+    {"failed", "indeterminate"} at construction time. The two remaining
+    boundaries cover fail-before-send (bootstrap not consumed) and
+    fail-after-send (bootstrap consumed) durable truth.
+    """
     def __init__(self, failure_boundary: str) -> None:
         self.failure_boundary = failure_boundary
 
-    async def ensure_generation(self, binding_id, spec):
-        return ProviderGeneration(
-            provider_session_id=f"session-{binding_id}",
-            observed_model=spec.provider_model_id,
-        )
+    def resolve_execution(
+        self,
+        requested_model_id: str,
+        requested_thinking_level: str,
+    ) -> EffectiveResolution:
+        return store_resolution()
 
-    async def prepare_turn(self, binding_id, request, **kwargs):
+    def stage_generation(self, binding_id: str, spec: GenerationSpec) -> None:
+        return None
+
+    async def prepare_turn(
+        self,
+        generation,
+        request,
+        options,
+        *,
+        is_first_turn: bool,
+    ) -> ProviderGeneration:
         if self.failure_boundary == "prepare":
             raise ProviderAdapterError("prepare_failed")
+        return ProviderGeneration(
+            provider_session_id=f"session-{generation.binding_id}",
+            observed_model=options.provider_model_slug,
+            observed_effort=options.effort,
+        )
 
     async def stream_turn(self, binding_id, request):
-        if self.failure_boundary == "invalid_status":
-            raise ProviderAdapterError("invalid_status", terminal_status="completed")
+        if self.failure_boundary == "stream":
+            raise ProviderAdapterError("post_send_failed")
         yield ProviderEvent(
             event_type="error",
             payload={"code": "post_send_failed"},
@@ -118,25 +160,45 @@ class RuntimeStateTerminalTruthTests(unittest.TestCase):
     def active_generation(self):
         binding_id = str(uuid4())
         spec = GenerationSpec(
-            provider_model_id="fake-model",
+            runtime_kind="fake",
             bootstrap_fingerprint="bootstrap",
-            config_fingerprint="config",
+            system_instructions="system",
         )
         self.store.ensure_generation(binding_id, spec)
-        self.store.activate_generation(binding_id, f"session-{binding_id}")
         return binding_id
 
     def claim(self, binding_id):
         request_id = str(uuid4())
-        self.store.claim_request(binding_id, request_id, "a" * 64, "owner")
+        self.store.claim_request(
+            binding_id,
+            request_id,
+            "a" * 64,
+            "gemini-3.1-pro-preview",
+            "auto",
+            "owner",
+        )
         return request_id
+
+    def claim_resolved(self, binding_id):
+        request_id = self.claim(binding_id)
+        self.store.freeze_resolution(binding_id, request_id, "owner", store_resolution())
+        return request_id
+
+    def mark_sent(self, binding_id, request_id, *, consume_bootstrap=False):
+        self.store.activate_generation(binding_id, f"session-{binding_id}", request_id)
+        self.store.mark_sent(
+            binding_id,
+            request_id,
+            "owner",
+            consume_bootstrap=consume_bootstrap,
+        )
 
     def test_persisted_terminal_status_matrix_and_nonterminal_nulls(self) -> None:
         for status in ("completed", "failed", "cancelled", "indeterminate"):
             with self.subTest(status=status):
                 binding_id = self.active_generation()
-                request_id = self.claim(binding_id)
-                self.store.mark_sent(binding_id, request_id, "owner")
+                request_id = self.claim_resolved(binding_id)
+                self.mark_sent(binding_id, request_id, consume_bootstrap=True)
                 nonterminal = self.store.append_event(
                     binding_id, request_id, "content_delta", {"text": status}
                 )
@@ -154,11 +216,11 @@ class RuntimeStateTerminalTruthTests(unittest.TestCase):
                 self.assertIsNone(nonterminal.bootstrap_consumed)
                 self.assertEqual(replay[-1], event)
                 self.assertEqual(replay[-1].terminal_status, status)
-                self.assertIs(replay[-1].bootstrap_consumed, False)
+                self.assertIs(replay[-1].bootstrap_consumed, True)
 
     def test_duplicate_terminal_preserves_original_terminal_time_truth(self) -> None:
         binding_id = self.active_generation()
-        first_request = self.claim(binding_id)
+        first_request = self.claim_resolved(binding_id)
         original, changed = self.store.append_terminal(
             binding_id,
             first_request,
@@ -170,13 +232,8 @@ class RuntimeStateTerminalTruthTests(unittest.TestCase):
         self.assertTrue(changed)
         self.assertIs(original.bootstrap_consumed, False)
 
-        second_request = self.claim(binding_id)
-        self.store.mark_sent(
-            binding_id,
-            second_request,
-            "owner",
-            consume_bootstrap=True,
-        )
+        second_request = self.claim_resolved(binding_id)
+        self.mark_sent(binding_id, second_request, consume_bootstrap=True)
         self.store.append_terminal(
             binding_id,
             second_request,
@@ -200,17 +257,17 @@ class RuntimeStateTerminalTruthTests(unittest.TestCase):
 
     def test_retire_shutdown_and_restart_use_durable_bootstrap_truth(self) -> None:
         retired_binding = self.active_generation()
-        retired_request = self.claim(retired_binding)
-        self.store.mark_sent(retired_binding, retired_request, "owner", consume_bootstrap=True)
+        retired_request = self.claim_resolved(retired_binding)
+        self.mark_sent(retired_binding, retired_request, consume_bootstrap=True)
         self.store.retire_generation(retired_binding, "done")
         retired = self.store.read_events(retired_binding, retired_request)[-1]
         self.assertEqual((retired.terminal_status, retired.bootstrap_consumed), ("indeterminate", True))
 
         prepared_binding = self.active_generation()
-        prepared_request = self.claim(prepared_binding)
+        prepared_request = self.claim_resolved(prepared_binding)
         sent_binding = self.active_generation()
-        sent_request = self.claim(sent_binding)
-        self.store.mark_sent(sent_binding, sent_request, "owner", consume_bootstrap=True)
+        sent_request = self.claim_resolved(sent_binding)
+        self.mark_sent(sent_binding, sent_request, consume_bootstrap=True)
 
         self.assertEqual(self.store.terminalize_open_requests_for_shutdown(), 2)
         prepared = self.store.read_events(prepared_binding, prepared_request)[-1]
@@ -219,8 +276,8 @@ class RuntimeStateTerminalTruthTests(unittest.TestCase):
         self.assertEqual((sent.terminal_status, sent.bootstrap_consumed), ("indeterminate", True))
 
         restart_binding = self.active_generation()
-        restart_request = self.claim(restart_binding)
-        self.store.mark_sent(restart_binding, restart_request, "owner", consume_bootstrap=True)
+        restart_request = self.claim_resolved(restart_binding)
+        self.mark_sent(restart_binding, restart_request, consume_bootstrap=True)
         self.assertEqual(self.store.recover_after_restart(), 1)
         first_projection = self.store.read_events(restart_binding, restart_request)[-1]
         reopened = RuntimeStateStore(self.path)
@@ -232,12 +289,11 @@ class RuntimeStateTerminalTruthTests(unittest.TestCase):
         )
 
 
-class LegacyEventSchemaUpgradeTests(unittest.TestCase):
-    def test_upgrade_is_idempotent_and_does_not_backfill_legacy_terminal_truth(self) -> None:
+class V1StoreResetGuardTests(unittest.TestCase):
+    def test_v1_store_fails_loud_with_reset_required_and_is_never_migrated(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "legacy.sqlite3"
             binding_id = str(uuid4())
-            request_id = str(uuid4())
             connection = sqlite3.connect(path)
             try:
                 connection.executescript(
@@ -289,42 +345,33 @@ class LegacyEventSchemaUpgradeTests(unittest.TestCase):
                     """,
                     (binding_id, "a" * 64),
                 )
-                connection.execute(
-                    """
-                    INSERT INTO requests(
-                        binding_id, request_id, payload_hash, status, last_sequence, terminal_code
-                    ) VALUES (?, ?, ?, 'completed', 1, 'completed')
-                    """,
-                    (binding_id, request_id, "b" * 64),
-                )
-                connection.execute(
-                    """
-                    INSERT INTO events(
-                        binding_id, request_id, sequence, event_type, payload_json, is_terminal
-                    ) VALUES (?, ?, 1, 'done', '{}', 1)
-                    """,
-                    (binding_id, request_id),
-                )
+                connection.execute("PRAGMA user_version = 1")
                 connection.commit()
             finally:
                 connection.close()
 
-            store = RuntimeStateStore(path)
-            RuntimeStateStore(path)
+            for attempt in (1, 2):
+                with self.subTest(attempt=attempt), self.assertRaises(
+                    StateResetRequiredError
+                ) as caught:
+                    RuntimeStateStore(path)
+                self.assertEqual(caught.exception.code, "v2_state_reset_required")
             connection = sqlite3.connect(path)
             try:
-                columns = {
-                    row[1] for row in connection.execute("PRAGMA table_info(events)").fetchall()
+                tables = {
+                    row[0]
+                    for row in connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table'"
+                    ).fetchall()
                 }
-                truth = connection.execute(
-                    "SELECT terminal_status, bootstrap_consumed FROM events"
-                ).fetchone()
+                user_version = connection.execute("PRAGMA user_version").fetchone()[0]
             finally:
                 connection.close()
-            self.assertTrue({"terminal_status", "bootstrap_consumed"}.issubset(columns))
-            self.assertEqual(truth, (None, None))
-            with self.assertRaisesRegex(ConflictError, "legacy terminal event lacks durable truth"):
-                store.read_events(binding_id, request_id)
+            # The v1 file must remain byte-for-byte untouched: no row migration,
+            # no schema projection, no v2 markers.
+            self.assertIn("generations", tables)
+            self.assertNotIn("runtime_meta", tables)
+            self.assertEqual(user_version, 1)
 
 
 class ProviderBoundaryProjectionTests(unittest.IsolatedAsyncioTestCase):
@@ -332,7 +379,6 @@ class ProviderBoundaryProjectionTests(unittest.IsolatedAsyncioTestCase):
         cases = (
             ("prepare", "failed", False),
             ("stream", "failed", True),
-            ("invalid_status", "indeterminate", True),
         )
         for boundary, expected_status, expected_consumed in cases:
             with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as temp_dir:
@@ -344,15 +390,15 @@ class ProviderBoundaryProjectionTests(unittest.IsolatedAsyncioTestCase):
                 binding_id = uuid4()
                 spec = GenerationSpec(
                     runtime_kind="antigravity",
-                    provider_model_id="gemini-3.1-pro-high",
                     bootstrap_fingerprint="bootstrap",
-                    config_fingerprint="config",
                     system_instructions="system",
                 )
                 await service.ensure_generation(binding_id, spec)
                 request = TurnRequest(
                     request_id=uuid4(),
                     user_message="hello",
+                    requested_model_id="gemini-3.1-pro-preview",
+                    requested_thinking_level="auto",
                     bootstrap_context={"history": []},
                 )
                 events = await collect(service, binding_id, request)
@@ -364,6 +410,7 @@ class ProviderBoundaryProjectionTests(unittest.IsolatedAsyncioTestCase):
                     [event.model_dump_json() for event in events],
                     [event.model_dump_json() for event in replay],
                 )
+                await service.shutdown()
 
 
 if __name__ == "__main__":

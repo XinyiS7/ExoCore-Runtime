@@ -33,6 +33,11 @@ class RetiredError(RuntimeGatewayError):
     status_code = 409
 
 
+class StateResetRequiredError(RuntimeGatewayError):
+    code = "v2_state_reset_required"
+    status_code = 409
+
+
 class ProviderProtocolError(RuntimeGatewayError):
     code = "provider_protocol_error"
     status_code = 502

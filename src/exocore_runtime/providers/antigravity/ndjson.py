@@ -50,7 +50,11 @@ def parse_line(line: bytes) -> dict[str, Any]:
     return payload
 
 
-def parse_init(payload: dict[str, Any], expected_model: str) -> ProviderGeneration:
+def parse_init(
+    payload: dict[str, Any],
+    expected_model: str,
+    expected_effort: str,
+) -> ProviderGeneration:
     if payload.get("event") != "init":
         raise ProviderAdapterError("agy_init_missing", fatal_generation=True)
     conversation_id = payload.get("conversation_id")
@@ -67,6 +71,7 @@ def parse_init(payload: dict[str, Any], expected_model: str) -> ProviderGenerati
     return ProviderGeneration(
         provider_session_id=conversation_id,
         observed_model=observed_model,
+        observed_effort=expected_effort,
     )
 
 

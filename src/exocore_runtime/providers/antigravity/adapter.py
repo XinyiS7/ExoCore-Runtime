@@ -15,14 +15,21 @@ import sys
 from uuid import uuid4
 
 from exocore_runtime.contracts import (
+    EffectiveResolution,
     GenerationSpec,
+    ProcessExecutionOptions,
     ProviderEvent,
     ProviderGeneration,
     TurnRequest,
     generation_identity,
-    generation_identity_from_hashes,
+    system_instructions_sha256,
 )
 from exocore_runtime.errors import ProviderAdapterError
+from exocore_runtime.providers.antigravity.capabilities import (
+    LAUNCH_ENVIRONMENT_REVISION,
+    SECURITY_POLICY_REVISION,
+    resolve_execution,
+)
 from exocore_runtime.providers.antigravity.ephemeral_hook import EphemeralMailbox
 from exocore_runtime.providers.antigravity.process import (
     AgyProcessSupervisor,
@@ -35,6 +42,7 @@ from exocore_runtime.providers.antigravity.renderer import (
     render_agent_markdown,
     render_stdin_line,
 )
+from exocore_runtime.state_store import GenerationRecord
 
 
 class AntigravityAdapter:
@@ -55,71 +63,37 @@ class AntigravityAdapter:
         self._shutting_down = False
         self._cleanup_stale_mailboxes()
 
-    async def ensure_generation(
+    def resolve_execution(
         self,
-        binding_id: str,
-        spec: GenerationSpec,
-    ) -> ProviderGeneration:
-        if spec.runtime_kind != "antigravity" or spec.system_instructions is None:
+        requested_model_id: str,
+        requested_thinking_level: str,
+    ) -> EffectiveResolution:
+        return resolve_execution(requested_model_id, requested_thinking_level)
+
+    def stage_generation(self, binding_id: str, spec: GenerationSpec) -> None:
+        if spec.runtime_kind != "antigravity":
             raise ProviderAdapterError("agy_generation_spec_invalid", fatal_generation=True)
-        try:
-            lock = await self._artifact_lock(binding_id)
-            async with lock:
-                if self._shutting_down:
-                    raise ProviderAdapterError("agy_adapter_shutting_down", fatal_generation=True)
-                layout = self._ensure_generation_artifacts(binding_id, spec)
-                acquired = await self.supervisor.ensure(layout)
-                try:
-                    self._update_provider_session(binding_id, acquired.provider_session_id)
-                except BaseException as original_error:
-                    try:
-                        await self.supervisor.close_binding(binding_id, force=True)
-                    except BaseException:
-                        original_error.add_note("post-acquisition process cleanup also failed")
-                    raise
-                return acquired
-        except ProviderAdapterError as original_error:
-            try:
-                self._cleanup_presend_payloads(binding_id, None)
-            except OSError as cleanup_error:
-                failure = ProviderAdapterError(
-                    "ephemeral_presend_cleanup_failed",
-                    fatal_generation=True,
-                )
-                try:
-                    await self.supervisor.close_binding(binding_id, force=True)
-                except BaseException:
-                    failure.add_note("process cleanup also failed")
-                raise failure from cleanup_error
-            try:
-                await self.supervisor.close_binding(binding_id, force=True)
-            except BaseException:
-                original_error.add_note("process cleanup also failed")
-            raise
-        except OSError as exc:
-            raise ProviderAdapterError("agy_artifact_write_failed", fatal_generation=True) from exc
+        self._ensure_generation_artifacts(binding_id, spec)
 
     async def prepare_turn(
         self,
-        binding_id: str,
+        generation: GenerationRecord,
         request: TurnRequest,
+        options: ProcessExecutionOptions,
         *,
         is_first_turn: bool,
-        generation_identity_hash: str,
-        expected_provider_session_id: str | None,
-    ) -> None:
+    ) -> ProviderGeneration:
+        binding_id = generation.binding_id
         mailbox: EphemeralMailbox | None = None
+        acquired: ProviderGeneration | None = None
         try:
             lock = await self._artifact_lock(binding_id)
             async with lock:
                 if self._shutting_down:
                     raise ProviderAdapterError("agy_adapter_shutting_down", fatal_generation=True)
-                layout = self._load_layout(
-                    binding_id,
-                    generation_identity_hash,
-                    expected_provider_session_id,
-                )
-                await self.supervisor.ensure(layout)
+                layout = self._load_layout(generation, options)
+                acquired = await self.supervisor.ensure(layout)
+                self._update_provider_session(binding_id, acquired.provider_session_id)
                 mailbox = self._mailbox(binding_id)
                 request_id = str(request.request_id)
                 payload_hash = mailbox.prepare(request_id, request.ephemeral_current)
@@ -169,6 +143,9 @@ class AntigravityAdapter:
             except BaseException:
                 failure.add_note("process cleanup also failed")
             raise failure from exc
+        if acquired is None:
+            raise ProviderAdapterError("agy_process_not_ready")
+        return acquired
 
     async def stream_turn(
         self,
@@ -306,69 +283,125 @@ class AntigravityAdapter:
         self,
         binding_id: str,
         spec: GenerationSpec,
-    ) -> GenerationLayout:
+    ) -> None:
         root = self._generation_root(binding_id)
         metadata_path = root / "generation.json"
         agent_name = generation_agent_name(binding_id)
         agent_markdown = render_agent_markdown(agent_name, spec.system_instructions)
         agent_hash = hashlib.sha256(agent_markdown.encode("utf-8")).hexdigest()
-        generation_id = self._generation_id(binding_id, spec.config_fingerprint)
+        identity_hash = generation_identity(spec)
         expected = {
-            "schema_version": "v1",
+            "schema_version": "v2",
             "binding_id": binding_id,
             "runtime_kind": "antigravity",
-            "provider_model_id": spec.provider_model_id,
             "bootstrap_fingerprint": spec.bootstrap_fingerprint,
-            "config_fingerprint": spec.config_fingerprint,
-            "system_instructions_sha256": hashlib.sha256(
-                spec.system_instructions.strip().encode("utf-8")
-            ).hexdigest(),
+            "system_instructions_sha256": system_instructions_sha256(
+                spec.system_instructions
+            ),
             "agent_name": agent_name,
-            "generation_id": generation_id,
-            "identity_provider_session_id": spec.provider_session_id,
-            "identity_hash": generation_identity(spec),
+            "generation_id": self._generation_id(binding_id, identity_hash),
+            "identity_hash": identity_hash,
+            "agent_markdown_sha256": agent_hash,
         }
         if metadata_path.exists():
             metadata = self._read_json(metadata_path)
             if any(metadata.get(key) != value for key, value in expected.items()):
                 raise ProviderAdapterError("agy_artifact_identity_mismatch", fatal_generation=True)
-            recorded_agent_hash = metadata.get("agent_markdown_sha256")
-            if recorded_agent_hash not in (None, agent_hash):
-                raise ProviderAdapterError("agy_artifact_identity_mismatch", fatal_generation=True)
-            if (
-                spec.provider_session_id is not None
-                and metadata.get("provider_session_id") != spec.provider_session_id
-            ):
-                raise ProviderAdapterError("agy_resume_session_mismatch", fatal_generation=True)
         else:
-            metadata = {
-                **expected,
-                "provider_session_id": spec.provider_session_id,
-            }
+            metadata = {**expected, "provider_session_id": None}
         self._restore_security_artifacts(root, metadata, agent_markdown)
-        metadata["agent_markdown_sha256"] = agent_hash
         self._atomic_write_json(metadata_path, metadata)
-        return self._layout_from_metadata(root, metadata)
 
     def _load_layout(
         self,
-        binding_id: str,
-        generation_identity_hash: str,
-        expected_provider_session_id: str | None,
+        generation: GenerationRecord,
+        options: ProcessExecutionOptions,
     ) -> GenerationLayout:
-        root = self._generation_root(binding_id)
+        self._validate_process_options(options)
+        root = self._generation_root(generation.binding_id)
         metadata_path = root / "generation.json"
-        if not metadata_path.exists():
-            raise ProviderAdapterError("agy_generation_artifact_missing", fatal_generation=True)
-        metadata = self._read_json(metadata_path)
-        self._verify_security_artifacts(
-            root,
-            binding_id,
-            generation_identity_hash,
-            expected_provider_session_id,
-            metadata,
+        if metadata_path.exists():
+            metadata = self._read_json(metadata_path)
+        else:
+            metadata = self._rebuild_missing_metadata(root, generation)
+        artifact_session = metadata.get("provider_session_id")
+        if artifact_session is not None and not isinstance(artifact_session, str):
+            raise ProviderAdapterError("agy_generation_artifact_invalid", fatal_generation=True)
+        if (
+            artifact_session is not None
+            and generation.provider_session_id is not None
+            and artifact_session != generation.provider_session_id
+        ):
+            raise ProviderAdapterError("agy_artifact_session_conflict", fatal_generation=True)
+        if artifact_session is None and generation.provider_session_id is not None:
+            metadata["provider_session_id"] = generation.provider_session_id
+            self._atomic_write_json(metadata_path, metadata)
+        agent_markdown = self._canonical_agent_markdown(root, metadata, generation)
+        self._restore_security_artifacts(root, metadata, agent_markdown)
+        self._verify_security_artifacts(root, generation, metadata)
+        return self._layout_from_metadata(root, metadata, options)
+
+    def _rebuild_missing_metadata(
+        self,
+        root: Path,
+        generation: GenerationRecord,
+    ) -> dict[str, object]:
+        agent_name = generation_agent_name(generation.binding_id)
+        agent_path = (
+            root / "profile" / ".gemini" / "config" / "agents" / agent_name / "agent.md"
         )
-        return self._layout_from_metadata(root, metadata)
+        try:
+            agent_markdown = agent_path.read_text(encoding="utf-8")
+            rendered = extract_rendered_system_instructions(agent_name, agent_markdown)
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            raise ProviderAdapterError("agy_generation_artifact_missing", fatal_generation=True) from exc
+        if hashlib.sha256(rendered.encode("utf-8")).hexdigest() != generation.system_instructions_sha256:
+            raise ProviderAdapterError("agy_custom_agent_invalid", fatal_generation=True)
+        metadata = {
+            "schema_version": "v2",
+            "binding_id": generation.binding_id,
+            "runtime_kind": generation.runtime_kind,
+            "bootstrap_fingerprint": generation.bootstrap_fingerprint,
+            "system_instructions_sha256": generation.system_instructions_sha256,
+            "agent_name": agent_name,
+            "generation_id": self._generation_id(
+                generation.binding_id,
+                generation.identity_hash,
+            ),
+            "identity_hash": generation.identity_hash,
+            "agent_markdown_sha256": hashlib.sha256(
+                agent_markdown.encode("utf-8")
+            ).hexdigest(),
+            "provider_session_id": generation.provider_session_id,
+        }
+        self._atomic_write_json(root / "generation.json", metadata)
+        return metadata
+
+    def _canonical_agent_markdown(
+        self,
+        root: Path,
+        metadata: dict[str, object],
+        generation: GenerationRecord,
+    ) -> str:
+        agent_name = str(metadata.get("agent_name", ""))
+        path = root / "profile" / ".gemini" / "config" / "agents" / agent_name / "agent.md"
+        try:
+            content = path.read_text(encoding="utf-8")
+            rendered = extract_rendered_system_instructions(agent_name, content)
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            raise ProviderAdapterError("agy_custom_agent_invalid", fatal_generation=True) from exc
+        if hashlib.sha256(rendered.encode("utf-8")).hexdigest() != generation.system_instructions_sha256:
+            raise ProviderAdapterError("agy_custom_agent_invalid", fatal_generation=True)
+        return content
+
+    @staticmethod
+    def _validate_process_options(options: ProcessExecutionOptions) -> None:
+        if (
+            options.security_policy_revision != SECURITY_POLICY_REVISION
+            or options.launch_environment_revision != LAUNCH_ENVIRONMENT_REVISION
+            or options.profile_mode != "generation_private"
+        ):
+            raise ProviderAdapterError("agy_process_options_unsupported")
 
     def _restore_security_artifacts(
         self,
@@ -435,92 +468,74 @@ class AntigravityAdapter:
     def _verify_security_artifacts(
         self,
         root: Path,
-        expected_binding_id: str,
-        expected_identity_hash: str,
-        expected_provider_session_id: str | None,
+        generation: GenerationRecord,
         metadata: dict[str, object],
     ) -> None:
-        layout = self._layout_from_metadata(root, metadata)
         generation_id = metadata.get("generation_id")
         agent_hash = metadata.get("agent_markdown_sha256")
         system_hash = metadata.get("system_instructions_sha256")
+        expected_fields = {
+            "schema_version": "v2",
+            "binding_id": generation.binding_id,
+            "runtime_kind": generation.runtime_kind,
+            "bootstrap_fingerprint": generation.bootstrap_fingerprint,
+            "system_instructions_sha256": generation.system_instructions_sha256,
+            "agent_name": generation_agent_name(generation.binding_id),
+            "generation_id": self._generation_id(
+                generation.binding_id,
+                generation.identity_hash,
+            ),
+            "identity_hash": generation.identity_hash,
+        }
         if (
             not isinstance(generation_id, str)
             or not isinstance(agent_hash, str)
             or not isinstance(system_hash, str)
-        ):
-            raise ProviderAdapterError("agy_security_artifact_unverifiable", fatal_generation=True)
-        identity_provider_session_id = metadata.get("identity_provider_session_id")
-        if identity_provider_session_id is not None and not isinstance(
-            identity_provider_session_id,
-            str,
-        ):
-            raise ProviderAdapterError("agy_security_artifact_unverifiable", fatal_generation=True)
-        identity_fields = (
-            metadata.get("schema_version"),
-            metadata.get("runtime_kind"),
-            metadata.get("provider_model_id"),
-            metadata.get("bootstrap_fingerprint"),
-            metadata.get("config_fingerprint"),
-        )
-        if any(not isinstance(value, str) for value in identity_fields):
-            raise ProviderAdapterError("agy_security_artifact_unverifiable", fatal_generation=True)
-        observed_identity_hash = generation_identity_from_hashes(
-            schema_version=str(metadata["schema_version"]),
-            runtime_kind=str(metadata["runtime_kind"]),
-            provider_model_id=str(metadata["provider_model_id"]),
-            bootstrap_fingerprint=str(metadata["bootstrap_fingerprint"]),
-            config_fingerprint=str(metadata["config_fingerprint"]),
-            provider_session_id=identity_provider_session_id,
-            system_instructions_sha256=system_hash,
-        )
-        if (
-            layout.binding_id != expected_binding_id
-            or layout.provider_session_id != expected_provider_session_id
-            or layout.agent_name != generation_agent_name(expected_binding_id)
-            or generation_id
-            != self._generation_id(expected_binding_id, str(metadata["config_fingerprint"]))
-            or metadata.get("identity_hash") != expected_identity_hash
-            or observed_identity_hash != expected_identity_hash
+            or any(metadata.get(key) != value for key, value in expected_fields.items())
         ):
             raise ProviderAdapterError("agy_artifact_identity_mismatch", fatal_generation=True)
+        artifact_session = metadata.get("provider_session_id")
+        if (
+            artifact_session is not None
+            and generation.provider_session_id is not None
+            and artifact_session != generation.provider_session_id
+        ):
+            raise ProviderAdapterError("agy_artifact_session_conflict", fatal_generation=True)
+        layout_profile = root / "profile"
+        layout_workspace = root / "workspace"
+        agent_name = str(metadata["agent_name"])
         mailbox_root = root / "mailbox"
-        hooks_path = layout.profile / ".gemini" / "config" / "hooks.json"
-        settings_path = layout.profile / ".gemini" / "antigravity-cli" / "settings.json"
+        hooks_path = layout_profile / ".gemini" / "config" / "hooks.json"
+        settings_path = layout_profile / ".gemini" / "antigravity-cli" / "settings.json"
         agent_path = (
-            layout.profile
-            / ".gemini"
-            / "config"
-            / "agents"
-            / layout.agent_name
-            / "agent.md"
+            layout_profile / ".gemini" / "config" / "agents" / agent_name / "agent.md"
         )
         controlled_paths = (
-            layout.profile,
-            layout.profile / ".gemini",
-            layout.profile / ".gemini" / "config",
-            layout.profile / ".gemini" / "config" / "agents",
+            layout_profile,
+            layout_profile / ".gemini",
+            layout_profile / ".gemini" / "config",
+            layout_profile / ".gemini" / "config" / "agents",
             agent_path.parent,
-            layout.profile / ".gemini" / "antigravity-cli",
-            layout.profile / "AppData",
-            layout.profile / "AppData" / "Roaming",
-            layout.profile / "AppData" / "Local",
-            layout.profile / ".config",
-            layout.profile / ".cache",
-            layout.profile / ".local",
-            layout.profile / ".local" / "share",
-            layout.profile / "Temp",
+            layout_profile / ".gemini" / "antigravity-cli",
+            layout_profile / "AppData",
+            layout_profile / "AppData" / "Roaming",
+            layout_profile / "AppData" / "Local",
+            layout_profile / ".config",
+            layout_profile / ".cache",
+            layout_profile / ".local",
+            layout_profile / ".local" / "share",
+            layout_profile / "Temp",
             mailbox_root,
             hooks_path,
             settings_path,
             agent_path,
-            layout.workspace,
+            layout_workspace,
         )
         if any(self._is_link_or_reparse(path) for path in controlled_paths):
             raise ProviderAdapterError("agy_security_artifact_invalid", fatal_generation=True)
         mailbox = EphemeralMailbox(
             mailbox_root,
-            binding_id=layout.binding_id,
+            binding_id=generation.binding_id,
             generation_id=generation_id,
             ttl_seconds=self.mailbox_ttl_seconds,
         )
@@ -532,7 +547,7 @@ class AntigravityAdapter:
             agent_bytes = agent_path.read_bytes()
             agent_markdown = agent_bytes.decode("utf-8", errors="strict")
             rendered_system = extract_rendered_system_instructions(
-                layout.agent_name,
+                agent_name,
                 agent_markdown,
             )
         except (OSError, UnicodeDecodeError, ValueError) as exc:
@@ -543,9 +558,9 @@ class AntigravityAdapter:
         ):
             raise ProviderAdapterError("agy_custom_agent_invalid", fatal_generation=True)
         if (
-            not layout.workspace.is_dir()
-            or self._is_link_or_reparse(layout.workspace)
-            or any(layout.workspace.iterdir())
+            not layout_workspace.is_dir()
+            or self._is_link_or_reparse(layout_workspace)
+            or any(layout_workspace.iterdir())
         ):
             raise ProviderAdapterError("agy_workspace_invalid", fatal_generation=True)
 
@@ -584,10 +599,10 @@ class AntigravityAdapter:
         self,
         root: Path,
         metadata: dict[str, object],
+        options: ProcessExecutionOptions,
     ) -> GenerationLayout:
         required = (
             "binding_id",
-            "provider_model_id",
             "agent_name",
             "generation_id",
         )
@@ -602,8 +617,8 @@ class AntigravityAdapter:
             profile=root / "profile",
             workspace=root / "workspace",
             agent_name=str(metadata["agent_name"]),
-            provider_model_id=str(metadata["provider_model_id"]),
             provider_session_id=provider_session_id,
+            execution_options=options,
         )
 
     def _update_provider_session(self, binding_id: str, provider_session_id: str) -> None:
@@ -612,7 +627,7 @@ class AntigravityAdapter:
         metadata = self._read_json(metadata_path)
         existing = metadata.get("provider_session_id")
         if existing is not None and existing != provider_session_id:
-            raise ProviderAdapterError("agy_resume_session_mismatch", fatal_generation=True)
+            raise ProviderAdapterError("resume_identity_mismatch")
         metadata["provider_session_id"] = provider_session_id
         self._atomic_write_json(metadata_path, metadata)
 
@@ -672,9 +687,9 @@ class AntigravityAdapter:
         return bool(attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
 
     @staticmethod
-    def _generation_id(binding_id: str, config_fingerprint: str) -> str:
+    def _generation_id(binding_id: str, identity_hash: str) -> str:
         return hashlib.sha256(
-            f"{binding_id}:{config_fingerprint}".encode("utf-8")
+            f"{binding_id}:{identity_hash}".encode("utf-8")
         ).hexdigest()
 
     @staticmethod

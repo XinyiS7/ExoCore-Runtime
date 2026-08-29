@@ -8,6 +8,11 @@ import os
 from pathlib import Path
 import sys
 
+from exocore_runtime.contracts import ProcessExecutionOptions
+from exocore_runtime.providers.antigravity.capabilities import (
+    LAUNCH_ENVIRONMENT_REVISION,
+    SECURITY_POLICY_REVISION,
+)
 from exocore_runtime.providers.antigravity.process import (
     AgyProcessConfig,
     AgyProcessSupervisor,
@@ -44,8 +49,13 @@ async def run() -> None:
             profile=profile,
             workspace=workspace,
             agent_name="exocore-runtime-hardcrashbinding",
-            provider_model_id="gemini-3.1-pro-high",
             provider_session_id=None,
+            execution_options=ProcessExecutionOptions(
+                provider_model_slug="gemini-3.1-pro-high",
+                effort="high",
+                security_policy_revision=SECURITY_POLICY_REVISION,
+                launch_environment_revision=LAUNCH_ENVIRONMENT_REVISION,
+            ),
         )
     )
     os._exit(73)

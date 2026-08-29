@@ -111,6 +111,13 @@ def main():
             return 0
         print("1.2.0" if scenario == "bad_version" else "1.1.20")
         return 0
+    if "models" in sys.argv:
+        evidence("models", argv=sys.argv[1:])
+        if scenario == "models_missing":
+            return 7
+        print("gemini-3.1-pro-high     Gemini 3.1 Pro (High)")
+        print("gemini-3.1-pro-low      Gemini 3.1 Pro (Low)")
+        return 0
     if argument_value("-p") == "/quota":
         evidence("quota", argv=sys.argv[1:])
         if scenario == "auth_missing":
@@ -161,6 +168,8 @@ def main():
         "FAKE_AGY_CONVERSATION",
         "11111111-2222-3333-4444-555555555555",
     )
+    if scenario == "resume_mismatch" and argument_value("--conversation"):
+        conversation_id = "99999999-8888-7777-6666-555555555555"
     emit(
         {
             "event": "init",

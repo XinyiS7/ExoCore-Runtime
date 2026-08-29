@@ -21,6 +21,43 @@ from exocore_runtime.providers.antigravity.process import AgyProcessConfig, AgyP
 from exocore_runtime.providers.fake import DeterministicFakeAdapter
 
 
+V2_HEALTH = {
+    "status": "ok",
+    "schema_version": "v2",
+    "protocol": "subscription-runtime-v2",
+    "capabilities": [
+        "generation_state_only",
+        "durable_control_events",
+        "requested_effective_execution",
+        "strict_session_resume",
+    ],
+}
+
+
+def v2_spec(*, runtime_kind="fake", system_instructions="system"):
+    return {
+        "schema_version": "v2",
+        "runtime_kind": runtime_kind,
+        "bootstrap_fingerprint": "bootstrap",
+        "system_instructions": system_instructions,
+    }
+
+
+def v2_turn(*, request_id, bootstrap=None, thinking="auto", ephemeral=None):
+    turn = {
+        "schema_version": "v2",
+        "request_id": str(request_id),
+        "user_message": "hello",
+        "requested_model_id": "gemini-3.1-pro-preview",
+        "requested_thinking_level": thinking,
+    }
+    if bootstrap is not None:
+        turn["bootstrap_context"] = bootstrap
+    if ephemeral is not None:
+        turn["ephemeral_current"] = ephemeral
+    return turn
+
+
 class LiveGateway:
     def __init__(self, state_path: Path, token: str, provider=None) -> None:
         probe = socket.socket()
@@ -41,20 +78,36 @@ class LiveGateway:
         self.server = uvicorn.Server(uvicorn_config)
         self.thread = threading.Thread(target=self.server.run, name="runtime-test-server")
 
+    def _force_stop(self) -> None:
+        """Test-harness-only stop: never strand the non-daemon uvicorn thread."""
+        self.server.should_exit = True
+        self.server.force_exit = True
+        self.thread.join(timeout=5)
+        if self.thread.is_alive():
+            raise RuntimeError("test server did not stop")
+
     def __enter__(self):
         self.thread.start()
-        for _ in range(200):
-            try:
-                status, _ = self.request("GET", "/v1/health")
-                if status == 200:
-                    return self
-            except OSError:
-                time.sleep(0.01)
+        try:
+            for _ in range(200):
+                try:
+                    status, _ = self.request("GET", "/v2/health")
+                    if status == 200:
+                        return self
+                except OSError:
+                    time.sleep(0.01)
+        except BaseException:
+            self._force_stop()
+            raise
+        self._force_stop()
         raise RuntimeError("test server did not start")
 
     def __exit__(self, exc_type, exc, traceback):
         self.server.should_exit = True
         self.thread.join(timeout=5)
+        if self.thread.is_alive():
+            self.server.force_exit = True
+            self.thread.join(timeout=5)
         if self.thread.is_alive():
             raise RuntimeError("test server did not stop")
 
@@ -118,28 +171,24 @@ class RuntimeHttpTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
+    def _generation_paths(self, binding_id, request_id=None):
+        generation_path = f"/v2/generations/{binding_id}"
+        turn_path = f"{generation_path}/turns"
+        cancel_path = (
+            f"{turn_path}/{request_id}/cancel" if request_id is not None else None
+        )
+        return generation_path, turn_path, cancel_path
+
     def test_health_auth_generation_turn_replay_and_secret_redaction(self) -> None:
         binding_id = uuid4()
         request_id = uuid4()
-        generation_path = f"/v1/generations/{binding_id}"
-        turn_path = f"{generation_path}/turns"
-        spec = {
-            "schema_version": "v1",
-            "runtime_kind": "fake",
-            "provider_model_id": "fake-model",
-            "bootstrap_fingerprint": "bootstrap",
-            "config_fingerprint": "config",
-        }
-        turn = {
-            "schema_version": "v1",
-            "request_id": str(request_id),
-            "user_message": "hello",
-            "behavior": "normal",
-        }
+        generation_path, turn_path, _ = self._generation_paths(binding_id)
+        spec = v2_spec()
+        turn = v2_turn(request_id=request_id, bootstrap={"history": []})
         with LiveGateway(self.state_path, self.token) as gateway:
-            health_status, health = gateway.request("GET", "/v1/health")
+            health_status, health = gateway.request("GET", "/v2/health")
             self.assertEqual(health_status, 200)
-            self.assertEqual(json.loads(health), {"status": "ok", "schema_version": "v1"})
+            self.assertEqual(json.loads(health), V2_HEALTH)
             for supplied_token in (None, "wrong-token"):
                 status, body = gateway.request(
                     "PUT", generation_path, spec, token=supplied_token
@@ -148,12 +197,14 @@ class RuntimeHttpTests(unittest.TestCase):
                 self.assertNotIn(self.token.encode(), body)
             unknown_status, _ = gateway.request("GET", "/not-a-route")
             self.assertEqual(unknown_status, 401)
-            self.assertEqual(sum(gateway.provider.generation_acquisitions.values()), 0)
+            self.assertEqual(sum(gateway.provider.generation_stages.values()), 0)
+            self.assertEqual(sum(gateway.provider.process_spawns.values()), 0)
             status, generation = gateway.request(
                 "PUT", generation_path, spec, token=self.token
             )
             self.assertEqual(status, 200)
-            self.assertEqual(json.loads(generation)["status"], "active")
+            self.assertEqual(json.loads(generation)["status"], "starting")
+            self.assertEqual(gateway.provider.process_spawns[str(binding_id)], 0)
             first_status, first_body = gateway.request(
                 "POST", turn_path, turn, token=self.token
             )
@@ -163,11 +214,22 @@ class RuntimeHttpTests(unittest.TestCase):
             self.assertEqual((first_status, second_status), (200, 200))
             self.assertEqual(first_body, second_body)
             events = [json.loads(line) for line in first_body.splitlines()]
-            self.assertEqual([event["sequence"] for event in events], list(range(1, 5)))
+            self.assertEqual(
+                [event["event_type"] for event in events],
+                [
+                    "generation_activated",
+                    "execution_resolved",
+                    "thinking_delta",
+                    "content_delta",
+                    "usage",
+                    "done",
+                ],
+            )
+            self.assertEqual([event["sequence"] for event in events], list(range(1, 7)))
             self.assertEqual(sum(event["terminal"] for event in events), 1)
             self.assertEqual(events[-1]["event_type"], "done")
             self.assertEqual(events[-1]["terminal_status"], "completed")
-            self.assertIs(events[-1]["bootstrap_consumed"], False)
+            self.assertIs(events[-1]["bootstrap_consumed"], True)
             self.assertTrue(
                 all(
                     event["terminal_status"] is None
@@ -176,11 +238,26 @@ class RuntimeHttpTests(unittest.TestCase):
                 )
             )
             self.assertNotIn(self.token.encode(), first_body)
-            self.assertIn(b"[REDACTED]", first_body)
+            provider_session = json.loads(
+                [
+                    line
+                    for line in first_body.decode("utf-8").splitlines()
+                    if "generation_activated" in line
+                ][0]
+            )["payload"]["provider_session_id"]
+            # The provider session appears exactly once, and only inside the
+            # dedicated durable control event (G-05 location).
+            self.assertEqual(first_body.count(provider_session.encode()), 1)
             rejected_status, rejected_body = gateway.request(
                 "POST",
                 turn_path,
-                {"request_id": str(uuid4()), "user_message": self.token},
+                {
+                    "schema_version": "v2",
+                    "request_id": str(uuid4()),
+                    "user_message": self.token,
+                    "requested_model_id": "gemini-3.1-pro-preview",
+                    "requested_thinking_level": "auto",
+                },
                 token=self.token,
             )
             self.assertEqual(rejected_status, 400)
@@ -194,17 +271,17 @@ class RuntimeHttpTests(unittest.TestCase):
 
     def test_authenticated_validation_errors_never_echo_input_or_mutate_provider(self) -> None:
         binding_id = uuid4()
-        generation_path = f"/v1/generations/{binding_id}"
-        turn_path = f"{generation_path}/turns"
+        generation_path, turn_path, retire_path = self._generation_paths(binding_id)
         retire_path = f"{generation_path}/retire"
         cases = (
             (
                 "PUT",
                 generation_path,
                 {
-                    "provider_model_id": "fake-model",
+                    "schema_version": "v2",
+                    "runtime_kind": "fake",
                     "bootstrap_fingerprint": "bootstrap",
-                    "config_fingerprint": "config",
+                    "system_instructions": "system",
                     "extra": self.token,
                 },
             ),
@@ -221,7 +298,7 @@ class RuntimeHttpTests(unittest.TestCase):
             (
                 "PUT",
                 generation_path,
-                f'{{"provider_model_id":"{self.token}"'.encode("utf-8"),
+                f'{{"schema_version":"{self.token}"'.encode("utf-8"),
             ),
         )
         with LiveGateway(self.state_path, self.token) as gateway:
@@ -239,12 +316,12 @@ class RuntimeHttpTests(unittest.TestCase):
             unauthorized_status, unauthorized_body = gateway.request(
                 "PUT",
                 generation_path,
-                f'{{"provider_model_id":"{self.token}"'.encode("utf-8"),
+                f'{{"schema_version":"{self.token}"'.encode("utf-8"),
                 token="wrong-token",
             )
             self.assertEqual(unauthorized_status, 401)
             self.assertEqual(json.loads(unauthorized_body), {"error": "unauthorized"})
-            self.assertEqual(sum(gateway.provider.generation_acquisitions.values()), 0)
+            self.assertEqual(sum(gateway.provider.generation_stages.values()), 0)
             self.assertEqual(sum(gateway.provider.turn_sends.values()), 0)
             with self.assertRaises(NotFoundError):
                 gateway.app.state.runtime_store.get_generation(str(binding_id))
@@ -254,22 +331,13 @@ class RuntimeHttpTests(unittest.TestCase):
     def test_http_observer_disconnect_does_not_cancel_or_resend_owner(self) -> None:
         binding_id = uuid4()
         request_id = uuid4()
-        generation_path = f"/v1/generations/{binding_id}"
-        turn_path = f"{generation_path}/turns"
-        cancel_path = f"{turn_path}/{request_id}/cancel"
-        spec = {
-            "provider_model_id": "fake-model",
-            "bootstrap_fingerprint": "bootstrap",
-            "config_fingerprint": "config",
-        }
-        turn = {
-            "request_id": str(request_id),
-            "user_message": "long HTTP owner",
-            "behavior": "cancel_late",
-        }
+        generation_path, turn_path, cancel_path = self._generation_paths(binding_id, request_id)
+        spec = v2_spec()
+        turn = v2_turn(request_id=request_id, bootstrap={"history": []})
         owner_result = []
 
         with LiveGateway(self.state_path, self.token) as gateway:
+            gateway.provider.set_behavior(str(request_id), "cancel_late")
             self.assertEqual(
                 gateway.request("PUT", generation_path, spec, self.token)[0],
                 200,
@@ -307,7 +375,7 @@ class RuntimeHttpTests(unittest.TestCase):
             owner_events = [json.loads(line) for line in owner_body.splitlines()]
             self.assertEqual(owner_events[-1]["payload"], {"code": "cancelled"})
             self.assertEqual(owner_events[-1]["terminal_status"], "cancelled")
-            self.assertIs(owner_events[-1]["bootstrap_consumed"], False)
+            self.assertIs(owner_events[-1]["bootstrap_consumed"], True)
             self.assertEqual(
                 gateway.app.state.runtime_store.terminal_count(*key),
                 1,
@@ -317,8 +385,7 @@ class RuntimeHttpTests(unittest.TestCase):
     def test_antigravity_http_selection_contract_and_fake_control_rejection(self) -> None:
         binding_id = uuid4()
         request_id = uuid4()
-        generation_path = f"/v1/generations/{binding_id}"
-        turn_path = f"{generation_path}/turns"
+        generation_path, turn_path, _ = self._generation_paths(binding_id)
         fixture = Path(__file__).resolve().parents[1] / "fixtures" / "fake_agy.py"
         data_root = Path(self.temp.name) / "providers"
         evidence = Path(self.temp.name) / "evidence.jsonl"
@@ -339,13 +406,10 @@ class RuntimeHttpTests(unittest.TestCase):
         )
         antigravity = AntigravityAdapter(data_root, supervisor)
         providers = {"fake": DeterministicFakeAdapter(), "antigravity": antigravity}
-        spec = {
-            "runtime_kind": "antigravity",
-            "provider_model_id": "gemini-3.1-pro-high",
-            "bootstrap_fingerprint": "bootstrap",
-            "config_fingerprint": "config",
-            "system_instructions": "private system contract",
-        }
+        spec = v2_spec(
+            runtime_kind="antigravity",
+            system_instructions="private system contract",
+        )
         with LiveGateway(self.state_path, self.token, providers) as gateway:
             unknown = {**spec, "runtime_kind": "unknown"}
             unknown_status, unknown_body = gateway.request(
@@ -358,17 +422,20 @@ class RuntimeHttpTests(unittest.TestCase):
 
             status, body = gateway.request("PUT", generation_path, spec, self.token)
             self.assertEqual(status, 200)
-            self.assertEqual(json.loads(body)["status"], "active")
+            self.assertEqual(json.loads(body)["status"], "starting")
             rejected = {
+                "schema_version": "v2",
                 "request_id": str(request_id),
                 "user_message": "must reject",
+                "requested_model_id": "gemini-3.1-pro-preview",
+                "requested_thinking_level": "auto",
                 "bootstrap_context": {"history": []},
                 "behavior": "exception",
             }
             rejected_status, rejected_body = gateway.request(
                 "POST", turn_path, rejected, self.token
             )
-            self.assertEqual(rejected_status, 400)
+            self.assertEqual(rejected_status, 422)
             self.assertEqual(json.loads(rejected_body), {"error": "invalid_request"})
             self.assertIsNone(
                 gateway.app.state.runtime_store.get_request(
@@ -376,12 +443,11 @@ class RuntimeHttpTests(unittest.TestCase):
                 )
             )
 
-            turn = {
-                "request_id": str(uuid4()),
-                "user_message": "hello through HTTP",
-                "bootstrap_context": {"history": []},
-                "ephemeral_current": "http-ephemeral-canary",
-            }
+            turn = v2_turn(
+                request_id=uuid4(),
+                bootstrap={"history": []},
+                ephemeral="http-ephemeral-canary",
+            )
             turn_status, turn_body = gateway.request(
                 "POST", turn_path, turn, self.token
             )
@@ -393,8 +459,7 @@ class RuntimeHttpTests(unittest.TestCase):
     def test_antigravity_http_owner_disconnect_closes_process_tree(self) -> None:
         binding_id = uuid4()
         request_id = uuid4()
-        generation_path = f"/v1/generations/{binding_id}"
-        turn_path = f"{generation_path}/turns"
+        generation_path, turn_path, _ = self._generation_paths(binding_id)
         fixture = Path(__file__).resolve().parents[1] / "fixtures" / "fake_agy.py"
         evidence_path = Path(self.temp.name) / "disconnect-evidence.jsonl"
         supervisor = AgyProcessSupervisor(
@@ -417,18 +482,11 @@ class RuntimeHttpTests(unittest.TestCase):
             supervisor,
         )
         providers = {"fake": DeterministicFakeAdapter(), "antigravity": antigravity}
-        spec = {
-            "runtime_kind": "antigravity",
-            "provider_model_id": "gemini-3.1-pro-high",
-            "bootstrap_fingerprint": "bootstrap",
-            "config_fingerprint": "config",
-            "system_instructions": "private system contract",
-        }
-        turn = {
-            "request_id": str(request_id),
-            "user_message": "disconnect owner",
-            "bootstrap_context": {"history": []},
-        }
+        spec = v2_spec(
+            runtime_kind="antigravity",
+            system_instructions="private system contract",
+        )
+        turn = v2_turn(request_id=request_id, bootstrap={"history": []})
         with LiveGateway(self.state_path, self.token, providers) as gateway:
             self.assertEqual(
                 gateway.request("PUT", generation_path, spec, self.token)[0],
@@ -483,14 +541,9 @@ class RuntimeHttpTests(unittest.TestCase):
     def test_restart_replays_completed_request_without_provider_send(self) -> None:
         binding_id = uuid4()
         request_id = uuid4()
-        generation_path = f"/v1/generations/{binding_id}"
-        turn_path = f"{generation_path}/turns"
-        spec = {
-            "provider_model_id": "fake-model",
-            "bootstrap_fingerprint": "bootstrap",
-            "config_fingerprint": "config",
-        }
-        turn = {"request_id": str(request_id), "user_message": "restart"}
+        generation_path, turn_path, _ = self._generation_paths(binding_id)
+        spec = v2_spec()
+        turn = v2_turn(request_id=request_id, bootstrap={"history": []})
         with LiveGateway(self.state_path, self.token) as first_gateway:
             self.assertEqual(
                 first_gateway.request("PUT", generation_path, spec, self.token)[0],

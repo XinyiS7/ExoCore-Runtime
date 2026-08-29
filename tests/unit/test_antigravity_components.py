@@ -1,6 +1,5 @@
 import json
 from pathlib import Path
-import sqlite3
 import tempfile
 import time
 import unittest
@@ -34,9 +33,7 @@ class AntigravityComponentTests(unittest.TestCase):
         canary = "system-instructions-private-canary"
         spec = GenerationSpec(
             runtime_kind="antigravity",
-            provider_model_id="gemini-3.1-pro-high",
             bootstrap_fingerprint="bootstrap",
-            config_fingerprint="config",
             system_instructions=canary,
         )
         store = RuntimeStateStore(self.root / "runtime.sqlite3")
@@ -49,62 +46,14 @@ class AntigravityComponentTests(unittest.TestCase):
         persisted = b"".join(path.read_bytes() for path in self.root.iterdir())
         self.assertNotIn(canary.encode(), persisted)
 
-    def test_legacy_generation_identity_migration_scrubs_system_plaintext(self) -> None:
-        database = self.root / "legacy-runtime.sqlite3"
-        store = RuntimeStateStore(database)
-        spec = GenerationSpec(
-            provider_model_id="fake-model",
-            bootstrap_fingerprint="bootstrap",
-            config_fingerprint="config",
-        )
-        store.ensure_generation(self.binding_id, spec)
-        canary = "legacy-system-plaintext-private-canary"
-        legacy = spec.model_dump(mode="json")
-        legacy["system_instructions"] = canary
-        malformed_binding = str(uuid4())
-        scalar_binding = str(uuid4())
-        store.ensure_generation(
-            malformed_binding,
-            spec.model_copy(update={"config_fingerprint": "malformed-config"}),
-        )
-        store.ensure_generation(
-            scalar_binding,
-            spec.model_copy(update={"config_fingerprint": "scalar-config"}),
-        )
-        malformed_canary = "malformed-legacy-private-canary"
-        scalar_canary = "scalar-legacy-private-canary"
-        connection = sqlite3.connect(database)
-        try:
-            connection.executemany(
-                "UPDATE generations SET identity_hash = ? WHERE binding_id = ?",
-                (
-                    (json.dumps(legacy), self.binding_id),
-                    ("not-json-" + malformed_canary, malformed_binding),
-                    (json.dumps(scalar_canary), scalar_binding),
-                ),
-            )
-            connection.commit()
-        finally:
-            connection.close()
-        before = database.read_bytes()
-        self.assertIn(canary.encode(), before)
-        self.assertIn(malformed_canary.encode(), before)
-        self.assertIn(scalar_canary.encode(), before)
-        RuntimeStateStore(database)
-        persisted = b"".join(
-            path.read_bytes()
-            for path in self.root.glob("legacy-runtime.sqlite3*")
-        )
-        self.assertNotIn(canary.encode(), persisted)
-        self.assertNotIn(malformed_canary.encode(), persisted)
-        self.assertNotIn(scalar_canary.encode(), persisted)
-
     def test_renderer_keeps_ephemeral_out_of_stdin_and_bootstrap_is_first_only(self) -> None:
         ephemeral = "ephemeral-render-canary"
         current = "current-user-once"
         request = TurnRequest(
             request_id=uuid4(),
             user_message=current,
+            requested_model_id="gemini-3.1-pro-preview",
+            requested_thinking_level="auto",
             bootstrap_context={"historical_turns": [{"role": "assistant", "content": "prior"}]},
             ephemeral_current=ephemeral,
         )
@@ -210,8 +159,10 @@ class AntigravityComponentTests(unittest.TestCase):
                 "init": {"model": "gemini-3.1-pro-high", "tools": ["x"]},
             },
             "gemini-3.1-pro-high",
+            "high",
         )
         self.assertEqual(generation.provider_session_id, conversation_id)
+        self.assertEqual(generation.observed_effort, "high")
         normalizer = AgyTurnNormalizer(conversation_id)
         events = []
         for payload in (
@@ -346,17 +297,23 @@ class AntigravityComponentTests(unittest.TestCase):
     def test_known_provider_session_does_not_claim_bootstrap_was_sent(self) -> None:
         spec = GenerationSpec(
             runtime_kind="antigravity",
-            provider_model_id="gemini-3.1-pro-high",
             bootstrap_fingerprint="bootstrap",
-            config_fingerprint="config",
-            provider_session_id="known-provider-session",
             system_instructions="private system",
         )
         store = RuntimeStateStore(self.root / "known-session.sqlite3")
         record, created = store.ensure_generation(self.binding_id, spec)
         self.assertTrue(created)
-        self.assertEqual(record.provider_session_id, "known-provider-session")
+        self.assertEqual(record.status, "starting")
+        self.assertIsNone(record.provider_session_id)
         self.assertFalse(record.bootstrap_sent)
+        store.activate_generation(
+            self.binding_id,
+            "known-provider-session",
+            str(uuid4()),
+        )
+        activated = store.get_generation(self.binding_id)
+        self.assertEqual(activated.provider_session_id, "known-provider-session")
+        self.assertFalse(activated.bootstrap_sent)
 
     def test_init_model_mismatch_is_fatal_before_turn(self) -> None:
         with self.assertRaises(ProviderAdapterError) as caught:
@@ -367,6 +324,7 @@ class AntigravityComponentTests(unittest.TestCase):
                     "init": {"model": "wrong-model"},
                 },
                 "gemini-3.1-pro-high",
+                "high",
             )
         self.assertEqual(caught.exception.code, "agy_model_mismatch")
         self.assertTrue(caught.exception.fatal_generation)

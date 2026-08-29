@@ -18,7 +18,11 @@ import subprocess
 import threading
 import time
 
-from exocore_runtime.contracts import ProviderEvent, ProviderGeneration
+from exocore_runtime.contracts import (
+    ProcessExecutionOptions,
+    ProviderEvent,
+    ProviderGeneration,
+)
 from exocore_runtime.errors import ProviderAdapterError
 from exocore_runtime.providers.antigravity.ndjson import (
     AgyTurnNormalizer,
@@ -109,8 +113,8 @@ class GenerationLayout:
     profile: Path
     workspace: Path
     agent_name: str
-    provider_model_id: str
     provider_session_id: str | None
+    execution_options: ProcessExecutionOptions
 
 
 @dataclass
@@ -136,6 +140,7 @@ class AgyProcessSupervisor:
         self._preflight_lock = asyncio.Lock()
         self._preflight_complete = False
         self.quota_snapshot: dict[str, int] | None = None
+        self.available_model_slugs: frozenset[str] = frozenset()
 
     async def ensure(self, layout: GenerationLayout) -> ProviderGeneration:
         lock = await self._binding_lock(layout.binding_id)
@@ -143,21 +148,40 @@ class AgyProcessSupervisor:
             self._validate_account_default(layout.profile)
             current = self._sessions.get(layout.binding_id)
             if current is not None and current.process.returncode is None:
-                if current.layout.provider_model_id != layout.provider_model_id:
-                    raise ProviderAdapterError("agy_model_mismatch", fatal_generation=True)
-                return ProviderGeneration(
-                    provider_session_id=current.provider_session_id,
-                    observed_model=layout.provider_model_id,
-                )
-            if current is not None:
+                if current.layout.execution_options == layout.execution_options:
+                    if (
+                        layout.provider_session_id is not None
+                        and current.provider_session_id != layout.provider_session_id
+                    ):
+                        raise ProviderAdapterError("resume_identity_mismatch")
+                    return ProviderGeneration(
+                        provider_session_id=current.provider_session_id,
+                        observed_model=layout.execution_options.provider_model_slug,
+                        observed_effort=layout.execution_options.effort,
+                    )
+                await self._dispose_session(current, force=True)
+                self._sessions.pop(layout.binding_id, None)
+            elif current is not None:
                 await self._dispose_session(current, force=True)
                 self._sessions.pop(layout.binding_id, None)
             await self._preflight(layout.profile, layout.workspace)
-            session = await self._spawn(layout)
+            if layout.execution_options.provider_model_slug not in self.available_model_slugs:
+                raise ProviderAdapterError("frozen_execution_unavailable")
+            try:
+                session = await self._spawn(layout)
+            except ProviderAdapterError as exc:
+                if (
+                    layout.provider_session_id is not None
+                    and exc.code
+                    not in {"resume_identity_mismatch", "agy_model_mismatch"}
+                ):
+                    raise ProviderAdapterError("provider_session_unavailable") from exc
+                raise
             self._sessions[layout.binding_id] = session
             return ProviderGeneration(
                 provider_session_id=session.provider_session_id,
-                observed_model=layout.provider_model_id,
+                observed_model=layout.execution_options.provider_model_slug,
+                observed_effort=layout.execution_options.effort,
             )
 
     async def stream_turn(
@@ -314,6 +338,13 @@ class AgyProcessSupervisor:
             major, minor, patch = (int(part) for part in match.groups())
             if (major, minor, patch) < (1, 1, 20) or (major, minor) >= (1, 2):
                 raise ProviderAdapterError("agy_version_unsupported", fatal_generation=True)
+            models_stdout = await self._run_bounded(
+                (*self.config.command_prefix, "models"),
+                environment,
+                workspace,
+                "agy_models_unavailable",
+            )
+            self.available_model_slugs = self._parse_models(models_stdout)
             quota_stdout = await self._run_bounded(
                 (*self.config.command_prefix, "-p", "/quota", "--output-format", "json"),
                 environment,
@@ -348,15 +379,18 @@ class AgyProcessSupervisor:
             "--agent",
             layout.agent_name,
             "--model",
-            layout.provider_model_id,
+            layout.execution_options.provider_model_slug,
+            "--effort",
+            layout.execution_options.effort,
             "--input-format",
             "stream-json",
             "--output-format",
             "stream-json",
             "--print-timeout",
             f"{int(self.config.hard_timeout_seconds)}s",
-            "--sandbox",
         ]
+        if layout.execution_options.sandbox:
+            argv.append("--sandbox")
         if layout.provider_session_id is not None:
             argv.extend(("--conversation", layout.provider_session_id))
         environment = self._isolated_environment(layout.profile)
@@ -410,12 +444,16 @@ class AgyProcessSupervisor:
                 raise ProviderAdapterError("agy_init_stderr", fatal_generation=True)
             if line is None:
                 raise ProviderAdapterError("agy_init_eof", fatal_generation=True)
-            acquired = parse_init(parse_line(line), layout.provider_model_id)
+            acquired = parse_init(
+                parse_line(line),
+                layout.execution_options.provider_model_slug,
+                layout.execution_options.effort,
+            )
             if (
                 layout.provider_session_id is not None
                 and acquired.provider_session_id != layout.provider_session_id
             ):
-                raise ProviderAdapterError("agy_resume_session_mismatch", fatal_generation=True)
+                raise ProviderAdapterError("resume_identity_mismatch")
             provisional.provider_session_id = acquired.provider_session_id
             await self._assert_ready_after_init(provisional)
             return provisional
@@ -767,6 +805,21 @@ class AgyProcessSupervisor:
                 await queue.put((tag, line))
         finally:
             await queue.put((tag, None))
+
+    @staticmethod
+    def _parse_models(stdout: bytes) -> frozenset[str]:
+        try:
+            text = stdout.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as exc:
+            raise ProviderAdapterError("agy_models_unavailable", fatal_generation=True) from exc
+        slugs = frozenset(
+            line.split(maxsplit=1)[0]
+            for line in text.splitlines()
+            if line.strip()
+        )
+        if not slugs or any(not re.fullmatch(r"[a-z0-9][a-z0-9.-]*", slug) for slug in slugs):
+            raise ProviderAdapterError("agy_models_unavailable", fatal_generation=True)
+        return slugs
 
     @staticmethod
     def _parse_quota(stdout: bytes) -> dict[str, int]:
