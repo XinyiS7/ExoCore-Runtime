@@ -16,10 +16,15 @@ from exocore_runtime.contracts import (
     PROTOCOL_VERSION,
     RUNTIME_CAPABILITIES,
     GenerationSpec,
+    JournalReplayHeader,
     RetireRequest,
     TurnRequest,
 )
-from exocore_runtime.errors import InvalidRequestError, RuntimeGatewayError
+from exocore_runtime.errors import (
+    InvalidRequestError,
+    NotFoundError,
+    RuntimeGatewayError,
+)
 from exocore_runtime.providers.antigravity.adapter import AntigravityAdapter
 from exocore_runtime.providers.antigravity.process import (
     AgyProcessConfig,
@@ -149,6 +154,62 @@ def create_app(
     @app.post("/v2/generations/{binding_id}/turns/{request_id}/cancel")
     async def cancel(binding_id: UUID, request_id: UUID):
         return await service.cancel(binding_id, request_id)
+
+    class JournalNotTerminalError(RuntimeGatewayError):
+        code = "journal_not_terminal"
+        status_code = 409
+
+    @app.get("/v2/generations/{binding_id}/turns/{request_id}/journal")
+    async def request_journal_replay(
+        binding_id: UUID,
+        request_id: UUID,
+    ) -> StreamingResponse:
+        """Authenticated read-only replay of one terminal request journal.
+
+        Resolves nothing: no provider lookup, no generation ensure, no process
+        supervisor, no prepare/send/cancel/resume/retire and no SQLite write.
+        Only the durable request row and its ordered event snapshot are read.
+        """
+
+        binding = str(binding_id)
+        request_key = str(request_id)
+        request_record = service.store.get_request(binding, request_key)
+        if request_record is None:
+            raise NotFoundError()
+        if not request_record.terminal:
+            raise JournalNotTerminalError()
+        events = service.journal.replay(binding, request_key)
+        if not events:
+            raise RuntimeGatewayError()
+        last_sequence = int(request_record.last_sequence)
+        if (
+            last_sequence < 1
+            or len(events) != last_sequence
+            or events[-1].sequence != last_sequence
+            or not events[-1].terminal
+            or events[-1].terminal_status != request_record.status
+        ):
+            raise RuntimeGatewayError()
+        for index, event in enumerate(events, start=1):
+            if event.sequence != index:
+                raise RuntimeGatewayError()
+        header = JournalReplayHeader(
+            schema_version="v2",
+            frame_type="journal_header",
+            binding_id=binding_id,
+            request_id=request_id,
+            request_payload_sha256=request_record.payload_hash,
+            request_status=request_record.status,
+            event_count=len(events),
+            last_sequence=last_sequence,
+        )
+
+        async def lines():
+            yield header.model_dump_json() + "\n"
+            for event in events:
+                yield event.model_dump_json() + "\n"
+
+        return StreamingResponse(lines(), media_type="application/x-ndjson")
 
     @app.post("/v2/generations/{binding_id}/retire")
     async def retire(binding_id: UUID, body: RetireRequest | None = None):

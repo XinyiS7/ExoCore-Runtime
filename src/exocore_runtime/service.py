@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Mapping
-import hashlib
-import json
 from uuid import UUID, uuid4
 
 from exocore_runtime.contracts import (
@@ -17,6 +15,7 @@ from exocore_runtime.contracts import (
     RetireResult,
     RuntimeEvent,
     TurnRequest,
+    canonical_turn_request_hash,
 )
 from exocore_runtime.errors import (
     ConflictError,
@@ -516,10 +515,4 @@ class RuntimeService:
 
     @staticmethod
     def _request_hash(request: TurnRequest) -> str:
-        canonical = json.dumps(
-            request.model_dump(mode="json"),
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-        ).encode("utf-8")
-        return hashlib.sha256(canonical).hexdigest()
+        return canonical_turn_request_hash(request)

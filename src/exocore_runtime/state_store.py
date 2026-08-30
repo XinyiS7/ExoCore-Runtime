@@ -177,6 +177,9 @@ class RuntimeStateStore:
                         'completed', 'failed', 'cancelled', 'indeterminate'
                     )),
                     bootstrap_consumed INTEGER CHECK(bootstrap_consumed IN (0, 1)),
+                    provider_input_effect TEXT CHECK(provider_input_effect IN (
+                        'not_sent', 'may_have_reached_provider'
+                    )),
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     PRIMARY KEY(binding_id, request_id, sequence),
                     FOREIGN KEY(binding_id, request_id)
@@ -188,6 +191,7 @@ class RuntimeStateStore:
                 ON events(binding_id, request_id, event_type) WHERE is_control = 1;
                 """
             )
+            self._ensure_provider_input_effect_column(connection)
             connection.execute(
                 "INSERT OR IGNORE INTO runtime_meta(key, value) VALUES ('schema_version', ?)",
                 (str(SCHEMA_VERSION),),
@@ -345,6 +349,7 @@ class RuntimeStateStore:
                     event_type="error",
                     payload_json=self._canonical_payload({"code": "indeterminate_after_restart"}),
                     terminal_status="indeterminate",
+                    provider_input_effect="may_have_reached_provider",
                 )
                 connection.execute(
                     """
@@ -641,7 +646,15 @@ class RuntimeStateStore:
                 (sequence, binding_id, request_id),
             )
         return self._runtime_event(
-            binding_id, request_id, sequence, event_type, json.loads(payload_json), False, None, None
+            binding_id,
+            request_id,
+            sequence,
+            event_type,
+            json.loads(payload_json),
+            False,
+            None,
+            None,
+            None,
         )
 
     def append_terminal(
@@ -675,6 +688,10 @@ class RuntimeStateStore:
                     event_type=event_type,
                     payload_json=payload_json,
                     terminal_status=status,
+                    provider_input_effect=(
+                        "not_sent" if record.status == "prepared"
+                        else "may_have_reached_provider"
+                    ),
                 )
                 connection.execute(
                     """
@@ -745,6 +762,9 @@ class RuntimeStateStore:
                 event_type="error",
                 payload_json=cls._canonical_payload({"code": code}),
                 terminal_status=status,
+                provider_input_effect=(
+                    "not_sent" if not was_sent else "may_have_reached_provider"
+                ),
             )
             connection.execute(
                 """
@@ -766,7 +786,10 @@ class RuntimeStateStore:
         event_type: str,
         payload_json: str,
         terminal_status: str,
+        provider_input_effect: str,
     ) -> None:
+        if provider_input_effect not in {"not_sent", "may_have_reached_provider"}:
+            raise ValueError("invalid provider input effect")
         generation = connection.execute(
             "SELECT bootstrap_sent FROM generations WHERE binding_id = ?", (binding_id,)
         ).fetchone()
@@ -776,8 +799,9 @@ class RuntimeStateStore:
             """
             INSERT INTO events(
                 binding_id, request_id, sequence, event_type, payload_json,
-                is_control, is_terminal, terminal_status, bootstrap_consumed
-            ) VALUES (?, ?, ?, ?, ?, 0, 1, ?, ?)
+                is_control, is_terminal, terminal_status, bootstrap_consumed,
+                provider_input_effect
+            ) VALUES (?, ?, ?, ?, ?, 0, 1, ?, ?, ?)
             """,
             (
                 binding_id,
@@ -787,8 +811,23 @@ class RuntimeStateStore:
                 payload_json,
                 terminal_status,
                 int(bool(generation["bootstrap_sent"])),
+                provider_input_effect,
             ),
         )
+
+    @staticmethod
+    def _ensure_provider_input_effect_column(connection: sqlite3.Connection) -> None:
+        """Additively align a pre-existing v2 store with the two-state event truth."""
+
+        columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(events)").fetchall()
+        }
+        if "provider_input_effect" not in columns:
+            connection.execute(
+                "ALTER TABLE events ADD COLUMN provider_input_effect TEXT "
+                "CHECK(provider_input_effect IN ('not_sent', 'may_have_reached_provider'))"
+            )
 
     @staticmethod
     def _canonical_payload(payload: dict[str, object]) -> str:
@@ -842,6 +881,7 @@ class RuntimeStateStore:
         terminal: bool,
         terminal_status: str | None,
         bootstrap_consumed: bool | None,
+        provider_input_effect: str | None,
     ) -> RuntimeEvent:
         return RuntimeEvent(
             binding_id=UUID(binding_id),
@@ -852,11 +892,17 @@ class RuntimeStateStore:
             terminal=terminal,
             terminal_status=terminal_status,
             bootstrap_consumed=bootstrap_consumed,
+            provider_input_effect=provider_input_effect,
         )
 
     def _event_from_row(self, row: sqlite3.Row) -> RuntimeEvent:
         terminal = bool(row["is_terminal"])
         bootstrap_value = row["bootstrap_consumed"]
+        effect = row["provider_input_effect"]
+        if effect is None and terminal:
+            # Legacy rows predate the two-state truth. The fail-closed projection
+            # is conservative: never claim a terminal request was not sent.
+            effect = "may_have_reached_provider"
         return self._runtime_event(
             row["binding_id"],
             row["request_id"],
@@ -866,4 +912,5 @@ class RuntimeStateStore:
             terminal,
             row["terminal_status"],
             bool(bootstrap_value) if bootstrap_value is not None else None,
+            effect,
         )

@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import patch
 from uuid import uuid4
 
-from exocore_runtime.contracts import GenerationSpec, TurnRequest
+from exocore_runtime.contracts import ContinuityDeltaTurn, GenerationSpec, TurnRequest
 from exocore_runtime.errors import ProviderAdapterError
 from exocore_runtime.providers.antigravity.ephemeral_hook import (
     EphemeralMailbox,
@@ -54,14 +54,14 @@ class AntigravityComponentTests(unittest.TestCase):
             user_message=current,
             requested_model_id="gemini-3.1-pro-preview",
             requested_thinking_level="auto",
-            bootstrap_context={"historical_turns": [{"role": "assistant", "content": "prior"}]},
+            bootstrap_context={"continuity_anchor": "prior"},
             ephemeral_current=ephemeral,
         )
         first = render_stdin_line(request, is_first_turn=True)
         payload = json.loads(first)
         content = payload["message"]["content"]
-        envelope = json.loads(content)
-        self.assertEqual(envelope["current_user_message"], current)
+        self.assertIn("ExoCorePriorContinuity v1", content)
+        self.assertIn("prior", content)
         self.assertEqual(content.count(current), 1)
         self.assertNotIn(ephemeral, content)
         later = request.model_copy(update={"bootstrap_context": None})
@@ -81,6 +81,148 @@ class AntigravityComponentTests(unittest.TestCase):
                 "mcp(*)",
             },
         )
+
+    def test_renderer_preserves_raw_multiline_history_and_literal_backslash_n(self) -> None:
+        current = "continue this conversation"
+        multiline = "first paragraph\n\n**bold**\n\n---\n\n```python\nprint('ok')\n```"
+        intentional_literal = r"the two characters \n stay literal"
+        request = TurnRequest(
+            request_id=uuid4(),
+            user_message=current,
+            requested_model_id="gemini-3.1-pro-preview",
+            requested_thinking_level="auto",
+            bootstrap_context={
+                "synthetic_fake_pair": {
+                    "user": "fake user\nsecond line",
+                    "assistant": "fake assistant\n\nwith spacing",
+                },
+                "buffer_turns": "[User] buffered\n\n[AI] buffered reply",
+                "historical_flow": [
+                    {
+                        "role": "user",
+                        "content": "older user\n\nsecond paragraph",
+                        "timestamp": "2026-08-20 21:13",
+                    },
+                    {
+                        "role": "assistant",
+                        "content": multiline + "\n\n" + intentional_literal,
+                        "timestamp": None,
+                    },
+                ],
+            },
+        )
+
+        rendered = render_stdin_line(request, is_first_turn=True)
+        self.assertEqual(rendered.count(b"\n"), 1)
+        content = json.loads(rendered)["message"]["content"]
+
+        self.assertIn(multiline, content)
+        self.assertIn(intentional_literal, content)
+        self.assertNotIn(r"first paragraph\n\n**bold**", content)
+        self.assertIn("HistoricalTurn 0 role=user timestamp=2026-08-20 21:13", content)
+        self.assertIn("HistoricalTurn 1 role=assistant", content)
+        self.assertLess(content.index("older user"), content.index("first paragraph"))
+        self.assertEqual(content.count(current), 1)
+
+    def test_later_turn_delta_renders_ordered_sections_then_single_current(self) -> None:
+        current = "current later turn"
+        multiline = "delta user\n\nsecond paragraph\n\n- list item"
+        intentional_literal = r"delta literal \n stays literal"
+        request = TurnRequest(
+            request_id=uuid4(),
+            user_message=current,
+            requested_model_id="gemini-3.1-pro-preview",
+            requested_thinking_level="auto",
+            bootstrap_context=None,
+            continuity_delta=(
+                ContinuityDeltaTurn(
+                    role="user",
+                    content=multiline,
+                    timestamp="2026-08-20T12:34:56.123456Z",
+                ),
+                ContinuityDeltaTurn(
+                    role="assistant",
+                    content="delta assistant reply\n\n" + intentional_literal,
+                    timestamp=None,
+                ),
+            ),
+        )
+
+        rendered = render_stdin_line(request, is_first_turn=False)
+        self.assertEqual(rendered.count(b"\n"), 1)
+        payload = json.loads(rendered)
+        self.assertEqual(payload["event"], "user")
+        content = payload["message"]["content"]
+
+        self.assertNotIn("ExoCorePriorContinuity v1", content)
+        self.assertIn(
+            "HistoricalTurn 0 role=user timestamp=2026-08-20T12:34:56.123456Z",
+            content,
+        )
+        self.assertIn("HistoricalTurn 1 role=assistant", content)
+        self.assertIn(multiline, content)
+        self.assertIn(intentional_literal, content)
+        self.assertNotIn(r"delta user\n\nsecond paragraph", content)
+        self.assertEqual(content.count(current), 1)
+        self.assertLess(
+            content.index("delta user"), content.index("delta assistant reply")
+        )
+        self.assertLess(
+            content.index("delta assistant reply"), content.index(current)
+        )
+        self.assertTrue(content.rstrip().endswith(f"--- end CurrentUserMessage ---"))
+
+    def test_later_turn_empty_delta_preserves_current_user_only_rendering(self) -> None:
+        current = "model switch entry"
+        request = TurnRequest(
+            request_id=uuid4(),
+            user_message=current,
+            requested_model_id="gemini-3.1-flash",
+            requested_thinking_level="low",
+            bootstrap_context=None,
+            continuity_delta=(),
+        )
+        rendered = render_stdin_line(request, is_first_turn=False)
+        self.assertEqual(rendered.count(b"\n"), 1)
+        content = json.loads(rendered)["message"]["content"]
+        self.assertEqual(content, current)
+        self.assertNotIn("HistoricalTurn", content)
+        self.assertNotIn("CurrentUserMessage", content)
+
+    def test_first_turn_delta_follows_bootstrap_sections_before_current(self) -> None:
+        current = "first send after unsent failure"
+        request = TurnRequest(
+            request_id=uuid4(),
+            user_message=current,
+            requested_model_id="gemini-3.1-pro-preview",
+            requested_thinking_level="auto",
+            bootstrap_context={
+                "synthetic_fake_pair": {"user": "fake", "assistant": "pair"},
+                "buffer_turns": "",
+                "historical_flow": [],
+            },
+            continuity_delta=(
+                ContinuityDeltaTurn(
+                    role="user",
+                    content="failed unsent user",
+                    timestamp="2026-08-20T13:00:00.000000Z",
+                ),
+            ),
+        )
+        rendered = render_stdin_line(request, is_first_turn=True)
+        self.assertEqual(rendered.count(b"\n"), 1)
+        content = json.loads(rendered)["message"]["content"]
+        self.assertIn("ExoCorePriorContinuity v1", content)
+        self.assertIn("SyntheticFakePair user", content)
+        self.assertIn(
+            "HistoricalTurn 0 role=user timestamp=2026-08-20T13:00:00.000000Z",
+            content,
+        )
+        self.assertEqual(content.count(current), 1)
+        self.assertLess(
+            content.index("SyntheticFakePair user"), content.index("failed unsent user")
+        )
+        self.assertLess(content.index("failed unsent user"), content.index(current))
 
     def test_mailbox_consumes_once_and_receipt_contains_no_plaintext(self) -> None:
         canary = "ephemeral-mailbox-canary"

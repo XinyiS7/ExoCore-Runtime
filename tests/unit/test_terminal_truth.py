@@ -16,7 +16,6 @@ from exocore_runtime.contracts import (
     TurnRequest,
 )
 from exocore_runtime.errors import ProviderAdapterError, StateResetRequiredError
-from exocore_runtime.providers.fake import DeterministicFakeAdapter
 from exocore_runtime.service import RuntimeService
 from exocore_runtime.state_store import RuntimeStateStore
 
@@ -115,33 +114,68 @@ class RuntimeEventContractTests(unittest.TestCase):
                     terminal=True,
                     terminal_status=status,
                     bootstrap_consumed=False,
+                    provider_input_effect=(
+                        "may_have_reached_provider"
+                        if status == "completed"
+                        else "not_sent"
+                    ),
                 )
                 self.assertEqual(event.terminal_status, status)
                 self.assertIs(event.bootstrap_consumed, False)
+                self.assertEqual(
+                    event.provider_input_effect,
+                    "may_have_reached_provider" if status == "completed" else "not_sent",
+                )
 
         nonterminal = RuntimeEvent(
             **{**self.event_data(), "event_type": "content_delta"},
         )
         self.assertIsNone(nonterminal.terminal_status)
         self.assertIsNone(nonterminal.bootstrap_consumed)
+        self.assertIsNone(nonterminal.provider_input_effect)
 
     def test_incomplete_wrong_or_nonterminal_truth_fails_closed(self) -> None:
         cases = (
             {"terminal": True},
             {"terminal": True, "terminal_status": "failed"},
             {"terminal": True, "bootstrap_consumed": False},
+            {"terminal": True, "provider_input_effect": "not_sent"},
+            {
+                "terminal": True,
+                "terminal_status": "failed",
+                "bootstrap_consumed": False,
+                "provider_input_effect": "consumed",
+            },
             {
                 "terminal": True,
                 "terminal_status": "unknown",
                 "bootstrap_consumed": False,
+                "provider_input_effect": "not_sent",
             },
             {
                 "terminal": True,
                 "terminal_status": "failed",
                 "bootstrap_consumed": "false",
+                "provider_input_effect": "not_sent",
+            },
+            {
+                "terminal": True,
+                "terminal_status": "completed",
+                "bootstrap_consumed": True,
+                "provider_input_effect": "not_sent",
             },
             {"terminal_status": "failed", "bootstrap_consumed": False},
             {"terminal_status": None, "bootstrap_consumed": False},
+            {
+                "terminal_status": "failed",
+                "bootstrap_consumed": False,
+                "provider_input_effect": "not_sent",
+            },
+            {
+                "provider_input_effect": None,
+                "terminal_status": None,
+                "bootstrap_consumed": False,
+            },
         )
         for truth in cases:
             with self.subTest(truth=truth), self.assertRaises(ValidationError):
@@ -217,6 +251,39 @@ class RuntimeStateTerminalTruthTests(unittest.TestCase):
                 self.assertEqual(replay[-1], event)
                 self.assertEqual(replay[-1].terminal_status, status)
                 self.assertIs(replay[-1].bootstrap_consumed, True)
+                self.assertEqual(
+                    replay[-1].provider_input_effect,
+                    "may_have_reached_provider",
+                )
+
+    def test_persisted_provider_input_effect_is_two_state_durable_truth(self) -> None:
+        prepared_binding = self.active_generation()
+        prepared_request = self.claim_resolved(prepared_binding)
+        not_sent, _ = self.store.append_terminal(
+            prepared_binding,
+            prepared_request,
+            "error",
+            {"code": "prepare_failed"},
+            "failed",
+            "prepare_failed",
+        )
+        self.assertEqual(not_sent.provider_input_effect, "not_sent")
+
+        sent_binding = self.active_generation()
+        sent_request = self.claim_resolved(sent_binding)
+        self.mark_sent(sent_binding, sent_request, consume_bootstrap=True)
+        may_have, _ = self.store.append_terminal(
+            sent_binding,
+            sent_request,
+            "done",
+            {"finish_reason": "stop"},
+            "completed",
+            "completed",
+        )
+        self.assertEqual(may_have.provider_input_effect, "may_have_reached_provider")
+        replayed = self.store.read_events(sent_binding, sent_request)[-1]
+        self.assertEqual(replayed.provider_input_effect, "may_have_reached_provider")
+
 
     def test_duplicate_terminal_preserves_original_terminal_time_truth(self) -> None:
         binding_id = self.active_generation()
@@ -274,6 +341,8 @@ class RuntimeStateTerminalTruthTests(unittest.TestCase):
         sent = self.store.read_events(sent_binding, sent_request)[-1]
         self.assertEqual((prepared.terminal_status, prepared.bootstrap_consumed), ("failed", False))
         self.assertEqual((sent.terminal_status, sent.bootstrap_consumed), ("indeterminate", True))
+        self.assertEqual(prepared.provider_input_effect, "not_sent")
+        self.assertEqual(sent.provider_input_effect, "may_have_reached_provider")
 
         restart_binding = self.active_generation()
         restart_request = self.claim_resolved(restart_binding)
@@ -286,6 +355,10 @@ class RuntimeStateTerminalTruthTests(unittest.TestCase):
         self.assertEqual(
             (second_projection.terminal_status, second_projection.bootstrap_consumed),
             ("indeterminate", True),
+        )
+        self.assertEqual(
+            second_projection.provider_input_effect,
+            "may_have_reached_provider",
         )
 
 
@@ -377,10 +450,10 @@ class V1StoreResetGuardTests(unittest.TestCase):
 class ProviderBoundaryProjectionTests(unittest.IsolatedAsyncioTestCase):
     async def test_provider_failures_keep_terminal_and_bootstrap_truth(self) -> None:
         cases = (
-            ("prepare", "failed", False),
-            ("stream", "failed", True),
+            ("prepare", "failed", False, "not_sent"),
+            ("stream", "failed", True, "may_have_reached_provider"),
         )
-        for boundary, expected_status, expected_consumed in cases:
+        for boundary, expected_status, expected_consumed, expected_effect in cases:
             with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as temp_dir:
                 adapter = BootstrapBoundaryAdapter(boundary)
                 service = RuntimeService(
@@ -405,6 +478,7 @@ class ProviderBoundaryProjectionTests(unittest.IsolatedAsyncioTestCase):
                 terminal = events[-1]
                 self.assertEqual(terminal.terminal_status, expected_status)
                 self.assertIs(terminal.bootstrap_consumed, expected_consumed)
+                self.assertEqual(terminal.provider_input_effect, expected_effect)
                 replay = await collect(service, binding_id, request)
                 self.assertEqual(
                     [event.model_dump_json() for event in events],

@@ -30,6 +30,7 @@ V2_HEALTH = {
         "durable_control_events",
         "requested_effective_execution",
         "strict_session_resume",
+        "request_journal_replay",
     ],
 }
 

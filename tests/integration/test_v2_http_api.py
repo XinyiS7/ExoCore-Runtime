@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -49,6 +52,7 @@ class V2HttpContractTests(unittest.TestCase):
                     "durable_control_events",
                     "requested_effective_execution",
                     "strict_session_resume",
+                    "request_journal_replay",
                 ],
             },
         )
@@ -88,6 +92,134 @@ class V2HttpContractTests(unittest.TestCase):
         self.assertEqual(response.status_code, 422)
         self.assertEqual(response.json(), {"error": "invalid_request"})
         self.assertEqual(sum(self.provider.generation_stages.values()), 0)
+
+    def _completed_request(self):
+        binding_id = uuid4()
+        response = self.client.put(
+            f"/v2/generations/{binding_id}",
+            headers=self.auth(),
+            json={
+                "schema_version": "v2",
+                "runtime_kind": "fake",
+                "bootstrap_fingerprint": "bootstrap",
+                "system_instructions": "system",
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        request_id = uuid4()
+        turn = {
+            "schema_version": "v2",
+            "request_id": str(request_id),
+            "user_message": "journal probe",
+            "requested_model_id": "gemini-3.1-pro-preview",
+            "requested_thinking_level": "auto",
+            "bootstrap_context": {"history": []},
+            "continuity_delta": [],
+            "ephemeral_current": None,
+        }
+        response = self.client.post(
+            f"/v2/generations/{binding_id}/turns",
+            headers=self.auth(),
+            json=turn,
+        )
+        self.assertEqual(response.status_code, 200)
+        return binding_id, request_id
+
+    def test_journal_replay_requires_auth_and_forbids_token_in_path(self) -> None:
+        binding_id, request_id = self._completed_request()
+        url = f"/v2/generations/{binding_id}/turns/{request_id}/journal"
+        self.assertEqual(self.client.get(url).status_code, 401)
+        token_url = f"/v2/generations/{binding_id}/turns/{request_id}/{self.token}/journal"
+        self.assertEqual(self.client.get(token_url, headers=self.auth()).status_code, 401)
+
+    def test_journal_replay_404_and_409_codes_are_exact(self) -> None:
+        missing = self.client.get(
+            f"/v2/generations/{uuid4()}/turns/{uuid4()}/journal",
+            headers=self.auth(),
+        )
+        self.assertEqual(missing.status_code, 404)
+        self.assertEqual(missing.json(), {"error": "not_found"})
+
+        from exocore_runtime.contracts import GenerationSpec
+
+        binding_id = uuid4()
+        self.store.ensure_generation(
+            str(binding_id),
+            GenerationSpec(
+                runtime_kind="fake",
+                bootstrap_fingerprint="bootstrap",
+                system_instructions="system",
+            ),
+        )
+        request_id = uuid4()
+        self.store.claim_request(
+            str(binding_id),
+            str(request_id),
+            "a" * 64,
+            "gemini-3.1-pro-preview",
+            "auto",
+            "owner",
+        )
+        prepared = self.client.get(
+            f"/v2/generations/{binding_id}/turns/{request_id}/journal",
+            headers=self.auth(),
+        )
+        self.assertEqual(prepared.status_code, 409)
+        self.assertEqual(prepared.json(), {"error": "journal_not_terminal"})
+
+    def test_journal_replay_returns_exact_header_and_ordered_frames(self) -> None:
+        binding_id, request_id = self._completed_request()
+        store_request = self.store.get_request(str(binding_id), str(request_id))
+        self.assertIsNotNone(store_request)
+        expected_hash = store_request.payload_hash
+        response = self.client.get(
+            f"/v2/generations/{binding_id}/turns/{request_id}/journal",
+            headers=self.auth(),
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.headers["content-type"].split(";", 1)[0],
+            "application/x-ndjson",
+        )
+        lines = [
+            line
+            for line in response.text.split("\n")
+            if line.strip()
+        ]
+        header = json.loads(lines[0])
+        self.assertEqual(header["frame_type"], "journal_header")
+        self.assertEqual(header["schema_version"], "v2")
+        self.assertEqual(header["binding_id"], str(binding_id))
+        self.assertEqual(header["request_id"], str(request_id))
+        self.assertEqual(header["request_payload_sha256"], expected_hash)
+        self.assertEqual(header["request_status"], "completed")
+        self.assertEqual(header["event_count"], len(lines) - 1)
+        self.assertEqual(header["last_sequence"], len(lines) - 1)
+        events = [json.loads(line) for line in lines[1:]]
+        for index, event in enumerate(events, start=1):
+            self.assertEqual(event["sequence"], index)
+        self.assertTrue(events[-1]["terminal"])
+        self.assertEqual(events[-1]["terminal_status"], "completed")
+        self.assertEqual(
+            events[-1]["provider_input_effect"],
+            "may_have_reached_provider",
+        )
+
+    def test_journal_replay_never_touches_provider_or_process(self) -> None:
+        binding_id, request_id = self._completed_request()
+        spawns_before = sum(self.provider.process_spawns.values())
+        prepares_before = sum(self.provider.process_prepares.values())
+        sends_before = sum(self.provider.turn_sends.values())
+        resolver_before = sum(self.provider.resolver_calls.values())
+        response = self.client.get(
+            f"/v2/generations/{binding_id}/turns/{request_id}/journal",
+            headers=self.auth(),
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(sum(self.provider.process_spawns.values()), spawns_before)
+        self.assertEqual(sum(self.provider.process_prepares.values()), prepares_before)
+        self.assertEqual(sum(self.provider.turn_sends.values()), sends_before)
+        self.assertEqual(sum(self.provider.resolver_calls.values()), resolver_before)
 
 
 if __name__ == "__main__":
