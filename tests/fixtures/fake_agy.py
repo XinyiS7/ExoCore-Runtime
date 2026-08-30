@@ -109,12 +109,19 @@ def main():
         if scenario == "version_timeout":
             time.sleep(60)
             return 0
+        if scenario == "version_stderr":
+            print("fixture version warning", file=sys.stderr)
         print("1.2.0" if scenario == "bad_version" else "1.1.20")
         return 0
     if "models" in sys.argv:
         evidence("models", argv=sys.argv[1:])
         if scenario == "models_missing":
             return 7
+        if scenario == "models_progress_stderr":
+            print("Fetching available models...", file=sys.stderr)
+        if scenario == "models_invalid_stdout":
+            print("INVALID MODEL OUTPUT")
+            return 0
         print("gemini-3.1-pro-high     Gemini 3.1 Pro (High)")
         print("gemini-3.1-pro-low      Gemini 3.1 Pro (Low)")
         return 0
@@ -122,6 +129,8 @@ def main():
         evidence("quota", argv=sys.argv[1:])
         if scenario == "auth_missing":
             return 7
+        if scenario == "quota_stderr":
+            print("fixture quota warning", file=sys.stderr)
         print(json.dumps(quota_response(), separators=(",", ":")))
         return 0
 

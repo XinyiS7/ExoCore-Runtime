@@ -343,6 +343,7 @@ class AgyProcessSupervisor:
                 environment,
                 workspace,
                 "agy_models_unavailable",
+                allow_stderr=True,
             )
             self.available_model_slugs = self._parse_models(models_stdout)
             quota_stdout = await self._run_bounded(
@@ -601,6 +602,8 @@ class AgyProcessSupervisor:
         environment: dict[str, str],
         cwd: Path,
         error_code: str,
+        *,
+        allow_stderr: bool = False,
     ) -> bytes:
         process: asyncio.subprocess.Process | None = None
         job_handle: int | None = None
@@ -623,7 +626,7 @@ class AgyProcessSupervisor:
                 process.communicate(),
                 timeout=self.config.init_timeout_seconds,
             )
-            if process.returncode != 0 or stderr:
+            if process.returncode != 0 or (stderr and not allow_stderr):
                 raise ProviderAdapterError(error_code, fatal_generation=True)
             return stdout
         except ProviderAdapterError as exc:

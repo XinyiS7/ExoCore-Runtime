@@ -636,10 +636,27 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(len([item for item in self.evidence() if item["kind"] == "turn"]), 1)
 
+    async def test_models_progress_stderr_is_accepted_with_strict_stdout(self) -> None:
+        service, _ = self.build_service("models_progress_stderr")
+        await service.ensure_generation(self.binding_id, self.spec)
+
+        events = await collect(
+            service,
+            self.binding_id,
+            self.turn(bootstrap={"history": []}),
+        )
+
+        self.assertEqual(events[-1].event_type, "done")
+        self.assertEqual(len([item for item in self.evidence() if item["kind"] == "turn"]), 1)
+
     async def test_startup_faults_fail_before_user_stdin_and_timeout_process_is_reaped(self) -> None:
         scenarios = {
             "bad_version": "agy_version_unsupported",
+            "version_stderr": "agy_version_failed",
+            "models_missing": "agy_models_unavailable",
+            "models_invalid_stdout": "agy_models_unavailable",
             "auth_missing": "agy_auth_unavailable",
+            "quota_stderr": "agy_auth_unavailable",
             "init_timeout": "agy_init_timeout",
             "init_empty": "agy_init_eof",
             "init_malformed": "agy_malformed_ndjson",
