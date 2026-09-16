@@ -41,7 +41,7 @@ Runtime correctness depends on:
 
 1. **Runtime URL alignment** - Django `SUBSCRIPTION_RUNTIME_URL` against Runtime `EXOCORE_RUNTIME_HOST` / `EXOCORE_RUNTIME_PORT`.
 2. **Bearer alignment** - Django `SUBSCRIPTION_RUNTIME_TOKEN` against Runtime `EXOCORE_RUNTIME_TOKEN`.
-3. **Django authorizes the intended Runtime preset** in `SUBSCRIPTION_RUNTIME_PRESET_ALLOWLIST` (the current local setup authorizes preset 8).
+3. **Django authorizes the intended Runtime preset** in `SUBSCRIPTION_RUNTIME_PRESET_ALLOWLIST` (the current local setup authorizes presets 1 and 8).
 4. **Migrations current** - `python.exe manage.py migrate --check --noinput`.
 5. **Exact health contract** - `GET /v2/health` returns `status=ok`, `schema_version=v2`, `protocol=subscription-runtime-v2` and all five capabilities (`generation_state_only`, `durable_control_events`, `requested_effective_execution`, `strict_session_resume`, `request_journal_replay`).
 
