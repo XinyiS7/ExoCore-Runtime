@@ -27,7 +27,7 @@ Runtime turns only work when both halves agree. The correctness contract is:
 
 1. Django and Runtime share the **same Runtime URL** (`SUBSCRIPTION_RUNTIME_URL` against `EXOCORE_RUNTIME_HOST` + `EXOCORE_RUNTIME_PORT`).
 2. Django and Runtime share the **same bearer** (`SUBSCRIPTION_RUNTIME_TOKEN` / `EXOCORE_RUNTIME_TOKEN`).
-3. The preset allowlist matches (`SUBSCRIPTION_RUNTIME_PRESET_ALLOWLIST`; the launcher uses `8`).
+3. Django authorizes the intended Runtime preset in `SUBSCRIPTION_RUNTIME_PRESET_ALLOWLIST` (the launcher authorizes preset `8`). This is a Django-side gate: the Runtime owns no matching preset allowlist.
 4. Migrations are current (`python.exe manage.py migrate --check --noinput`).
 5. The Runtime answers the exact health contract: `GET /v2/health` returns `status=ok`, `schema_version=v2`, `protocol=subscription-runtime-v2` and all five capabilities (`generation_state_only`, `durable_control_events`, `requested_effective_execution`, `strict_session_resume`, `request_journal_replay`).
 
@@ -39,7 +39,7 @@ Runtime turns only work when both halves agree. The correctness contract is:
 2. `python.exe manage.py migrate --check --noinput` - unapplied migrations abort startup.
 3. Start the Runtime: the launcher, or `EXOCORE_RUNTIME_TOKEN=<secret> python.exe -m exocore_runtime`.
 4. `curl http://127.0.0.1:8766/v2/health` - expect the full v2 contract from item 5 above.
-5. Start Django with the same URL / bearer / allowlist, then `curl http://127.0.0.1:8000/` - expect `200`.
+5. Start Django with the same URL / bearer and an allowlist that authorizes the preset, then `curl http://127.0.0.1:8000/` - expect `200`.
 
 ### Pre-send orphan reconciliation coverage
 
