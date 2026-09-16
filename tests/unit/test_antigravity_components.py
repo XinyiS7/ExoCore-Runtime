@@ -385,7 +385,7 @@ class AntigravityComponentTests(unittest.TestCase):
                 "outcome": "tool_error",
             },
         )
-        self.assertEqual(events[-2].payload, {"cache_read_tokens": 3, "input_tokens": 7})
+        self.assertEqual(events[-2].payload, {"cache_read_tokens": 3})
         with self.assertRaises(ProviderAdapterError) as caught:
             normalizer.consume(
                 {
@@ -522,6 +522,174 @@ class AntigravityComponentTests(unittest.TestCase):
             "total_tokens": 7335,
         })
         self.assertEqual(events[5].payload, {"finish_reason": "stop"})
+
+    def test_multi_step_usage_aggregation_within_turn(self) -> None:
+        """AC-01: Multiple distinct steps with usage are aggregated per-field."""
+        normalizer = AgyTurnNormalizer("sess-multi-step")
+        normalizer.consume({
+            "event": "step_update",
+            "step_update": {
+                "conversation_id": "sess-multi-step",
+                "step_index": 2,
+                "step_type": "agent_response",
+                "state": "DONE",
+                "usage": {"input_tokens": 100, "output_tokens": 50, "total_tokens": 150},
+            },
+        })
+        normalizer.consume({
+            "event": "step_update",
+            "step_update": {
+                "conversation_id": "sess-multi-step",
+                "step_index": 4,
+                "step_type": "agent_response",
+                "state": "DONE",
+                "usage": {"input_tokens": 50, "output_tokens": 20, "thinking_tokens": 15, "total_tokens": 70},
+            },
+        })
+        events = normalizer.consume({
+            "event": "result",
+            "result": {
+                "conversation_id": "sess-multi-step",
+                "status": "SUCCESS",
+                "usage": {"input_tokens": 99999, "total_tokens": 99999},  # Cumulative, must NOT overwrite
+            },
+        })
+        usage_events = [e for e in events if e.event_type == "usage"]
+        self.assertEqual(len(usage_events), 1)
+        self.assertEqual(
+            usage_events[0].payload,
+            {
+                "input_tokens": 150,
+                "output_tokens": 70,
+                "thinking_tokens": 15,
+                "total_tokens": 220,
+            },
+        )
+
+    def test_same_step_usage_deduplication_updates_snapshot(self) -> None:
+        """AC-02: Same step_index updated multiple times updates snapshot without duplicate counting."""
+        normalizer = AgyTurnNormalizer("sess-same-step")
+        normalizer.consume({
+            "event": "step_update",
+            "step_update": {
+                "conversation_id": "sess-same-step",
+                "step_index": 2,
+                "step_type": "agent_response",
+                "state": "ACTIVE",
+            },
+        })
+        normalizer.consume({
+            "event": "step_update",
+            "step_update": {
+                "conversation_id": "sess-same-step",
+                "step_index": 2,
+                "step_type": "agent_response",
+                "state": "DONE",
+                "usage": {"input_tokens": 100, "output_tokens": 30, "total_tokens": 130},
+            },
+        })
+        # Second update on the same step_index (e.g. final enrichment)
+        normalizer.consume({
+            "event": "step_update",
+            "step_update": {
+                "conversation_id": "sess-same-step",
+                "step_index": 2,
+                "step_type": "agent_response",
+                "state": "DONE",
+                "usage": {"input_tokens": 100, "output_tokens": 40, "total_tokens": 140},
+            },
+        })
+        events = normalizer.consume({
+            "event": "result",
+            "result": {"conversation_id": "sess-same-step", "status": "SUCCESS"},
+        })
+        usage_events = [e for e in events if e.event_type == "usage"]
+        self.assertEqual(len(usage_events), 1)
+        self.assertEqual(
+            usage_events[0].payload,
+            {"input_tokens": 100, "output_tokens": 40, "total_tokens": 140},
+        )
+
+    def test_cumulative_result_usage_does_not_overwrite_turn_usage(self) -> None:
+        """AC-03: Cumulative result.usage does not overwrite step truth in later turns."""
+        normalizer = AgyTurnNormalizer("sess-turn-2")
+        normalizer.consume({
+            "event": "step_update",
+            "step_update": {
+                "conversation_id": "sess-turn-2",
+                "step_index": 1,
+                "step_type": "agent_response",
+                "state": "DONE",
+                "usage": {
+                    "input_tokens": 278,
+                    "output_tokens": 4,
+                    "cache_read_tokens": 30214,
+                    "total_tokens": 282,
+                },
+            },
+        })
+        events = normalizer.consume({
+            "event": "result",
+            "result": {
+                "conversation_id": "sess-turn-2",
+                "status": "SUCCESS",
+                "num_turns": 2,
+                "usage": {
+                    "input_tokens": 30662,
+                    "output_tokens": 8,
+                    "total_tokens": 30670,
+                },
+            },
+        })
+        usage_events = [e for e in events if e.event_type == "usage"]
+        self.assertEqual(len(usage_events), 1)
+        self.assertEqual(
+            usage_events[0].payload,
+            {
+                "input_tokens": 278,
+                "output_tokens": 4,
+                "cache_read_tokens": 30214,
+                "total_tokens": 282,
+            },
+        )
+
+    def test_no_step_usage_means_no_canonical_usage_event(self) -> None:
+        """AC-04: If no step has usage, no canonical usage event is emitted even if result has usage."""
+        normalizer = AgyTurnNormalizer("sess-no-step-usage")
+        normalizer.consume({
+            "event": "step_update",
+            "step_update": {
+                "conversation_id": "sess-no-step-usage",
+                "step_index": 1,
+                "step_type": "agent_response",
+                "state": "DONE",
+                "text_delta": "hello",
+            },
+        })
+        events = normalizer.consume({
+            "event": "result",
+            "result": {
+                "conversation_id": "sess-no-step-usage",
+                "status": "SUCCESS",
+                "usage": {"input_tokens": 5000},
+            },
+        })
+        usage_events = [e for e in events if e.event_type == "usage"]
+        self.assertEqual(len(usage_events), 0)
+
+    def test_result_usage_malformed_is_still_rejected(self) -> None:
+        """AC-05: result.usage is still validated and rejected if malformed."""
+        normalizer = AgyTurnNormalizer("sess-malformed-result")
+        with self.assertRaises(ProviderAdapterError) as caught:
+            normalizer.consume({
+                "event": "result",
+                "result": {
+                    "conversation_id": "sess-malformed-result",
+                    "status": "SUCCESS",
+                    "usage": {"input_tokens": "not-an-int"},
+                },
+            })
+        self.assertEqual(caught.exception.code, "agy_malformed_usage")
 
 
 if __name__ == "__main__":

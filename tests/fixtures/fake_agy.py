@@ -290,6 +290,13 @@ def main():
                     },
                 }
             )
+        step_usage = {
+            "input_tokens": 100,
+            "output_tokens": 10,
+            "thinking_tokens": 4,
+            "cache_read_tokens": 50 if turn_number > 1 else 0,
+            "total_tokens": 110,
+        }
         emit(
             {
                 "event": "step_update",
@@ -299,6 +306,7 @@ def main():
                     "step_type": "agent_response",
                     "state": "DONE",
                     "text_delta": "fixture-answer",
+                    "usage": step_usage,
                 },
             }
         )
@@ -310,11 +318,11 @@ def main():
                 "response": "fixture-answer",
                 "num_turns": turn_number,
                 "usage": {
-                    "input_tokens": 100,
-                    "output_tokens": 10,
-                    "thinking_tokens": 4,
-                    "cache_read_tokens": 50 if turn_number > 1 else 0,
-                    "total_tokens": 110,
+                    "input_tokens": 100 * turn_number,
+                    "output_tokens": 10 * turn_number,
+                    "thinking_tokens": 4 * turn_number,
+                    "cache_read_tokens": 50 * (turn_number - 1) if turn_number > 1 else 0,
+                    "total_tokens": 110 * turn_number,
                 },
             },
         }

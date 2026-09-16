@@ -81,7 +81,7 @@ class AgyTurnNormalizer:
     def __init__(self, conversation_id: str) -> None:
         self.conversation_id = conversation_id
         self.result_seen = False
-        self._latest_step_usage: dict[str, int] = {}
+        self._step_usage_by_index: dict[int, dict[str, int]] = {}
 
     def consume(self, payload: dict[str, Any]) -> list[ProviderEvent]:
         if self.result_seen:
@@ -122,7 +122,11 @@ class AgyTurnNormalizer:
             "state": state,
         }
         if "usage" in step:
-            self._latest_step_usage = self._project_usage(step["usage"])
+            projected = self._project_usage(step["usage"])
+            if step_index not in self._step_usage_by_index:
+                self._step_usage_by_index[step_index] = projected
+            else:
+                self._step_usage_by_index[step_index].update(projected)
         if step_type in _TEXT_STEP_TYPES:
             text = step.get("text_delta")
             if text is None or text == "":
@@ -153,13 +157,19 @@ class AgyTurnNormalizer:
         status = result.get("status")
         if not isinstance(status, str):
             raise ProviderAdapterError("agy_malformed_result", terminal_status="indeterminate")
+        # Validate result.usage if present (preserves strictness, AC-05)
+        if "usage" in result:
+            self._project_usage(result.get("usage"))
+
         events: list[ProviderEvent] = []
-        usage = {
-            **self._latest_step_usage,
-            **self._project_usage(result.get("usage")),
-        }
-        if usage:
-            events.append(ProviderEvent(event_type="usage", payload=usage))
+        if self._step_usage_by_index:
+            aggregated_usage: dict[str, int] = {}
+            for step_usage in self._step_usage_by_index.values():
+                for key, val in step_usage.items():
+                    aggregated_usage[key] = aggregated_usage.get(key, 0) + val
+            if aggregated_usage:
+                events.append(ProviderEvent(event_type="usage", payload=aggregated_usage))
+
         if status == "SUCCESS":
             events.append(
                 ProviderEvent(
