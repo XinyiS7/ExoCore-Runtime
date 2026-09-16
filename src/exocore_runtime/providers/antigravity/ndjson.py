@@ -1,4 +1,4 @@
-"""Strict official AGY 1.1.20 NDJSON parsing and normalized rendering."""
+"""Strict official AGY 1.1.20 - 1.2.4 NDJSON parsing and normalized rendering."""
 
 from __future__ import annotations
 

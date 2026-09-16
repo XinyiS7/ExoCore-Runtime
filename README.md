@@ -24,7 +24,7 @@ Optional AGY configuration uses `EXOCORE_RUNTIME_AGY_EXECUTABLE`, `EXOCORE_RUNTI
 ## Runtime providers
 
 - `fake`: deterministic protocol and lifecycle fixture retained from Milestone A.
-- `antigravity`: official AGY `>=1.1.20,<1.2` using consumer `account_default` authentication and the pinned `gemini-3.1-pro-high` model.
+- `antigravity`: official AGY `>=1.1.20,<1.3` using consumer `account_default` authentication and the pinned `gemini-3.1-pro-high` model. The verified envelope is 1.1.20 - 1.2.4 (1.2.4 NDJSON capture lives in `tests/fixtures/agy_1_2_4_success.jsonl`); a new minor boundary needs a fresh capture before the gate is widened.
 
 The AGY adapter has no API-key, Vertex, Python SDK, shell, or unofficial executable fallback. Each generation receives an isolated profile, custom agent, deny-all tool policy, empty workspace, one-shot PreInvocation mailbox, and supervised process tree. SQLite remains the durable source for bootstrap, send, replay, cancellation, and terminal status.
 

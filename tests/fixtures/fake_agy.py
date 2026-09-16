@@ -111,7 +111,10 @@ def main():
             return 0
         if scenario == "version_stderr":
             print("fixture version warning", file=sys.stderr)
-        print("1.2.0" if scenario == "bad_version" else "1.1.20")
+        if scenario == "version_1_2_4":
+            print("1.2.4")
+            return 0
+        print("1.3.0" if scenario == "bad_version" else "1.1.20")
         return 0
     if "models" in sys.argv:
         evidence("models", argv=sys.argv[1:])

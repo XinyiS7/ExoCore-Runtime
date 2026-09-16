@@ -649,6 +649,19 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[-1].event_type, "done")
         self.assertEqual(len([item for item in self.evidence() if item["kind"] == "turn"]), 1)
 
+    async def test_verified_1_2_4_version_is_accepted(self) -> None:
+        service, _ = self.build_service("version_1_2_4")
+        await service.ensure_generation(self.binding_id, self.spec)
+
+        events = await collect(
+            service,
+            self.binding_id,
+            self.turn(bootstrap={"history": []}),
+        )
+
+        self.assertEqual(events[-1].event_type, "done")
+        self.assertEqual(len([item for item in self.evidence() if item["kind"] == "turn"]), 1)
+
     async def test_startup_faults_fail_before_user_stdin_and_timeout_process_is_reaped(self) -> None:
         scenarios = {
             "bad_version": "agy_version_unsupported",

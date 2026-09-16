@@ -336,7 +336,10 @@ class AgyProcessSupervisor:
             if match is None:
                 raise ProviderAdapterError("agy_version_invalid", fatal_generation=True)
             major, minor, patch = (int(part) for part in match.groups())
-            if (major, minor, patch) < (1, 1, 20) or (major, minor) >= (1, 2):
+            # Verified envelope: 1.1.20 - 1.2.4 (1.2.4 captured from the official
+            # CLI, see tests/fixtures/agy_1_2_4_success.jsonl). Minor boundaries
+            # stay fail-closed: a 1.3.x CLI needs a fresh compatibility capture.
+            if (major, minor, patch) < (1, 1, 20) or (major, minor) >= (1, 3):
                 raise ProviderAdapterError("agy_version_unsupported", fatal_generation=True)
             models_stdout = await self._run_bounded(
                 (*self.config.command_prefix, "models"),
