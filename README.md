@@ -23,39 +23,33 @@ Optional AGY configuration uses `EXOCORE_RUNTIME_AGY_EXECUTABLE`, `EXOCORE_RUNTI
 
 ## Startup contract (Django + Runtime)
 
-Runtime turns only work when both halves agree. The correctness contract is:
+Daily local topology:
 
-1. Django and Runtime share the **same Runtime URL** (`SUBSCRIPTION_RUNTIME_URL` against `EXOCORE_RUNTIME_HOST` + `EXOCORE_RUNTIME_PORT`).
-2. Django and Runtime share the **same bearer** (`SUBSCRIPTION_RUNTIME_TOKEN` / `EXOCORE_RUNTIME_TOKEN`).
-3. Django authorizes the intended Runtime preset in `SUBSCRIPTION_RUNTIME_PRESET_ALLOWLIST` (the launcher authorizes preset `8`). This is a Django-side gate: the Runtime owns no matching preset allowlist.
-4. Migrations are current (`python.exe manage.py migrate --check --noinput`).
-5. The Runtime answers the exact health contract: `GET /v2/health` returns `status=ok`, `schema_version=v2`, `protocol=subscription-runtime-v2` and all five capabilities (`generation_state_only`, `durable_control_events`, `requested_effective_execution`, `strict_session_resume`, `request_journal_replay`).
+```text
+Browser
+  ↓
+nginx :8080 / :8443          (persistent Docker container)
+  ├─ serves the built frontend with SPA fallback
+  └─ /api, /media → Django :8000
+                         ↓
+                   Runtime :8766
+```
 
-`../start_backend_with_runtime.ps1` is **one convenience implementation** of that contract (random process-scoped token, port checks, health gate, lifecycle ownership, pre-Django reconcile step). It is not the contract itself: a manual two-terminal startup that satisfies 1-5 is equally valid.
+Django is normally started manually with `python manage.py runserver`. Subscription Runtime is a separate loopback service on `:8766`, with its own bearer and its own state file. nginx is the browser ingress and is outside this contract; `:8080/:8443` is not an alias of Django `:8000`, which is the API upstream it proxies to.
 
-### Pre-launch checklist
+Runtime correctness depends on:
 
-1. Stop any running Django/`runserver` and Runtime first (the launcher refuses an occupied `8000` or `8766`).
-2. `python.exe manage.py migrate --check --noinput` - unapplied migrations abort startup.
-3. Start the Runtime: the launcher, or `EXOCORE_RUNTIME_TOKEN=<secret> python.exe -m exocore_runtime`.
-4. `curl http://127.0.0.1:8766/v2/health` - expect the full v2 contract from item 5 above.
-5. Start Django with the same URL / bearer and an allowlist that authorizes the preset, then `curl http://127.0.0.1:8000/` - expect `200`.
+1. **Runtime URL alignment** - Django `SUBSCRIPTION_RUNTIME_URL` against Runtime `EXOCORE_RUNTIME_HOST` / `EXOCORE_RUNTIME_PORT`.
+2. **Bearer alignment** - Django `SUBSCRIPTION_RUNTIME_TOKEN` against Runtime `EXOCORE_RUNTIME_TOKEN`.
+3. **Django authorizes the intended Runtime preset** in `SUBSCRIPTION_RUNTIME_PRESET_ALLOWLIST` (the current local setup authorizes preset 8).
+4. **Migrations current** - `python.exe manage.py migrate --check --noinput`.
+5. **Exact health contract** - `GET /v2/health` returns `status=ok`, `schema_version=v2`, `protocol=subscription-runtime-v2` and all five capabilities (`generation_state_only`, `durable_control_events`, `requested_effective_execution`, `strict_session_resume`, `request_journal_replay`).
 
-### Pre-send orphan reconciliation coverage
+Startup check: `8000` and `8766` free -> migrate check -> start the Runtime -> `curl http://127.0.0.1:8766/v2/health` -> start Django with the matching URL and bearer.
 
-A runtime turn that dies between the durable prepare commit and the send boundary leaves a `prepared` turn that blocks its conversation until it is settled as `presend_abandoned`. Settlement runs automatically in a quiescent window only:
+Pre-send reconcile: a `runserver` reload session reconciles abandoned pre-send turns automatically in its `RUN_MAIN` child startup; a `--noreload` session has to run `python manage.py reconcile_runtime_presend` itself. The sweep assumes one serving Django process.
 
-| Startup | Automatic reconcile | Where |
-|---|---|---|
-| `manage.py runserver` (default reload) | yes | `RUN_MAIN` child app-startup seam |
-| launcher (`--noreload`) | yes | launcher pre-Django step |
-| manual `manage.py runserver --noreload` | **not promised** | run `manage.py reconcile_runtime_presend` yourself |
-
-The sweep is only sound while one serving Django process owns runtime turns (single-backend / quiescent window). A multi-worker deployment must re-evaluate it.
-
-### Token hygiene (hygiene, not correctness)
-
-The bearer is a process-scoped secret: the launcher generates it in memory and never writes it to `.env`, a token file, the command line, or a log. Manual startup usually means typing or persisting it, which is why the launcher is preferred - but a manual setup that satisfies the startup contract still works.
+Token hygiene (not correctness): the bearer is process-scoped. `../start_backend_with_runtime.ps1` stays an optional convenience that starts both halves with one in-memory bearer; the daily flow above does not need it.
 
 ## Runtime providers
 
