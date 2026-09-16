@@ -51,6 +51,15 @@ Pre-send reconcile: a `runserver` reload session reconciles abandoned pre-send t
 
 Token hygiene (not correctness): the bearer is process-scoped. `../start_backend_with_runtime.ps1` stays an optional convenience that starts both halves with one in-memory bearer; the daily flow above does not need it.
 
+Local bearer source: the Runtime takes its bearer only from `EXOCORE_RUNTIME_TOKEN` - there is no default and no config file, so a manually started Runtime owns whatever value it was launched with. In this local setup the canonical value lives in `ExoCore/.env` as `SUBSCRIPTION_RUNTIME_TOKEN`, so both halves can be started from one source; starting the Runtime by hand works without typing the secret:
+
+```powershell
+$env:EXOCORE_RUNTIME_TOKEN = (Select-String .\ExoCore\.env '^SUBSCRIPTION_RUNTIME_TOKEN=').Line.Split('=',2)[1]
+python -u -m exocore_runtime
+```
+
+`GET /v2/health` is unauthenticated; every other route requires the bearer.
+
 ## Runtime providers
 
 - `fake`: deterministic protocol and lifecycle fixture retained from Milestone A.
