@@ -13,6 +13,9 @@ from uuid import uuid4
 
 import uvicorn
 
+# Windows: helper processes must never open a visible console window.
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 from exocore_runtime.api import create_app
 from exocore_runtime.config import RuntimeConfig
 from exocore_runtime.errors import NotFoundError
@@ -536,6 +539,7 @@ class RuntimeHttpTests(unittest.TestCase):
                     capture_output=True,
                     text=True,
                     check=False,
+                    creationflags=NO_WINDOW,
                 )
                 self.assertNotIn(str(process_id), check.stdout)
 

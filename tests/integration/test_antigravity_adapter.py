@@ -12,6 +12,9 @@ from uuid import uuid4
 
 from pydantic import ValidationError
 
+# Windows: helper processes must never open a visible console window.
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 from exocore_runtime.contracts import GenerationSpec, TurnRequest
 from exocore_runtime.errors import ConflictError, ProviderAdapterError
 from exocore_runtime.providers.antigravity.adapter import AntigravityAdapter
@@ -811,6 +814,7 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
                         capture_output=True,
                         text=True,
                         check=False,
+                        creationflags=NO_WINDOW,
                     )
                     self.assertNotIn(str(process_id), check.stdout)
                 self.state_path = original_state
@@ -911,6 +915,7 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
             text=True,
             timeout=10,
             check=False,
+            creationflags=NO_WINDOW,
         )
         self.assertEqual(completed.returncode, 73)
         evidence = [
@@ -928,6 +933,7 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
                     capture_output=True,
                     text=True,
                     check=False,
+                    creationflags=NO_WINDOW,
                 )
                 if str(process_id) not in check.stdout:
                     break
@@ -987,6 +993,7 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
                     capture_output=True,
                     text=True,
                     check=False,
+                    creationflags=NO_WINDOW,
                 )
                 if str(process_id) not in check.stdout:
                     break
@@ -1048,6 +1055,7 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
             capture_output=True,
             text=True,
             check=False,
+            creationflags=NO_WINDOW,
         )
         self.assertNotIn(str(child_pid), check.stdout)
 

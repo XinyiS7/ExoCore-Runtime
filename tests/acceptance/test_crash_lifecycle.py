@@ -7,6 +7,9 @@ import textwrap
 import unittest
 from uuid import uuid4
 
+
+# Windows: helper processes must never open a visible console window.
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 from exocore_runtime.contracts import GenerationSpec, TurnRequest
 from exocore_runtime.providers.fake import DeterministicFakeAdapter
 from exocore_runtime.service import RuntimeService
@@ -88,7 +91,11 @@ class CrashLifecycleTests(unittest.TestCase):
             os._exit(91)
             """
         )
-        result = subprocess.run([sys.executable, "-c", script], check=False)
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            check=False,
+            creationflags=NO_WINDOW,
+        )
         self.assertEqual(result.returncode, 91)
 
     def test_starting_generation_survives_restart_and_may_retry(self) -> None:

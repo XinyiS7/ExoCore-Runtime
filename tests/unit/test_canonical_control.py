@@ -18,6 +18,9 @@ from exocore_runtime.providers.antigravity.control import (
 
 ARTIFACT = ReservedControlArtifact("canonical_demo.txt", "reserved/demo.txt")
 
+# Windows: a helper process must never open a visible console window.
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 
 def make_directory_reparse_point(link: Path, target: Path) -> bool:
     """Create a directory junction (symlink fallback) without elevation."""
@@ -31,6 +34,7 @@ def make_directory_reparse_point(link: Path, target: Path) -> bool:
     completed = subprocess.run(
         ["cmd", "/c", "mklink", "/J", str(link), str(target)],
         capture_output=True,
+        creationflags=NO_WINDOW,
     )
     return completed.returncode == 0
 

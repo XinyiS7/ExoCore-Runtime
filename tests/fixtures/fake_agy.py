@@ -10,6 +10,9 @@ import subprocess
 import sys
 import time
 
+# Every helper process this fixture spawns must stay windowless on Windows.
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 
 def emit(payload):
     sys.stdout.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
@@ -60,6 +63,7 @@ def run_hook(conversation_id):
         capture_output=True,
         timeout=10,
         check=False,
+        creationflags=NO_WINDOW,
     )
     evidence(
         "hook",
@@ -164,7 +168,10 @@ def main():
         ),
     )
     if scenario == "launch_child_before_init":
-        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            creationflags=NO_WINDOW,
+        )
         evidence("launch_child", child_pid=child.pid)
     if scenario == "init_timeout":
         time.sleep(60)
@@ -239,7 +246,7 @@ def main():
         if scenario == "slow_tree":
             child = subprocess.Popen(
                 [sys.executable, "-c", "import time; time.sleep(60)"],
-                creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+                creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | NO_WINDOW,
             )
             evidence("child", child_pid=child.pid)
             time.sleep(60)

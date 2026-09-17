@@ -10,6 +10,9 @@ import unittest
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
+# Windows: helper processes must never open a visible console window.
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 
 class ProcessLifecycleTests(unittest.TestCase):
     def test_module_startup_health_and_shutdown_leave_no_listener(self) -> None:
@@ -33,6 +36,7 @@ class ProcessLifecycleTests(unittest.TestCase):
                 env=env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                creationflags=NO_WINDOW,
             )
             try:
                 for _ in range(200):
