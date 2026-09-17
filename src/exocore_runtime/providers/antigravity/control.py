@@ -26,10 +26,20 @@ class ReservedControlArtifact:
     workspace_relative_path: str
 
 
-# Registrations arrive with their owning seam: CP3 adds the project-rules
-# artifact, CP5 adds the MCP config artifact. The default is intentionally
-# empty so this primitive ships without inventing a production artifact.
+# Registrations arrive with their owning seam. CP3 defines the project-rules
+# mirror (materialized only for generations that actually carry rules); CP5 adds
+# the MCP config artifact. The default stays empty so the primitive itself never
+# invents a production artifact, and the adapter decides per generation.
 RESERVED_CONTROL_ARTIFACTS: tuple[ReservedControlArtifact, ...] = ()
+
+#: The tool-visible mirror of the generation's project rules. The model context
+#: comes from the rules rendered into the agent definition, never from this file;
+#: the mirror exists so humans and tools can read the same rules inside the
+#: generation workspace, and it heals from the canonical body on every prepare.
+PROJECT_RULES_ARTIFACT = ReservedControlArtifact(
+    canonical_name="canonical_rules.md",
+    workspace_relative_path="AGENTS.md",
+)
 
 
 class CanonicalControlStore:
@@ -90,6 +100,21 @@ class CanonicalControlStore:
             return self._read_canonical_bytes(canonical_name).decode("utf-8", errors="strict")
         except UnicodeDecodeError as exc:
             raise ProviderAdapterError("agy_control_backing_invalid", fatal_generation=True) from exc
+
+    def read_canonical_if_present(self, canonical_name: str) -> str | None:
+        """Read the canonical body, or ``None`` when the generation has none.
+
+        Only a genuinely absent file yields ``None``: an invalid backing chain
+        or a non-file at the canonical path still fails closed, so recovery can
+        never mistake a tampered backing for "this generation has no rules".
+        """
+
+        self._validate_canonical_name(canonical_name)
+        self._validate_control_backing()
+        path = self.control_dir / canonical_name
+        if not path.exists() and not self._is_link_or_reparse(path):
+            return None
+        return self.read_canonical(canonical_name)
 
     def verify(self, artifact: ReservedControlArtifact) -> bool:
         """Report whether the materialized copy matches the canonical body."""

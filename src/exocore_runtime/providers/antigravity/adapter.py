@@ -22,6 +22,9 @@ from exocore_runtime.contracts import (
     ProviderGeneration,
     TurnRequest,
     generation_identity,
+    generation_identity_parts,
+    project_rules_absent_digest,
+    project_rules_identity_digest,
     system_instructions_sha256,
 )
 from exocore_runtime.errors import ProviderAdapterError
@@ -31,6 +34,7 @@ from exocore_runtime.providers.antigravity.capabilities import (
     resolve_execution,
 )
 from exocore_runtime.providers.antigravity.control import (
+    PROJECT_RULES_ARTIFACT,
     RESERVED_CONTROL_ARTIFACTS,
     CanonicalControlStore,
     ReservedControlArtifact,
@@ -294,7 +298,11 @@ class AntigravityAdapter:
         root = self._generation_root(binding_id)
         metadata_path = root / "generation.json"
         agent_name = generation_agent_name(binding_id)
-        agent_markdown = render_agent_markdown(agent_name, spec.system_instructions)
+        agent_markdown = render_agent_markdown(
+            agent_name,
+            spec.system_instructions,
+            spec.project_rules,
+        )
         agent_hash = hashlib.sha256(agent_markdown.encode("utf-8")).hexdigest()
         identity_hash = generation_identity(spec)
         expected = {
@@ -309,14 +317,35 @@ class AntigravityAdapter:
             "generation_id": self._generation_id(binding_id, identity_hash),
             "identity_hash": identity_hash,
             "agent_markdown_sha256": agent_hash,
+            "project_rules_present": spec.project_rules is not None,
         }
+        rules_digest = project_rules_identity_digest(spec.project_rules)
+        if rules_digest is not None:
+            expected["project_rules_sha256"] = rules_digest
         if metadata_path.exists():
-            metadata = self._read_json(metadata_path)
+            metadata = self._normalize_legacy_rules_metadata(
+                root,
+                self._read_json(metadata_path),
+                binding_id=binding_id,
+                runtime_kind="antigravity",
+                bootstrap_fingerprint=spec.bootstrap_fingerprint,
+                system_instructions_digest=system_instructions_sha256(
+                    spec.system_instructions
+                ),
+                expected_identity_hash=identity_hash,
+            )
             if any(metadata.get(key) != value for key, value in expected.items()):
                 raise ProviderAdapterError("agy_artifact_identity_mismatch", fatal_generation=True)
         else:
             metadata = {**expected, "provider_session_id": None}
         self._restore_security_artifacts(root, metadata, agent_markdown)
+        if spec.project_rules is not None:
+            # The canonical body is the only durable store of the rules; the
+            # workspace mirror is healed from it on every prepare.
+            CanonicalControlStore(root).write_canonical(
+                PROJECT_RULES_ARTIFACT.canonical_name,
+                spec.project_rules,
+            )
         self._atomic_write_json(metadata_path, metadata)
 
     def _load_layout(
@@ -328,7 +357,15 @@ class AntigravityAdapter:
         root = self._generation_root(generation.binding_id)
         metadata_path = root / "generation.json"
         if metadata_path.exists():
-            metadata = self._read_json(metadata_path)
+            metadata = self._normalize_legacy_rules_metadata(
+                root,
+                self._read_json(metadata_path),
+                binding_id=generation.binding_id,
+                runtime_kind=generation.runtime_kind,
+                bootstrap_fingerprint=generation.bootstrap_fingerprint,
+                system_instructions_digest=generation.system_instructions_sha256,
+                expected_identity_hash=generation.identity_hash,
+            )
         else:
             metadata = self._rebuild_missing_metadata(root, generation)
         artifact_session = metadata.get("provider_session_id")
@@ -345,7 +382,7 @@ class AntigravityAdapter:
             self._atomic_write_json(metadata_path, metadata)
         agent_markdown = self._canonical_agent_markdown(root, metadata, generation)
         self._restore_security_artifacts(root, metadata, agent_markdown)
-        self._restore_reserved_control_artifacts(root)
+        self._restore_reserved_control_artifacts(root, metadata)
         self._verify_security_artifacts(root, generation, metadata)
         return self._layout_from_metadata(root, metadata, options)
 
@@ -358,13 +395,35 @@ class AntigravityAdapter:
         agent_path = (
             root / "profile" / ".gemini" / "config" / "agents" / agent_name / "agent.md"
         )
+        # The canonical backing is the durable project-rules store; a genuinely
+        # absent file means the generation was created without rules. Recovery
+        # then recomputes the generation identity from the durable record fields
+        # plus that presence/content and fails closed on any mismatch.
+        project_rules = CanonicalControlStore(root).read_canonical_if_present(
+            PROJECT_RULES_ARTIFACT.canonical_name
+        )
+        rules_digest = project_rules_identity_digest(project_rules)
         try:
             agent_markdown = agent_path.read_text(encoding="utf-8")
-            rendered = extract_rendered_system_instructions(agent_name, agent_markdown)
+            rendered = extract_rendered_system_instructions(
+                agent_name,
+                agent_markdown,
+                project_rules=project_rules,
+            )
         except (OSError, UnicodeDecodeError, ValueError) as exc:
             raise ProviderAdapterError("agy_generation_artifact_missing", fatal_generation=True) from exc
         if hashlib.sha256(rendered.encode("utf-8")).hexdigest() != generation.system_instructions_sha256:
             raise ProviderAdapterError("agy_custom_agent_invalid", fatal_generation=True)
+        if (
+            generation_identity_parts(
+                runtime_kind=generation.runtime_kind,
+                bootstrap_fingerprint=generation.bootstrap_fingerprint,
+                system_instructions_digest=generation.system_instructions_sha256,
+                project_rules_digest=rules_digest,
+            )
+            != generation.identity_hash
+        ):
+            raise ProviderAdapterError("agy_artifact_identity_mismatch", fatal_generation=True)
         metadata = {
             "schema_version": "v2",
             "binding_id": generation.binding_id,
@@ -380,10 +439,62 @@ class AntigravityAdapter:
             "agent_markdown_sha256": hashlib.sha256(
                 agent_markdown.encode("utf-8")
             ).hexdigest(),
+            "project_rules_present": project_rules is not None,
             "provider_session_id": generation.provider_session_id,
         }
+        if rules_digest is not None:
+            metadata["project_rules_sha256"] = rules_digest
         self._atomic_write_json(root / "generation.json", metadata)
         return metadata
+
+    def _normalize_legacy_rules_metadata(
+        self,
+        root: Path,
+        metadata: dict[str, object],
+        *,
+        binding_id: str,
+        runtime_kind: str,
+        bootstrap_fingerprint: str,
+        system_instructions_digest: str,
+        expected_identity_hash: str,
+    ) -> dict[str, object]:
+        """Upgrade a pre-CP3 (rules-free) metadata file to the CP3 absent shape.
+
+        A generation created before project rules existed carries no rules keys,
+        no canonical rules backing, and a durable identity that is exactly the
+        rules-free identity. Missing keys then mean "absent" and the file is
+        rewritten deterministically in the CP3 shape without rotating identity.
+
+        Every other missing-key situation fails closed: a rules-present
+        generation must never silently degrade into a rules-free one (R1-03).
+        """
+
+        if "project_rules_present" in metadata or "project_rules_sha256" in metadata:
+            return metadata
+        legacy_identity = generation_identity_parts(
+            runtime_kind=runtime_kind,
+            bootstrap_fingerprint=bootstrap_fingerprint,
+            system_instructions_digest=system_instructions_digest,
+            project_rules_digest=None,
+        )
+        has_canonical_rules = (
+            CanonicalControlStore(root).read_canonical_if_present(
+                PROJECT_RULES_ARTIFACT.canonical_name
+            )
+            is not None
+        )
+        if (
+            legacy_identity != expected_identity_hash
+            or metadata.get("identity_hash") != expected_identity_hash
+            or metadata.get("binding_id") != binding_id
+            or has_canonical_rules
+        ):
+            raise ProviderAdapterError(
+                "agy_generation_artifact_invalid", fatal_generation=True
+            )
+        normalized = {**metadata, "project_rules_present": False}
+        self._atomic_write_json(root / "generation.json", normalized)
+        return normalized
 
     def _canonical_agent_markdown(
         self,
@@ -393,9 +504,14 @@ class AntigravityAdapter:
     ) -> str:
         agent_name = str(metadata.get("agent_name", ""))
         path = root / "profile" / ".gemini" / "config" / "agents" / agent_name / "agent.md"
+        project_rules = self._canonical_project_rules(root, metadata)
         try:
             content = path.read_text(encoding="utf-8")
-            rendered = extract_rendered_system_instructions(agent_name, content)
+            rendered = extract_rendered_system_instructions(
+                agent_name,
+                content,
+                project_rules=project_rules,
+            )
         except (OSError, UnicodeDecodeError, ValueError) as exc:
             raise ProviderAdapterError("agy_custom_agent_invalid", fatal_generation=True) from exc
         if hashlib.sha256(rendered.encode("utf-8")).hexdigest() != generation.system_instructions_sha256:
@@ -478,17 +594,50 @@ class AntigravityAdapter:
             agent_markdown,
         )
 
-    def _restore_reserved_control_artifacts(self, root: Path) -> None:
+    def _restore_reserved_control_artifacts(
+        self,
+        root: Path,
+        metadata: dict[str, object],
+    ) -> None:
         """Verify and heal only the registered reserved artifacts.
 
-        This pass never traverses or clears ordinary workspace content, and it
-        registers nothing by itself: the artifact list is owned by the seam
-        that introduces each reserved path.
+        This pass never traverses or clears ordinary workspace content. The
+        artifact list is owned by the seam that introduces each reserved path:
+        the project-rules mirror is registered only for generations whose
+        metadata records project rules, so a rules-free generation never gains
+        an ``AGENTS.md`` it did not ask for.
         """
 
         store = CanonicalControlStore(root)
-        for artifact in self.reserved_artifacts:
+        for artifact in self._reserved_artifacts_for(metadata):
             store.restore(artifact)
+
+    def _reserved_artifacts_for(
+        self,
+        metadata: dict[str, object],
+    ) -> tuple[ReservedControlArtifact, ...]:
+        if metadata.get("project_rules_present") is True:
+            return self.reserved_artifacts + (PROJECT_RULES_ARTIFACT,)
+        return self.reserved_artifacts
+
+    def _canonical_project_rules(
+        self,
+        root: Path,
+        metadata: dict[str, object],
+    ) -> str | None:
+        """Return the generation's project rules body, or ``None`` when absent.
+
+        The canonical backing is the durable store, so a generation whose
+        metadata records rules fails closed (``agy_control_backing_missing``)
+        when that backing disappears instead of silently degrading into a
+        rules-free generation.
+        """
+
+        if metadata.get("project_rules_present") is not True:
+            return None
+        return CanonicalControlStore(root).read_canonical(
+            PROJECT_RULES_ARTIFACT.canonical_name
+        )
 
     def _verify_security_artifacts(
         self,
@@ -530,6 +679,21 @@ class AntigravityAdapter:
         layout_workspace = root / "workspace"
         agent_name = str(metadata["agent_name"])
         mailbox_root = root / "mailbox"
+        project_rules = self._canonical_project_rules(root, metadata)
+        if (
+            generation_identity_parts(
+                runtime_kind=generation.runtime_kind,
+                bootstrap_fingerprint=generation.bootstrap_fingerprint,
+                system_instructions_digest=generation.system_instructions_sha256,
+                project_rules_digest=project_rules_identity_digest(project_rules),
+            )
+            != generation.identity_hash
+        ):
+            # A rules-present durable identity can never be reproduced from
+            # metadata that resolves to "no rules" (R1-03 masquerade guard).
+            raise ProviderAdapterError(
+                "agy_artifact_identity_mismatch", fatal_generation=True
+            )
         hooks_path = layout_profile / ".gemini" / "config" / "hooks.json"
         settings_path = layout_profile / ".gemini" / "antigravity-cli" / "settings.json"
         agent_path = (
@@ -574,6 +738,7 @@ class AntigravityAdapter:
             rendered_system = extract_rendered_system_instructions(
                 agent_name,
                 agent_markdown,
+                project_rules=project_rules,
             )
         except (OSError, UnicodeDecodeError, ValueError) as exc:
             raise ProviderAdapterError("agy_custom_agent_invalid", fatal_generation=True) from exc
@@ -582,13 +747,23 @@ class AntigravityAdapter:
             or hashlib.sha256(rendered_system.encode("utf-8")).hexdigest() != system_hash
         ):
             raise ProviderAdapterError("agy_custom_agent_invalid", fatal_generation=True)
+        stored_rules_digest = metadata.get("project_rules_sha256")
+        expected_rules_digest = project_rules_identity_digest(project_rules)
+        if expected_rules_digest is None:
+            # CP3 rules-absent metadata omits the digest; the pre-repair absent
+            # digest is tolerated so early CP3 artifacts are not declared broken.
+            rules_ok = stored_rules_digest in (None, project_rules_absent_digest())
+        else:
+            rules_ok = stored_rules_digest == expected_rules_digest
+        if not rules_ok:
+            raise ProviderAdapterError("agy_artifact_identity_mismatch", fatal_generation=True)
         if (
             not layout_workspace.is_dir()
             or self._is_link_or_reparse(layout_workspace)
         ):
             raise ProviderAdapterError("agy_workspace_invalid", fatal_generation=True)
         control_store = CanonicalControlStore(root)
-        for artifact in self.reserved_artifacts:
+        for artifact in self._reserved_artifacts_for(metadata):
             if not control_store.verify(artifact):
                 raise ProviderAdapterError("agy_security_artifact_invalid", fatal_generation=True)
 

@@ -24,6 +24,9 @@ class StrictContract(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
+PROJECT_RULES_MAX_CHARS = 256_000
+
+
 class GenerationSpec(StrictContract):
     schema_version: Literal["v2"] = "v2"
     runtime_kind: Literal["fake", "antigravity"] = "fake"
@@ -31,6 +34,15 @@ class GenerationSpec(StrictContract):
     system_instructions: str = Field(
         min_length=1,
         max_length=1_000_000,
+        repr=False,
+    )
+    # Project rules travel as their own frozen field, never concatenated into
+    # the system instructions: ``None`` means the project has no rules,
+    # ``""`` means rules are present but empty. ExoCore owns the content; the
+    # runtime only renders and materializes it.
+    project_rules: str | None = Field(
+        default=None,
+        max_length=PROJECT_RULES_MAX_CHARS,
         repr=False,
     )
 
@@ -46,6 +58,10 @@ class GenerationIdentity(StrictContract):
     runtime_kind: Literal["fake", "antigravity"]
     bootstrap_fingerprint: str
     system_instructions_sha256: str
+    # CP2-compatible: a rules-absent generation carries no digest at all, so a
+    # pre-CP3 (rules-free) identity recomputes byte-identically. Present-empty
+    # and present-content generations carry their digest.
+    project_rules_sha256: str | None = None
 
 
 def system_instructions_sha256(system_instructions: str) -> str:
@@ -70,13 +86,81 @@ def canonical_turn_request_hash(request: TurnRequest) -> str:
 
 
 def generation_identity(spec: GenerationSpec) -> str:
-    payload = GenerationIdentity(
+    return generation_identity_parts(
         runtime_kind=spec.runtime_kind,
         bootstrap_fingerprint=spec.bootstrap_fingerprint,
-        system_instructions_sha256=system_instructions_sha256(spec.system_instructions),
+        system_instructions_digest=system_instructions_sha256(
+            spec.system_instructions
+        ),
+        project_rules_digest=project_rules_identity_digest(spec.project_rules),
     )
+
+
+def project_rules_identity_digest(project_rules: str | None) -> str | None:
+    """Identity projection of project rules: absent rules have no digest.
+
+    A rules-free generation keeps the exact pre-CP3 identity payload, so the
+    upgrade never rotates a CP2 generation. A present-but-empty ruleset is a
+    real fact and carries its own digest.
+    """
+
+    if project_rules is None:
+        return None
+    return project_rules_sha256(project_rules)
+
+
+def project_rules_sha256(project_rules: str | None) -> str:
+    """Identity digest that keeps absent, present-empty and present-content apart.
+
+    ``None`` (the project has no rules) and ``""`` (rules exist but are empty)
+    are different generation facts, so the digest covers presence as well as the
+    body. The wire spec carries the raw value; this digest is the identity
+    projection used by metadata verification and by metadata recovery, where the
+    body itself must never be duplicated into durable runtime state.
+    """
+
+    payload = {"body": project_rules or "", "present": project_rules is not None}
     canonical = json.dumps(
-        payload.model_dump(mode="json"),
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def project_rules_absent_digest() -> str:
+    """The digest recorded when a generation carries no project rules."""
+
+    return project_rules_sha256(None)
+
+
+def generation_identity_parts(
+    *,
+    runtime_kind: str,
+    bootstrap_fingerprint: str,
+    system_instructions_digest: str,
+    project_rules_digest: str | None = None,
+) -> str:
+    """Recompute a generation identity from durable parts (recovery path).
+
+    The project-rules digest is omitted from the canonical payload when the
+    generation has no rules (legacy/CP2 shape). Present rules always contribute
+    their digest, so absent != present-empty stays true in both directions.
+    """
+
+    payload: dict[str, Any] = {
+        # The identity payload is written literally (not from the contract dump)
+        # so a rules-free generation hashes exactly like it did before CP3.
+        "schema_version": "v2",
+        "runtime_kind": runtime_kind,
+        "bootstrap_fingerprint": bootstrap_fingerprint,
+        "system_instructions_sha256": system_instructions_digest,
+    }
+    if project_rules_digest is not None:
+        payload["project_rules_sha256"] = project_rules_digest
+    canonical = json.dumps(
+        payload,
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,

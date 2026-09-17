@@ -55,22 +55,79 @@ def generation_agent_name(binding_id: str) -> str:
     return f"exocore-runtime-{compact.lower()}"
 
 
-def render_agent_markdown(agent_name: str, system_instructions: str) -> str:
+# B-prime: project rules are rendered into the agent definition itself and are
+# the only headless model-context source for ``work_dir/AGENTS.md``. AGY 1.2.5
+# does not load ambient workspace rule files in headless print mode (CP3-A
+# evidence), while an authenticated interactive TUI does. ``workspace/AGENTS.md``
+# stays a healed, tool-visible mirror for humans and tools - never the source the
+# model context is derived from.
+PROJECT_RULES_HEADING = "## ExoCore Project Rules"
+
+# The rules section sits between the instructions body and the transport
+# envelope, separated by a blank line on both sides. The marker is a private
+# constant so the heading text itself cannot be mistaken for a rule body.
+_PROJECT_RULES_BLOCK_PREFIX = "\n\n" + PROJECT_RULES_HEADING + "\n\n"
+
+
+def render_agent_markdown(
+    agent_name: str,
+    system_instructions: str,
+    project_rules: str | None = None,
+) -> str:
+    body = system_instructions.strip()
+    if project_rules is None:
+        return (
+            _agent_markdown_prefix(agent_name)
+            + body
+            + "\n\n"
+            + _TRANSPORT_INSTRUCTIONS
+            + "\n"
+        )
     return (
         _agent_markdown_prefix(agent_name)
-        + system_instructions.strip()
+        + body
+        + _PROJECT_RULES_BLOCK_PREFIX
+        + project_rules
         + "\n\n"
         + _TRANSPORT_INSTRUCTIONS
         + "\n"
     )
 
 
-def extract_rendered_system_instructions(agent_name: str, markdown: str) -> str:
+def extract_rendered_system_instructions(
+    agent_name: str,
+    markdown: str,
+    *,
+    project_rules: str | None = None,
+) -> str:
+    """Recover the system instructions body, strictly shaped by the rules value.
+
+    ``project_rules`` is the value the caller expects the rendered section to
+    carry (``None`` when the generation has no rules). Supplying it keeps the
+    split unambiguous: the returning body never has to be guessed from marker
+    text that the instructions themselves could contain.
+
+    A rules-present generation is recovered only when the middle ends with
+    exactly the expected rules section; a rules-free generation recovers the
+    middle as-is (no marker scanning, see R1-02).
+    """
+
     prefix = _agent_markdown_prefix(agent_name)
     suffix = "\n\n" + _TRANSPORT_INSTRUCTIONS + "\n"
     if not markdown.startswith(prefix) or not markdown.endswith(suffix):
         raise ValueError("custom agent markdown structure is invalid")
-    instructions = markdown[len(prefix) : -len(suffix)]
+    middle = markdown[len(prefix) : -len(suffix)]
+    if project_rules is None:
+        # R1-02: no marker scan. The system body is arbitrary text and may
+        # legitimately contain the rules heading; framing (prefix/suffix) plus
+        # the system-instructions and full-agent hashes are the integrity
+        # checks, so the whole middle is the caller's original system body.
+        instructions = middle
+    else:
+        ending = _PROJECT_RULES_BLOCK_PREFIX + project_rules
+        if not middle.endswith(ending):
+            raise ValueError("custom agent project rules section is invalid")
+        instructions = middle[: -len(ending)]
     if not instructions or instructions != instructions.strip():
         raise ValueError("custom agent system instructions are invalid")
     return instructions

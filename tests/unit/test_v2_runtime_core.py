@@ -70,7 +70,15 @@ class CapabilityPolicyTests(unittest.TestCase):
         fields = set(GenerationSpec.model_fields)
         self.assertEqual(
             fields,
-            {"schema_version", "runtime_kind", "bootstrap_fingerprint", "system_instructions"},
+            {
+                "schema_version",
+                "runtime_kind",
+                "bootstrap_fingerprint",
+                "system_instructions",
+                # CP3 (B-prime): project rules travel as their own frozen field
+                # and are never concatenated into the system instructions.
+                "project_rules",
+            },
         )
         forbidden = {
             "provider_session_id",
