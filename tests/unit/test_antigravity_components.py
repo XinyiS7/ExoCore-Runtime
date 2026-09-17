@@ -374,7 +374,6 @@ class AntigravityComponentTests(unittest.TestCase):
         )
         serialized = "".join(event.model_dump_json() for event in events)
         self.assertNotIn("must-not-project", serialized)
-        self.assertNotIn("view_file", serialized)
         self.assertEqual(
             events[3].payload,
             {
@@ -382,6 +381,7 @@ class AntigravityComponentTests(unittest.TestCase):
                 "step_type": "tool",
                 "state": "ERROR",
                 "category": "provider_tool",
+                "tool_name": "view_file",
                 "outcome": "tool_error",
             },
         )
@@ -395,12 +395,11 @@ class AntigravityComponentTests(unittest.TestCase):
             )
         self.assertEqual(caught.exception.code, "agy_event_after_result")
 
-    def test_ndjson_rejects_unknown_states_and_never_projects_tool_identity(self) -> None:
+    def test_ndjson_rejects_unknown_states_and_projects_only_bounded_tool_metadata(self) -> None:
         conversation_id = "provider-session-safe-projection"
         for step_type, state in (
             ("system_message", "PRIVATE-STATE-CANARY"),
             ("agent_response", "C:/PRIVATE/PATH/CANARY.txt"),
-            ("tool", "DONE"),
         ):
             with self.subTest(step_type=step_type, state=state):
                 normalizer = AgyTurnNormalizer(conversation_id)
@@ -426,13 +425,14 @@ class AntigravityComponentTests(unittest.TestCase):
                     "step_index": 2,
                     "step_type": "tool",
                     "state": "ERROR",
-                    "tool_name": "C:/PRIVATE/PATH/TOOL-CANARY.txt",
+                    "tool_name": "view_file",
+                    "tool_info": {"secret_path": "TOOL-CANARY"},
                 },
             }
         )[0]
         serialized = event.model_dump_json()
         self.assertNotIn("TOOL-CANARY", serialized)
-        self.assertNotIn("C:/PRIVATE", serialized)
+        self.assertEqual(event.payload["tool_name"], "view_file")
         self.assertEqual(event.payload["category"], "provider_tool")
         self.assertEqual(event.payload["outcome"], "tool_error")
 

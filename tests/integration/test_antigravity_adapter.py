@@ -15,6 +15,10 @@ from pydantic import ValidationError
 from exocore_runtime.contracts import GenerationSpec, TurnRequest
 from exocore_runtime.errors import ConflictError, ProviderAdapterError
 from exocore_runtime.providers.antigravity.adapter import AntigravityAdapter
+from exocore_runtime.providers.antigravity.control import (
+    CanonicalControlStore,
+    ReservedControlArtifact,
+)
 from exocore_runtime.providers.antigravity.process import AgyProcessConfig, AgyProcessSupervisor
 from exocore_runtime.providers.antigravity.renderer import (
     DENY_POLICY,
@@ -52,7 +56,7 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
                 pass
         self.temp.cleanup()
 
-    def build_service(self, scenario="normal"):
+    def build_service(self, scenario="normal", reserved_artifacts=None):
         fixture = Path(__file__).resolve().parents[1] / "fixtures" / "fake_agy.py"
         environment = {
             "FAKE_AGY_SCENARIO": scenario,
@@ -71,10 +75,13 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
             require_official_executable=False,
             environment_overrides=environment,
         )
+        adapter_kwargs = {"mailbox_ttl_seconds": 30}
+        if reserved_artifacts is not None:
+            adapter_kwargs["reserved_artifacts"] = reserved_artifacts
         adapter = AntigravityAdapter(
             self.data_root,
             AgyProcessSupervisor(process_config),
-            mailbox_ttl_seconds=30,
+            **adapter_kwargs,
         )
         service = RuntimeService(
             RuntimeStateStore(self.state_path),
@@ -177,7 +184,9 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
         )
         hook_config = hooks["exocore-runtime-ephemeral"]
         self.assertEqual(set(hook_config), {"enabled", "PreInvocation"})
-        self.assertFalse(any((generation_root / "workspace").iterdir()))
+        # CP1 workspace continuity: the workspace directory survives turns as a
+        # plain directory; this fixture scenario writes no files into it.
+        self.assertTrue((generation_root / "workspace").is_dir())
         metadata = (generation_root / "generation.json").read_text(encoding="utf-8")
         self.assertNotIn(self.system_canary, metadata)
         database_bytes = b"".join(
@@ -438,10 +447,8 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
             json.dumps({"modelProvider": "account_default", "permissions": {"deny": []}}),
             encoding="utf-8",
         )
-        (generation_root / "workspace" / "pollution.txt").write_text(
-            "workspace canary",
-            encoding="utf-8",
-        )
+        pollution = generation_root / "workspace" / "pollution.txt"
+        pollution.write_text("workspace canary", encoding="utf-8")
 
         restarted, _ = self.build_service()
         await restarted.ensure_generation(self.binding_id, self.spec)
@@ -457,7 +464,103 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(settings["modelProvider"], "account_default")
         self.assertEqual(settings["permissions"]["deny"], list(DENY_POLICY))
         self.assertIn(self.system_canary, agent_path.read_text(encoding="utf-8"))
-        self.assertFalse(any((generation_root / "workspace").iterdir()))
+        self.assertEqual(pollution.read_text(encoding="utf-8"), "workspace canary")
+
+    async def test_workspace_files_survive_repeated_ensure_stage_prepare_and_restart(self) -> None:
+        service, adapter = self.build_service()
+        await service.ensure_generation(self.binding_id, self.spec)
+        generation_root = next(self.data_root.iterdir())
+        self.assertTrue((generation_root / "control").is_dir())
+        ordinary = generation_root / "workspace" / "notes" / "scratch.txt"
+        ordinary.parent.mkdir()
+        ordinary.write_text("turn one output", encoding="utf-8")
+
+        await service.ensure_generation(self.binding_id, self.spec)
+        adapter.stage_generation(str(self.binding_id), self.spec)
+        adapter.stage_generation(str(self.binding_id), self.spec)
+        first = await collect(service, self.binding_id, self.turn(bootstrap={"history": []}))
+        self.assertEqual(first[-1].event_type, "done")
+        self.assertEqual(ordinary.read_text(encoding="utf-8"), "turn one output")
+
+        await service.shutdown()
+        self.services.remove(service)
+        restarted, _ = self.build_service()
+        resumed = await restarted.ensure_generation(self.binding_id, self.spec)
+        self.assertEqual(resumed.status, "active")
+        second = await collect(restarted, self.binding_id, self.turn(thinking="low"))
+        self.assertEqual(second[-1].event_type, "done")
+        self.assertEqual(ordinary.read_text(encoding="utf-8"), "turn one output")
+
+    async def test_registered_reserved_artifact_heals_from_canonical_backing(self) -> None:
+        artifact = ReservedControlArtifact("canonical_demo.txt", "reserved/demo.txt")
+        service, _ = self.build_service(reserved_artifacts=(artifact,))
+        await service.ensure_generation(self.binding_id, self.spec)
+        generation_root = next(self.data_root.iterdir())
+        workspace = generation_root / "workspace"
+        store = CanonicalControlStore(generation_root)
+        store.write_canonical("canonical_demo.txt", "reserved body v1")
+        ordinary = workspace / "ordinary.txt"
+        ordinary.write_text("ordinary body", encoding="utf-8")
+        neighbor = workspace / "reserved" / "neighbor.txt"
+
+        first = await collect(service, self.binding_id, self.turn(bootstrap={"history": []}))
+        self.assertEqual(first[-1].event_type, "done")
+        target = workspace / "reserved" / "demo.txt"
+        self.assertEqual(target.read_text(encoding="utf-8"), "reserved body v1")
+        neighbor.write_text("neighbor body", encoding="utf-8")
+
+        # A tampered projection is healed before the next turn runs.
+        target.write_text("tampered", encoding="utf-8")
+        second = await collect(service, self.binding_id, self.turn(thinking="low"))
+        self.assertEqual(second[-1].event_type, "done")
+        self.assertEqual(target.read_text(encoding="utf-8"), "reserved body v1")
+        self.assertEqual(neighbor.read_text(encoding="utf-8"), "neighbor body")
+
+        # A deleted projection is restored; ordinary files stay untouched.
+        target.unlink()
+        third = await collect(service, self.binding_id, self.turn(thinking="low"))
+        self.assertEqual(third[-1].event_type, "done")
+        self.assertEqual(target.read_text(encoding="utf-8"), "reserved body v1")
+        self.assertEqual(ordinary.read_text(encoding="utf-8"), "ordinary body")
+        self.assertEqual(neighbor.read_text(encoding="utf-8"), "neighbor body")
+
+    async def test_tool_success_reaches_journal_as_bounded_lifecycle_only(self) -> None:
+        await self.assert_tool_scenario("tool_success", "tool_completed", 0.25)
+
+    async def test_tool_error_reaches_journal_as_bounded_lifecycle_only(self) -> None:
+        await self.assert_tool_scenario("tool_error", "tool_error", None)
+
+    async def assert_tool_scenario(self, scenario, outcome, duration) -> None:
+        service, _ = self.build_service(scenario=scenario)
+        await service.ensure_generation(self.binding_id, self.spec)
+        request = self.turn(bootstrap={"history": []})
+        events = await collect(service, self.binding_id, request)
+        self.assertEqual(events[-1].event_type, "done")
+        tool_events = [
+            event.payload
+            for event in events
+            if event.payload.get("step_type") == "tool"
+        ]
+        self.assertEqual(
+            [payload["state"] for payload in tool_events],
+            ["ACTIVE", "DONE"] if scenario == "tool_success" else ["ACTIVE", "ERROR"],
+        )
+        for payload in tool_events:
+            self.assertEqual(payload["tool_name"], "view_file")
+            self.assertEqual(payload["category"], "provider_tool")
+            self.assertNotIn("tool_info", payload)
+        self.assertEqual(tool_events[-1]["outcome"], outcome)
+        if duration is not None:
+            self.assertEqual(tool_events[-1]["duration_seconds"], duration)
+        serialized = "".join(event.model_dump_json() for event in events)
+        self.assertNotIn("SENSITIVE-FIXTURE-PATH", serialized)
+        durable = service.store.read_events(str(self.binding_id), str(request.request_id))
+        durable_serialized = "".join(event.model_dump_json() for event in durable)
+        self.assertNotIn("SENSITIVE-FIXTURE-PATH", durable_serialized)
+        database_bytes = b"".join(
+            path.read_bytes() for path in self.root.glob("runtime.sqlite3*")
+        )
+        self.assertNotIn(b"SENSITIVE-FIXTURE-PATH", database_bytes)
 
     async def test_lazy_prepare_fails_before_spawn_when_custom_agent_is_unverifiable(self) -> None:
         service, _ = self.build_service()
@@ -494,11 +597,11 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
         settings = json.loads(settings_path.read_text(encoding="utf-8"))
         self.assertEqual(settings["permissions"]["deny"], list(DENY_POLICY))
 
-        # Workspace pollution is also repaired, never fatal, at load.
+        # Ordinary workspace files survive reserved-artifact verification at load.
         pollution = generation_root / "workspace" / "pollution.txt"
         pollution.write_text("workspace canary", encoding="utf-8")
         adapter._load_layout(durable_generation, options)
-        self.assertFalse(any((generation_root / "workspace").iterdir()))
+        self.assertEqual(pollution.read_text(encoding="utf-8"), "workspace canary")
 
         # Canonical agent markdown is identity material: any tamper is fatal
         # before the security restore may run.

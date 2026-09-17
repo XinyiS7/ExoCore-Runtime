@@ -30,6 +30,11 @@ from exocore_runtime.providers.antigravity.capabilities import (
     SECURITY_POLICY_REVISION,
     resolve_execution,
 )
+from exocore_runtime.providers.antigravity.control import (
+    RESERVED_CONTROL_ARTIFACTS,
+    CanonicalControlStore,
+    ReservedControlArtifact,
+)
 from exocore_runtime.providers.antigravity.ephemeral_hook import EphemeralMailbox
 from exocore_runtime.providers.antigravity.process import (
     AgyProcessSupervisor,
@@ -52,11 +57,13 @@ class AntigravityAdapter:
         supervisor: AgyProcessSupervisor,
         *,
         mailbox_ttl_seconds: float = 120.0,
+        reserved_artifacts: tuple[ReservedControlArtifact, ...] = RESERVED_CONTROL_ARTIFACTS,
     ) -> None:
         self.data_root = Path(data_root).resolve()
         self.data_root.mkdir(parents=True, exist_ok=True)
         self.supervisor = supervisor
         self.mailbox_ttl_seconds = mailbox_ttl_seconds
+        self.reserved_artifacts = tuple(reserved_artifacts)
         self._prepared: dict[str, tuple[str, EphemeralMailbox, str, bytes]] = {}
         self._artifact_locks: dict[str, asyncio.Lock] = {}
         self._artifact_locks_guard = asyncio.Lock()
@@ -338,6 +345,7 @@ class AntigravityAdapter:
             self._atomic_write_json(metadata_path, metadata)
         agent_markdown = self._canonical_agent_markdown(root, metadata, generation)
         self._restore_security_artifacts(root, metadata, agent_markdown)
+        self._restore_reserved_control_artifacts(root)
         self._verify_security_artifacts(root, generation, metadata)
         return self._layout_from_metadata(root, metadata, options)
 
@@ -437,15 +445,15 @@ class AntigravityAdapter:
                 raise ProviderAdapterError("agy_security_artifact_invalid", fatal_generation=True)
             directory.mkdir(parents=True, exist_ok=True)
         if workspace.exists():
+            # Workspace continuity: ordinary files persist across repeated
+            # stage/prepare/reacquire. Only retire() destroys the generation
+            # root. Reserved control artifacts are healed from canonical
+            # backing instead of clearing anything here.
             if self._is_link_or_reparse(workspace) or not workspace.is_dir():
                 raise ProviderAdapterError("agy_workspace_invalid", fatal_generation=True)
-            for child in workspace.iterdir():
-                if child.is_dir() and not child.is_symlink():
-                    shutil.rmtree(child)
-                else:
-                    child.unlink()
         else:
             workspace.mkdir(parents=True)
+        CanonicalControlStore(root).prepare()
         mailbox = EphemeralMailbox(
             root / "mailbox",
             binding_id=binding_id,
@@ -464,6 +472,18 @@ class AntigravityAdapter:
             profile / ".gemini" / "config" / "agents" / agent_name / "agent.md",
             agent_markdown,
         )
+
+    def _restore_reserved_control_artifacts(self, root: Path) -> None:
+        """Verify and heal only the registered reserved artifacts.
+
+        This pass never traverses or clears ordinary workspace content, and it
+        registers nothing by itself: the artifact list is owned by the seam
+        that introduces each reserved path.
+        """
+
+        store = CanonicalControlStore(root)
+        for artifact in self.reserved_artifacts:
+            store.restore(artifact)
 
     def _verify_security_artifacts(
         self,
@@ -560,9 +580,12 @@ class AntigravityAdapter:
         if (
             not layout_workspace.is_dir()
             or self._is_link_or_reparse(layout_workspace)
-            or any(layout_workspace.iterdir())
         ):
             raise ProviderAdapterError("agy_workspace_invalid", fatal_generation=True)
+        control_store = CanonicalControlStore(root)
+        for artifact in self.reserved_artifacts:
+            if not control_store.verify(artifact):
+                raise ProviderAdapterError("agy_security_artifact_invalid", fatal_generation=True)
 
     @staticmethod
     def _expected_hooks(mailbox_root: Path) -> dict[str, object]:

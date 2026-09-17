@@ -263,7 +263,7 @@ def main():
                 },
             }
         )
-        if scenario == "tool_error":
+        if scenario in {"tool_success", "tool_error"}:
             emit(
                 {
                     "event": "step_update",
@@ -277,19 +277,35 @@ def main():
                     },
                 }
             )
-            emit(
-                {
-                    "event": "step_update",
-                    "step_update": {
-                        "conversation_id": conversation_id,
-                        "step_index": turn_number * 10 + 3,
-                        "step_type": "tool",
-                        "state": "ERROR",
-                        "tool_name": "view_file",
-                        "tool_info": {"error": "SENSITIVE-FIXTURE-PATH"},
-                    },
-                }
-            )
+            if scenario == "tool_success":
+                emit(
+                    {
+                        "event": "step_update",
+                        "step_update": {
+                            "conversation_id": conversation_id,
+                            "step_index": turn_number * 10 + 3,
+                            "step_type": "tool",
+                            "state": "DONE",
+                            "tool_name": "view_file",
+                            "duration_seconds": 0.25,
+                            "tool_info": {"output": "SENSITIVE-FIXTURE-PATH"},
+                        },
+                    }
+                )
+            else:
+                emit(
+                    {
+                        "event": "step_update",
+                        "step_update": {
+                            "conversation_id": conversation_id,
+                            "step_index": turn_number * 10 + 3,
+                            "step_type": "tool",
+                            "state": "ERROR",
+                            "tool_name": "view_file",
+                            "tool_info": {"error": "SENSITIVE-FIXTURE-PATH"},
+                        },
+                    }
+                )
         step_usage = {
             "input_tokens": 100,
             "output_tokens": 10,

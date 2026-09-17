@@ -1,8 +1,9 @@
-"""Strict official AGY 1.1.20 - 1.2.4 NDJSON parsing and normalized rendering."""
+"""Strict official AGY 1.1.20 - 1.2.5 NDJSON parsing and normalized rendering."""
 
 from __future__ import annotations
 
 import json
+import math
 from typing import Any
 
 from exocore_runtime.contracts import ProviderEvent, ProviderGeneration
@@ -23,7 +24,7 @@ _OBSERVED_STEP_STATES = {
     "agent_response": frozenset({"ACTIVE", "DONE"}),
     "agent_thought": frozenset({"ACTIVE", "DONE"}),
     "agent_thoughts": frozenset({"ACTIVE", "DONE"}),
-    "tool": frozenset({"ACTIVE", "ERROR"}),
+    "tool": frozenset({"ACTIVE", "DONE", "ERROR"}),
 }
 _USAGE_KEYS = (
     "input_tokens",
@@ -32,6 +33,27 @@ _USAGE_KEYS = (
     "cache_read_tokens",
     "total_tokens",
 )
+
+
+def _finite_duration(value: object) -> float | None:
+    """Coerce a provider-declared duration, or return None when unusable.
+
+    Bools, non-numbers, negatives, NaN/infinite floats, and integers that a
+    float cannot represent (for example ``10**400``) are omitted rather than
+    projected. The frozen duration policy is "project only finite
+    non-negative seconds"; raising a raw OverflowError here would bypass the
+    fail-closed parser contract, so coercion failure is never fatal.
+    """
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        duration = float(value)
+    except OverflowError:
+        return None
+    if not math.isfinite(duration) or duration < 0:
+        return None
+    return duration
 
 
 def parse_line(line: bytes) -> dict[str, Any]:
@@ -144,9 +166,23 @@ class AgyTurnNormalizer:
                 raise ProviderAdapterError("agy_unknown_step", terminal_status="indeterminate")
             return [ProviderEvent(event_type="lifecycle", payload=lifecycle)]
         if step_type == "tool":
+            # Bounded lifecycle only: the tool name is a short provider-declared
+            # identifier, while tool_info (parameters, output, error bodies)
+            # must never reach a ProviderEvent or the durable journal. Capture
+            # evidence: tests/fixtures/agy_1_2_5_tool_success.jsonl and
+            # agy_1_2_5_tool_failure.jsonl.
+            raw_tool_name = step.get("tool_name")
+            if not isinstance(raw_tool_name, str) or not (1 <= len(raw_tool_name) <= 100):
+                raise ProviderAdapterError("agy_malformed_step", terminal_status="indeterminate")
             lifecycle["category"] = "provider_tool"
+            lifecycle["tool_name"] = raw_tool_name
+            duration = _finite_duration(step.get("duration_seconds"))
+            if duration is not None:
+                lifecycle["duration_seconds"] = duration
             if state == "ERROR":
                 lifecycle["outcome"] = "tool_error"
+            elif state == "DONE":
+                lifecycle["outcome"] = "tool_completed"
             return [ProviderEvent(event_type="lifecycle", payload=lifecycle)]
         raise ProviderAdapterError("agy_unknown_step", terminal_status="indeterminate")
 
