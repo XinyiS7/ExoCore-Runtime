@@ -408,6 +408,11 @@ class AntigravityAdapter:
             options.security_policy_revision != SECURITY_POLICY_REVISION
             or options.launch_environment_revision != LAUNCH_ENVIRONMENT_REVISION
             or options.profile_mode != "generation_private"
+            # AGY is the one provider that opts out of the provider-neutral
+            # sandbox default: the verified 1.2.5 tool unlock runs with the
+            # deny policy as the authority, so ``sandbox=True`` would append
+            # ``--sandbox`` and contradict the frozen security policy.
+            or options.sandbox
         ):
             raise ProviderAdapterError("agy_process_options_unsupported")
 

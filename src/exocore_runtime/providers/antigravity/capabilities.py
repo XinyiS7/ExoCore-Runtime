@@ -7,7 +7,7 @@ from exocore_runtime.errors import ProviderAdapterError
 
 
 RESOLVER_POLICY_REVISION = "agy-gemini-3.1-pro-v1"
-SECURITY_POLICY_REVISION = "agy-seven-deny-v1"
+SECURITY_POLICY_REVISION = "agy-tool-perm-v2"
 LAUNCH_ENVIRONMENT_REVISION = "agy-isolated-env-v1"
 
 _POLICY: dict[tuple[str, str], tuple[str, str]] = {
@@ -25,9 +25,15 @@ def resolve_execution(requested_model_id: str, requested_thinking_level: str) ->
             status_code=422,
         )
     model_slug, effort = pair
+    # Provider-neutral ``ProcessExecutionOptions`` keeps ``sandbox=True`` as its
+    # default; this provider deliberately opts out. The verified 1.2.5 tool
+    # unlock runs the CLI directly on the host with the deny policy as the
+    # authority (see renderer.DENY_POLICY and the CP0 evidence gate report), so
+    # a sandboxed spawn would be an incoherent half-state.
     options = ProcessExecutionOptions(
         provider_model_slug=model_slug,
         effort=effort,
+        sandbox=False,
         security_policy_revision=SECURITY_POLICY_REVISION,
         launch_environment_revision=LAUNCH_ENVIRONMENT_REVISION,
     )

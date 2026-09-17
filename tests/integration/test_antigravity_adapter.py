@@ -171,14 +171,32 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             set(settings["permissions"]["deny"]),
             {
-                "read_file(*)",
-                "write_file(*)",
                 "read_url(*)",
                 "execute_url(*)",
-                "command(*)",
-                "unsandboxed(*)",
                 "mcp(*)",
             },
+        )
+        # CP2: the production-rendered custom agent declares exactly the first
+        # unlock tool ids; URL and MCP tools are neither declared nor allowed.
+        agent_markdown = (
+            generation_root
+            / "profile"
+            / ".gemini"
+            / "config"
+            / "agents"
+            / f"exocore-runtime-{str(self.binding_id).replace('-', '')}"
+            / "agent.md"
+        ).read_text(encoding="utf-8")
+        self.assertEqual(
+            agent_markdown.split("---\n")[1].splitlines(),
+            [
+                f"name: exocore-runtime-{str(self.binding_id).replace('-', '')}",
+                "description: ExoCore generation-private subscription runtime agent.",
+                "tools:",
+                "  - view_file",
+                "  - write_to_file",
+                "  - run_command",
+            ],
         )
         hooks = json.loads(
             (
@@ -228,20 +246,21 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
                 "stream-json",
                 "--print-timeout",
                 "3s",
-                "--sandbox",
+                "--dangerously-skip-permissions",
                 "--conversation",
                 first_session,
             ],
         )
         forbidden = {
             "--add-dir",
-            "--dangerously-skip-permissions",
             "--mode",
             "--project",
             "--prompt",
             "-p",
         }
         self.assertTrue(forbidden.isdisjoint(resume_argv))
+        # CP2: AGY runs unsandboxed with deny rules as the authority.
+        self.assertNotIn("--sandbox", resume_argv)
         self.assertNotIn("CURRENT-USER-CANARY", " ".join(resume_argv))
         self.assertNotIn("EPHEMERAL-CANARY", " ".join(resume_argv))
         self.assertEqual(spawns[-1]["forbidden_env_present"], [])

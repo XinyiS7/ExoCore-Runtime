@@ -7,13 +7,30 @@ import json
 from exocore_runtime.contracts import ContinuityDeltaTurn, TurnRequest
 
 
+# Native tool exposure for the custom agent: the explicitly declared workload
+# set. The production boundary never relies on the CLI's no-declaration default
+# surface: verified 1.2.5 evidence shows that surface is neither small nor
+# stable, and that AGY may inject the fundamental management tool
+# ``manage_task`` outside AGENT_TOOLS (observed ACTIVE->DONE while every other
+# undeclared tool answered "unknown tool"; see
+# Subscription_Runtime_AGY_CP2_Checkpoint_Report.md section 5). These are
+# AGY-native tool ids and stay deliberately separate from the permission action
+# namespaces (``read_file``/``write_file``/``command``) used by DENY_POLICY.
+AGENT_TOOLS = (
+    "view_file",
+    "write_to_file",
+    "run_command",
+)
+
+# Official fine-grained permission semantics are Deny > Ask > Allow, so the
+# deny list (not the tool declaration) decides what an exposed tool may do.
+# Captured 1.2.5 evidence: keeping ``unsandboxed(*)`` denies every ``command``
+# while ``sandbox=False``, so the first unlock drops it together with the
+# ``read_file``/``write_file``/``command`` namespaces. The URL and MCP families
+# stay denied and are also never declared as tools.
 DENY_POLICY = (
-    "read_file(*)",
-    "write_file(*)",
     "read_url(*)",
     "execute_url(*)",
-    "command(*)",
-    "unsandboxed(*)",
     "mcp(*)",
 )
 
@@ -60,10 +77,13 @@ def extract_rendered_system_instructions(agent_name: str, markdown: str) -> str:
 
 
 def _agent_markdown_prefix(agent_name: str) -> str:
+    tools_block = "".join(f"  - {tool}\n" for tool in AGENT_TOOLS)
     return (
         "---\n"
         f"name: {agent_name}\n"
         "description: ExoCore generation-private subscription runtime agent.\n"
+        "tools:\n"
+        f"{tools_block}"
         "---\n"
     )
 

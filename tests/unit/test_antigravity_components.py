@@ -14,7 +14,10 @@ from exocore_runtime.providers.antigravity.ephemeral_hook import (
 )
 from exocore_runtime.providers.antigravity.ndjson import AgyTurnNormalizer, parse_init
 from exocore_runtime.providers.antigravity.renderer import (
+    AGENT_TOOLS,
     DENY_POLICY,
+    extract_rendered_system_instructions,
+    render_agent_markdown,
     render_stdin_line,
 )
 from exocore_runtime.state_store import RuntimeStateStore
@@ -72,15 +75,42 @@ class AntigravityComponentTests(unittest.TestCase):
         self.assertEqual(
             set(DENY_POLICY),
             {
-                "read_file(*)",
-                "write_file(*)",
                 "read_url(*)",
                 "execute_url(*)",
-                "command(*)",
-                "unsandboxed(*)",
                 "mcp(*)",
             },
         )
+
+    def test_rendered_agent_declares_only_the_intended_native_tools(self) -> None:
+        # Production rendering must expose exactly the CP2 first-unlock workload
+        # tool set. The boundary is the explicit declaration itself, never the
+        # CLI's no-declaration default surface (1.2.5 evidence: that default is
+        # neither small nor stable).
+        agent_name = f"exocore-runtime-{self.binding_id.replace('-', '')}"
+        markdown = render_agent_markdown(agent_name, "system instructions body")
+        self.assertEqual(
+            markdown.split("---\n")[1].splitlines(),
+            [
+                f"name: {agent_name}",
+                "description: ExoCore generation-private subscription runtime agent.",
+                "tools:",
+                "  - view_file",
+                "  - write_to_file",
+                "  - run_command",
+            ],
+        )
+        self.assertEqual(AGENT_TOOLS, ("view_file", "write_to_file", "run_command"))
+        # URL and MCP tools stay unexposed as well as denied.
+        for closed_tool in ("read_url_content", "execute_url", "mcp"):
+            self.assertNotIn(closed_tool, markdown)
+        # Extraction shares the same prefix source, so the round trip stays exact.
+        self.assertEqual(
+            extract_rendered_system_instructions(agent_name, markdown),
+            "system instructions body",
+        )
+        tampered = markdown.replace("  - run_command\n", "")
+        with self.assertRaises(ValueError):
+            extract_rendered_system_instructions(agent_name, tampered)
 
     def test_renderer_preserves_raw_multiline_history_and_literal_backslash_n(self) -> None:
         current = "continue this conversation"

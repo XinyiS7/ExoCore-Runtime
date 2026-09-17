@@ -7,9 +7,13 @@ from uuid import uuid4
 
 from pydantic import ValidationError
 
-from exocore_runtime.contracts import GenerationSpec, TurnRequest
+from exocore_runtime.contracts import GenerationSpec, ProcessExecutionOptions, TurnRequest
 from exocore_runtime.errors import ConflictError, StateResetRequiredError
-from exocore_runtime.providers.antigravity.capabilities import resolve_execution
+from exocore_runtime.providers.antigravity.capabilities import (
+    LAUNCH_ENVIRONMENT_REVISION,
+    SECURITY_POLICY_REVISION,
+    resolve_execution,
+)
 from exocore_runtime.providers.fake import DeterministicFakeAdapter
 from exocore_runtime.service import RuntimeService
 from exocore_runtime.state_store import RuntimeStateStore
@@ -47,6 +51,20 @@ class CapabilityPolicyTests(unittest.TestCase):
                 resolve_execution("gemini-3.1-pro-preview", thinking)
         with self.assertRaisesRegex(Exception, "unsupported_requested_execution"):
             resolve_execution("gemini-3.7-flash-preview", "high")
+
+    def test_agy_resolver_opts_out_of_the_neutral_sandbox_default(self) -> None:
+        options = resolve_execution("gemini-3.1-pro-preview", "auto").process_options
+        self.assertIs(options.sandbox, False)
+        self.assertEqual(options.security_policy_revision, SECURITY_POLICY_REVISION)
+        self.assertEqual(SECURITY_POLICY_REVISION, "agy-tool-perm-v2")
+        # The provider-neutral default itself stays untouched.
+        neutral = ProcessExecutionOptions(
+            provider_model_slug="gemini-3.1-pro-high",
+            effort="high",
+            security_policy_revision=SECURITY_POLICY_REVISION,
+            launch_environment_revision=LAUNCH_ENVIRONMENT_REVISION,
+        )
+        self.assertIs(neutral.sandbox, True)
 
     def test_generation_contract_structurally_excludes_execution_and_session(self) -> None:
         fields = set(GenerationSpec.model_fields)
