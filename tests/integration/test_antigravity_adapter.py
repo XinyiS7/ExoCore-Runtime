@@ -866,7 +866,7 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
                 await adapter.shutdown()
         self.assertEqual(caught.exception.code, "fixture_supervisor_cleanup_failed")
         self.assertFalse(mailbox.pending_path.exists())
-        self.assertNotIn(str(self.binding_id), adapter._prepared)
+        self.assertEqual(adapter._requests, {})
         await adapter.supervisor.shutdown()
 
     async def test_shutdown_terminalizes_sent_turn_before_process_cleanup(self) -> None:
@@ -992,18 +992,32 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(owner.cancel())
             with self.assertRaises(asyncio.CancelledError) as caught:
                 await owner
-        self.assertEqual(dispose_attempts, 3)
-        self.assertIn(
-            "cancelled stream process cleanup also failed",
-            getattr(caught.exception, "__notes__", []),
-        )
-        durable = service.store.get_request(str(self.binding_id), str(request.request_id))
-        self.assertEqual(durable.status, "cancelled")
-        self.assertEqual(
-            service.store.terminal_count(str(self.binding_id), str(request.request_id)),
-            1,
-        )
-        self.assertNotIn(str(self.binding_id), adapter._prepared)
+            # CP4-B: a failed exact force-dispose must never fabricate a
+            # cancelled receipt. The settlement reports honest indeterminate;
+            # the failed disposal leaves the session poisoned, never silently
+            # reusable, and the exact request proof is still reclaimed after
+            # the durable terminal.
+            self.assertEqual(dispose_attempts, 2)
+            self.assertIn(
+                "cancelled stream process cleanup also failed",
+                getattr(caught.exception, "__notes__", []),
+            )
+            durable = service.store.get_request(str(self.binding_id), str(request.request_id))
+            self.assertEqual(durable.status, "indeterminate")
+            self.assertEqual(durable.terminal_code, "cancel_cleanup_failed")
+            self.assertEqual(
+                service.store.terminal_count(str(self.binding_id), str(request.request_id)),
+                1,
+            )
+            self.assertFalse(
+                [key for key in adapter._requests if key[0] == str(self.binding_id)]
+            )
+            self.assertIn(str(self.binding_id), adapter.supervisor._sessions)
+            self.assertTrue(adapter.supervisor._sessions[str(self.binding_id)].poisoned)
+        # Once the failure injection is lifted, shutdown retries the poisoned
+        # session and the process tree is gone with exactly one durable terminal.
+        await service.shutdown()
+        self.services.remove(service)
         self.assertNotIn(str(self.binding_id), adapter.supervisor._sessions)
         for process_id in process_ids:
             for _ in range(100):

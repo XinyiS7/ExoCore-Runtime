@@ -126,6 +126,10 @@ class _ProcessSession:
     provider_session_id: str
     job_handle: int | None = None
     current_request_id: str | None = None
+    # A failed exact-request disposal poisons the session: it may still hold a
+    # stale claim and a live process tree, so reuse must force-dispose it
+    # instead of silently handing it to the next request.
+    poisoned: bool = False
 
 
 class AgyProcessSupervisor:
@@ -139,6 +143,12 @@ class AgyProcessSupervisor:
         self._binding_locks_guard = asyncio.Lock()
         self._preflight_lock = asyncio.Lock()
         self._preflight_complete = False
+        # Request-scoped physical proofs. The adapter is the only consumer:
+        # process candidates feed adapter certification, abandoned proofs
+        # feed the explicit cancel classification. Entries are released by
+        # ``discard_request_proofs`` after the Runtime durable ack.
+        self._result_candidates: dict[tuple[str, str], ProviderEvent] = {}
+        self._abandoned: dict[tuple[str, str], str] = {}
         self.quota_snapshot: dict[str, int] | None = None
         self.available_model_slugs: frozenset[str] = frozenset()
 
@@ -147,7 +157,11 @@ class AgyProcessSupervisor:
         async with lock:
             self._validate_account_default(layout.profile)
             current = self._sessions.get(layout.binding_id)
-            if current is not None and current.process.returncode is None:
+            if (
+                current is not None
+                and current.process.returncode is None
+                and not current.poisoned
+            ):
                 if current.layout.execution_options == layout.execution_options:
                     if (
                         layout.provider_session_id is not None
@@ -190,30 +204,16 @@ class AgyProcessSupervisor:
         request_id: str,
         stdin_line: bytes,
     ) -> AsyncIterator[ProviderEvent]:
-        session = self._sessions.get(binding_id)
-        if session is None or session.process.returncode is not None:
-            raise ProviderAdapterError(
-                "agy_process_not_ready",
-                terminal_status="indeterminate",
-                fatal_generation=True,
-            )
-        if session.current_request_id is not None:
-            raise ProviderAdapterError("agy_generation_busy", terminal_status="indeterminate")
-        session.current_request_id = request_id
+        session, stdin = await self._begin_request(binding_id, request_id, stdin_line)
+        normalizer = AgyTurnNormalizer(session.provider_session_id)
         try:
-            self._reject_unsolicited_output(session)
-            stdin = session.process.stdin
-            if stdin is None:
-                raise ProviderAdapterError("agy_stdin_unavailable", terminal_status="indeterminate")
             try:
-                stdin.write(stdin_line)
                 await stdin.drain()
             except (BrokenPipeError, ConnectionError) as exc:
                 raise ProviderAdapterError(
                     "agy_stdin_write_failed",
                     terminal_status="indeterminate",
                 ) from exc
-            normalizer = AgyTurnNormalizer(session.provider_session_id)
             started = time.monotonic()
             while True:
                 elapsed = time.monotonic() - started
@@ -229,14 +229,26 @@ class AgyProcessSupervisor:
                 events = normalizer.consume(parse_line(line))
                 if normalizer.result_seen:
                     await self._assert_quiet_after_result(session)
-                    session.current_request_id = None
+                    terminals = [
+                        event for event in events if event.event_type in {"done", "error"}
+                    ]
+                    if len(terminals) != 1:
+                        raise ProviderAdapterError(
+                            "agy_terminal_missing",
+                            terminal_status="indeterminate",
+                        )
+                    # Record the request-scoped process candidate before the
+                    # claim is released: a cancel interleaving at that await
+                    # must observe the candidate, not a fencable active claim.
+                    self._result_candidates[(binding_id, request_id)] = terminals[0]
+                    await self._release_claim(binding_id, session, request_id)
                     for event in events:
                         yield event
                     return
                 for event in events:
                     yield event
         except asyncio.CancelledError as original_error:
-            await self._finish_cancelled_stream_cleanup(binding_id, original_error)
+            await self._finish_cancelled_stream_cleanup(binding_id, request_id, original_error)
             raise
         except ProviderAdapterError as original_error:
             try:
@@ -249,20 +261,130 @@ class AgyProcessSupervisor:
             if current is not None and current.process.returncode is not None:
                 current.current_request_id = None
 
-    async def cancel(self, binding_id: str, request_id: str) -> None:
-        session = self._sessions.get(binding_id)
-        if session is None:
-            return
-        if session.current_request_id != request_id:
-            return
-        await self.close_binding(binding_id, force=False)
+    async def _begin_request(
+        self,
+        binding_id: str,
+        request_id: str,
+        stdin_line: bytes,
+    ) -> tuple[_ProcessSession, asyncio.StreamWriter]:
+        """Atomically claim the exact request and initiate the stdin write.
+
+        The claim and the synchronous ``stdin.write`` share one per-binding
+        critical section, so an explicit cancel can never fence request A and
+        then observe a stale owner sending A afterwards: by the time it takes
+        the lock, the request is either fully initiated (active disposal) or
+        not claimed at all (prestart disposal). The follow-up ``drain`` is
+        awaited outside the lock so a stuck pipe cannot block a cancel.
+        """
+
+        lock = await self._binding_lock(binding_id)
+        async with lock:
+            session = self._sessions.get(binding_id)
+            if (
+                session is None
+                or session.process.returncode is not None
+                or session.poisoned
+            ):
+                raise ProviderAdapterError(
+                    "agy_process_not_ready",
+                    terminal_status="indeterminate",
+                    fatal_generation=True,
+                )
+            if session.current_request_id is not None:
+                raise ProviderAdapterError("agy_generation_busy", terminal_status="indeterminate")
+            self._reject_unsolicited_output(session)
+            stdin = session.process.stdin
+            if stdin is None:
+                raise ProviderAdapterError("agy_stdin_unavailable", terminal_status="indeterminate")
+            session.current_request_id = request_id
+            try:
+                stdin.write(stdin_line)
+            except (BrokenPipeError, ConnectionError) as exc:
+                session.current_request_id = None
+                raise ProviderAdapterError(
+                    "agy_stdin_write_failed",
+                    terminal_status="indeterminate",
+                ) from exc
+            return session, stdin
+
+    async def _release_claim(
+        self,
+        binding_id: str,
+        session: _ProcessSession,
+        request_id: str,
+    ) -> None:
+        lock = await self._binding_lock(binding_id)
+        async with lock:
+            if (
+                self._sessions.get(binding_id) is session
+                and session.current_request_id == request_id
+            ):
+                session.current_request_id = None
+
+    async def dispose_request(self, binding_id: str, request_id: str) -> str:
+        """Classify and force-dispose one exact request under the binding lock.
+
+        Returns ``"active"`` when this instance's exact claim existed and the
+        session was force-disposed, ``"prestart"`` when the generation process
+        was idle (no claim) and was force-disposed, and ``"absent"`` when no
+        exact disposal proof exists. The classification and the disposal are
+        one critical section, so a lock-free ``current_request_id`` snapshot
+        can never close a session that meanwhile belongs to another request.
+        """
+
+        lock = await self._binding_lock(binding_id)
+        async with lock:
+            session = self._sessions.get(binding_id)
+            if session is None:
+                return "absent"
+            if session.process.returncode is not None:
+                if self._sessions.get(binding_id) is session:
+                    self._sessions.pop(binding_id, None)
+                return "absent"
+            if session.current_request_id == request_id:
+                await self._dispose_and_pop_locked(binding_id, session, force=True)
+                return "active"
+            if session.current_request_id is None:
+                await self._dispose_and_pop_locked(binding_id, session, force=True)
+                return "prestart"
+            return "absent"
+
+    def request_candidate(self, binding_id: str, request_id: str) -> ProviderEvent | None:
+        """Return the process-level result candidate for one exact request."""
+
+        return self._result_candidates.get((binding_id, request_id))
+
+    def abandoned_proof(self, binding_id: str, request_id: str) -> str | None:
+        """Return the abandoned-owner cleanup proof for one exact request."""
+
+        return self._abandoned.get((binding_id, request_id))
+
+    def discard_request_proofs(self, binding_id: str, request_id: str) -> None:
+        """Local synchronous release of one request's proofs after durable ack."""
+
+        self._result_candidates.pop((binding_id, request_id), None)
+        self._abandoned.pop((binding_id, request_id), None)
+
+    def discard_binding_proofs(self, binding_id: str) -> None:
+        """Drop every residual proof for one binding (retire/shutdown)."""
+
+        for key in [key for key in self._result_candidates if key[0] == binding_id]:
+            self._result_candidates.pop(key, None)
+        for key in [key for key in self._abandoned if key[0] == binding_id]:
+            self._abandoned.pop(key, None)
 
     async def _finish_cancelled_stream_cleanup(
         self,
         binding_id: str,
+        request_id: str,
         original_error: asyncio.CancelledError,
     ) -> None:
-        cleanup = asyncio.create_task(self.close_binding(binding_id, force=False))
+        if self.request_candidate(binding_id, request_id) is not None:
+            # The exact request already crossed the strict process-result
+            # boundary; its terminal fate belongs to adapter certification,
+            # never to an abandoned kill.
+            return
+        cleanup = asyncio.create_task(self._abandon_request(binding_id, request_id))
         while not cleanup.done():
             try:
                 await asyncio.shield(cleanup)
@@ -275,31 +397,53 @@ class AgyProcessSupervisor:
         except BaseException:
             original_error.add_note("cancelled stream process cleanup also failed")
 
+    async def _abandon_request(self, binding_id: str, request_id: str) -> None:
+        """Force-dispose exactly the abandoned owner's request; record proof.
+
+        The success marker is written only after the exact force-dispose
+        completed; a failed cleanup records an explicit failure marker so an
+        explicit cancel can never mistake it for a disposal proof.
+        """
+
+        lock = await self._binding_lock(binding_id)
+        async with lock:
+            session = self._sessions.get(binding_id)
+            if session is None or session.current_request_id != request_id:
+                return
+            try:
+                await self._dispose_and_pop_locked(binding_id, session, force=True)
+            except BaseException:
+                self._abandoned[(binding_id, request_id)] = "cleanup_failed"
+                raise
+            self._abandoned[(binding_id, request_id)] = "disposed"
+
     async def close_binding(self, binding_id: str, *, force: bool) -> None:
         lock = await self._binding_lock(binding_id)
         async with lock:
             session = self._sessions.get(binding_id)
             if session is None:
                 return
-            try:
-                await self._dispose_session(session, force=force)
-            except BaseException:
-                if (
-                    session.process.returncode is not None
-                    and self._sessions.get(binding_id) is session
-                ):
-                    self._sessions.pop(binding_id, None)
-                raise
-            if self._sessions.get(binding_id) is session:
-                self._sessions.pop(binding_id, None)
+            await self._dispose_and_pop_locked(binding_id, session, force=force)
 
-    def owns_request(self, binding_id: str, request_id: str) -> bool:
-        session = self._sessions.get(binding_id)
-        return (
-            session is not None
-            and session.process.returncode is None
-            and session.current_request_id == request_id
-        )
+    async def _dispose_and_pop_locked(
+        self,
+        binding_id: str,
+        session: _ProcessSession,
+        *,
+        force: bool,
+    ) -> None:
+        try:
+            await self._dispose_session(session, force=force)
+        except BaseException:
+            session.poisoned = True
+            if (
+                session.process.returncode is not None
+                and self._sessions.get(binding_id) is session
+            ):
+                self._sessions.pop(binding_id, None)
+            raise
+        if self._sessions.get(binding_id) is session:
+            self._sessions.pop(binding_id, None)
 
     async def shutdown(self) -> None:
         bindings = tuple(self._sessions)
@@ -309,6 +453,8 @@ class AgyProcessSupervisor:
                 await self.close_binding(binding_id, force=False)
             except BaseException as exc:
                 failures.append(exc)
+        self._result_candidates.clear()
+        self._abandoned.clear()
         if failures:
             raise ProviderAdapterError("agy_shutdown_cleanup_failed")
 

@@ -167,6 +167,34 @@ class V2HttpContractTests(unittest.TestCase):
         self.assertEqual(prepared.status_code, 409)
         self.assertEqual(prepared.json(), {"error": "journal_not_terminal"})
 
+    def test_cancel_of_unregistered_request_uses_the_cancel_specific_code(self) -> None:
+        from exocore_runtime.contracts import GenerationSpec
+
+        binding_id = uuid4()
+        self.store.ensure_generation(
+            str(binding_id),
+            GenerationSpec(
+                runtime_kind="fake",
+                bootstrap_fingerprint="bootstrap",
+                system_instructions="system",
+            ),
+        )
+        unregistered = self.client.post(
+            f"/v2/generations/{binding_id}/turns/{uuid4()}/cancel",
+            headers=self.auth(),
+        )
+        self.assertEqual(unregistered.status_code, 409)
+        self.assertEqual(
+            unregistered.json(),
+            {"error": "cancel_request_unregistered"},
+        )
+        missing_binding = self.client.post(
+            f"/v2/generations/{uuid4()}/turns/{uuid4()}/cancel",
+            headers=self.auth(),
+        )
+        self.assertEqual(missing_binding.status_code, 404)
+        self.assertEqual(missing_binding.json(), {"error": "not_found"})
+
     def test_journal_replay_returns_exact_header_and_ordered_frames(self) -> None:
         binding_id, request_id = self._completed_request()
         store_request = self.store.get_request(str(binding_id), str(request_id))

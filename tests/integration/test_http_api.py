@@ -531,7 +531,9 @@ class RuntimeHttpTests(unittest.TestCase):
             self.assertIsNotNone(record)
             self.assertEqual(record.status, "cancelled")
             self.assertEqual(len(process_ids), 2)
-            self.assertNotIn(str(binding_id), antigravity._prepared)
+            self.assertFalse(
+                [key for key in antigravity._requests if key[0] == str(binding_id)]
+            )
             self.assertNotIn(str(binding_id), supervisor._sessions)
             for process_id in process_ids:
                 check = subprocess.run(

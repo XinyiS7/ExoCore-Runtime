@@ -28,6 +28,18 @@ class ConflictError(RuntimeGatewayError):
     status_code = 409
 
 
+class CancelUnregisteredError(RuntimeGatewayError):
+    """Cancel arrived before the request crossed durable registration.
+
+    Cancel-operation-specific metadata-only code: ExoCore classifies this
+    conservatively as indeterminate instead of a definitive request failure,
+    because a send attempt may already have crossed the wire (CP4 R14).
+    """
+
+    code = "cancel_request_unregistered"
+    status_code = 409
+
+
 class RetiredError(RuntimeGatewayError):
     code = "generation_retired"
     status_code = 409

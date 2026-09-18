@@ -16,6 +16,10 @@ from exocore_runtime.contracts import (
     TurnRequest,
 )
 from exocore_runtime.errors import ProviderAdapterError, StateResetRequiredError
+from exocore_runtime.providers.base import (
+    ProviderCancelOutcome,
+    ProviderCancelReceipt,
+)
 from exocore_runtime.service import RuntimeService
 from exocore_runtime.state_store import RuntimeStateStore
 
@@ -87,6 +91,9 @@ class BootstrapBoundaryAdapter:
         )
 
     async def cancel(self, binding_id, request_id):
+        return ProviderCancelReceipt(ProviderCancelOutcome.OWNERSHIP_UNKNOWN)
+
+    def reclaim_request(self, binding_id, request_id):
         return None
 
     async def retire(self, binding_id, reason):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
 import hashlib
 import json
 import os
@@ -51,7 +52,31 @@ from exocore_runtime.providers.antigravity.renderer import (
     render_agent_markdown,
     render_stdin_line,
 )
+from exocore_runtime.providers.base import (
+    ProviderCancelOutcome,
+    ProviderCancelReceipt,
+)
 from exocore_runtime.state_store import GenerationRecord
+
+
+@dataclass
+class _RequestState:
+    """Adapter-private state for one exact prepared request.
+
+    The mailbox receipt validation is the provider-terminal certification
+    boundary: the process-level result candidate is only an input to it. The
+    state is retained from prepare until the Runtime reclaims the request
+    after its durable terminal, so a certified proof can never be lost when
+    the owner stream returns or disappears.
+    """
+
+    request_id: str
+    mailbox: EphemeralMailbox
+    payload_hash: str
+    stdin_line: bytes
+    certification_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    certified_terminal: ProviderEvent | None = None
+    mailbox_cleaned: bool = False
 
 
 class AntigravityAdapter:
@@ -68,7 +93,7 @@ class AntigravityAdapter:
         self.supervisor = supervisor
         self.mailbox_ttl_seconds = mailbox_ttl_seconds
         self.reserved_artifacts = tuple(reserved_artifacts)
-        self._prepared: dict[str, tuple[str, EphemeralMailbox, str, bytes]] = {}
+        self._requests: dict[tuple[str, str], _RequestState] = {}
         self._artifact_locks: dict[str, asyncio.Lock] = {}
         self._artifact_locks_guard = asyncio.Lock()
         self._shutting_down = False
@@ -109,7 +134,12 @@ class AntigravityAdapter:
                 request_id = str(request.request_id)
                 payload_hash = mailbox.prepare(request_id, request.ephemeral_current)
                 stdin_line = render_stdin_line(request, is_first_turn=is_first_turn)
-                self._prepared[binding_id] = (request_id, mailbox, payload_hash, stdin_line)
+                self._requests[(binding_id, request_id)] = _RequestState(
+                    request_id=request_id,
+                    mailbox=mailbox,
+                    payload_hash=payload_hash,
+                    stdin_line=stdin_line,
+                )
         except asyncio.CancelledError as original_error:
             try:
                 self._cleanup_presend_payloads(binding_id, mailbox)
@@ -164,34 +194,33 @@ class AntigravityAdapter:
         request: TurnRequest,
     ) -> AsyncIterator[ProviderEvent]:
         request_id = str(request.request_id)
-        prepared = self._prepared.get(binding_id)
-        if prepared is None or prepared[0] != request_id:
+        state = self._requests.get((binding_id, request_id))
+        if state is None:
             raise ProviderAdapterError(
                 "agy_turn_not_prepared",
                 terminal_status="indeterminate",
             )
-        _, mailbox, payload_hash, stdin_line = prepared
         deferred_usage: list[ProviderEvent] = []
         original_failure: BaseException | None = None
         try:
-            async for event in self.supervisor.stream_turn(binding_id, request_id, stdin_line):
+            async for event in self.supervisor.stream_turn(
+                binding_id, request_id, state.stdin_line
+            ):
                 if event.event_type == "usage":
                     deferred_usage.append(event)
                     continue
                 if event.event_type in {"done", "error"}:
-                    mailbox.validate_receipt(request_id, payload_hash)
-                    mailbox.cleanup_request()
+                    certified = await self._certify_request(binding_id, request_id, event)
                     for usage in deferred_usage:
                         yield usage
-                    yield event
+                    yield certified
                     return
                 yield event
         except asyncio.CancelledError as exc:
+            # The supervisor's own cancellation handler already force-disposed
+            # the exact request (or skipped it for a certified candidate); the
+            # Runtime arbiter settlement reads that proof afterwards.
             original_failure = exc
-            try:
-                await self.supervisor.cancel(binding_id, request_id)
-            except BaseException:
-                exc.add_note("cancelled owner process cleanup also failed")
             raise
         except ProviderAdapterError as exc:
             original_failure = exc
@@ -205,41 +234,63 @@ class AntigravityAdapter:
             original_failure = exc
             raise
         finally:
-            mailbox_clean = False
-            try:
-                mailbox.cleanup_request()
-                mailbox_clean = True
-            except OSError as cleanup_error:
-                if original_failure is None:
-                    raise ProviderAdapterError("ephemeral_cleanup_failed") from cleanup_error
-                original_failure.add_note("ephemeral mailbox cleanup also failed")
-            current = self._prepared.get(binding_id)
-            if (
-                mailbox_clean
-                and current is not None
-                and current[0] == request_id
-                and not self.supervisor.owns_request(binding_id, request_id)
-            ):
-                self._prepared.pop(binding_id, None)
+            self._finalize_request_stream(binding_id, request_id, original_failure)
 
-    async def cancel(self, binding_id: str, request_id: str) -> None:
-        await self.supervisor.cancel(binding_id, request_id)
+    async def cancel(self, binding_id: str, request_id: str) -> ProviderCancelReceipt:
+        """Explicit cancel classification under the artifact->binding lock order.
+
+        Only one positive physical proof may produce ``CANCELLED_*``; a
+        process result candidate is always routed through adapter
+        certification, and everything else falls through to
+        ``OWNERSHIP_UNKNOWN``.
+        """
+
         lock = await self._artifact_lock(binding_id)
         async with lock:
-            prepared = self._prepared.get(binding_id)
-            if prepared is None or prepared[0] != request_id:
-                return
-            try:
-                prepared[1].cleanup_request()
-            except OSError as cleanup_error:
-                raise ProviderAdapterError("ephemeral_cleanup_failed") from cleanup_error
-            self._prepared.pop(binding_id, None)
+            state = self._requests.get((binding_id, request_id))
+            if state is not None and state.certified_terminal is not None:
+                return ProviderCancelReceipt(
+                    ProviderCancelOutcome.NATURAL_TERMINAL_READY,
+                    state.certified_terminal,
+                )
+            candidate = self.supervisor.request_candidate(binding_id, request_id)
+            if candidate is not None:
+                certified = await self._certify_request(binding_id, request_id, candidate)
+                return ProviderCancelReceipt(
+                    ProviderCancelOutcome.NATURAL_TERMINAL_READY,
+                    certified,
+                )
+            abandoned = self.supervisor.abandoned_proof(binding_id, request_id)
+            if abandoned == "disposed":
+                return ProviderCancelReceipt(ProviderCancelOutcome.CANCELLED_ABANDONED)
+            outcome = await self.supervisor.dispose_request(binding_id, request_id)
+            if state is not None:
+                self._cleanup_state_mailbox(state)
+            if outcome == "active":
+                return ProviderCancelReceipt(ProviderCancelOutcome.CANCELLED_ACTIVE)
+            if outcome == "prestart" and state is not None:
+                # Fence the exact prepared request: a stale owner can no
+                # longer claim it (the process was force-disposed) and a new
+                # stream entry can no longer find its prepared state.
+                self._requests.pop((binding_id, request_id), None)
+                return ProviderCancelReceipt(ProviderCancelOutcome.CANCELLED_PRESTART)
+            if state is not None:
+                self._requests.pop((binding_id, request_id), None)
+            return ProviderCancelReceipt(ProviderCancelOutcome.OWNERSHIP_UNKNOWN)
+
+    def reclaim_request(self, binding_id: str, request_id: str) -> None:
+        """Local synchronous idempotent release after the durable terminal."""
+
+        self._requests.pop((binding_id, request_id), None)
+        self.supervisor.discard_request_proofs(binding_id, request_id)
 
     async def retire(self, binding_id: str, reason: str) -> None:
         lock = await self._artifact_lock(binding_id)
         async with lock:
             await self.supervisor.close_binding(binding_id, force=False)
-            self._prepared.pop(binding_id, None)
+            for key in [key for key in self._requests if key[0] == binding_id]:
+                self._requests.pop(key, None)
+            self.supervisor.discard_binding_proofs(binding_id)
             root = self._generation_root(binding_id)
             if root.exists():
                 try:
@@ -260,19 +311,115 @@ class AntigravityAdapter:
         except BaseException as exc:
             supervisor_failure = exc
         mailbox_failures: list[OSError] = []
-        for binding_id, prepared in tuple(self._prepared.items()):
+        for state in tuple(self._requests.values()):
+            if state.mailbox_cleaned:
+                continue
             try:
-                prepared[1].cleanup_request()
+                state.mailbox.cleanup_request()
+                state.mailbox_cleaned = True
             except OSError as exc:
                 mailbox_failures.append(exc)
-            else:
-                self._prepared.pop(binding_id, None)
+        self._requests.clear()
         if supervisor_failure is not None:
             if mailbox_failures:
                 supervisor_failure.add_note("ephemeral mailbox cleanup also failed")
             raise supervisor_failure
         if mailbox_failures:
             raise ProviderAdapterError("ephemeral_cleanup_failed") from mailbox_failures[0]
+
+    async def _certify_request(
+        self,
+        binding_id: str,
+        request_id: str,
+        candidate: ProviderEvent | None,
+    ) -> ProviderEvent:
+        """Single-flight idempotent provider-terminal certification.
+
+        A process result candidate is not provider terminal truth: only the
+        exact mailbox receipt validation makes an immutable certified
+        terminal, with the same cleanup/fatal mapping for the owner stream and
+        a late-cancel rescue. Whoever completes first wins; the other side
+        reuses the stored result and never re-runs validation/cleanup.
+        """
+
+        state = self._requests.get((binding_id, request_id))
+        if state is None:
+            raise ProviderAdapterError(
+                "agy_turn_not_prepared",
+                terminal_status="indeterminate",
+            )
+        async with state.certification_lock:
+            if state.certified_terminal is not None:
+                return state.certified_terminal
+            failure: ProviderAdapterError | None = None
+            try:
+                state.mailbox.validate_receipt(request_id, state.payload_hash)
+            except ProviderAdapterError as exc:
+                failure = exc
+            if failure is not None:
+                certified = self._certification_failure_event(failure)
+                if failure.fatal_generation:
+                    try:
+                        await self.supervisor.close_binding(binding_id, force=True)
+                    except BaseException:
+                        failure.add_note("process cleanup also failed")
+            else:
+                if candidate is None:
+                    candidate = self.supervisor.request_candidate(binding_id, request_id)
+                if candidate is None:
+                    raise ProviderAdapterError(
+                        "agy_terminal_candidate_missing",
+                        terminal_status="indeterminate",
+                    )
+                certified = candidate
+            try:
+                state.mailbox.cleanup_request()
+                state.mailbox_cleaned = True
+            except OSError as cleanup_error:
+                if failure is None:
+                    raise ProviderAdapterError("ephemeral_cleanup_failed") from cleanup_error
+                failure.add_note("ephemeral mailbox cleanup also failed")
+            state.certified_terminal = certified
+            return certified
+
+    @staticmethod
+    def _certification_failure_event(failure: ProviderAdapterError) -> ProviderEvent:
+        """Normalize one certification failure for both owner and rescue paths."""
+
+        return ProviderEvent(
+            event_type="error",
+            payload={"code": failure.code},
+            terminal_status=failure.terminal_status,
+        )
+
+    def _finalize_request_stream(
+        self,
+        binding_id: str,
+        request_id: str,
+        original_failure: BaseException | None,
+    ) -> None:
+        """Safety-net mailbox cleanup; the request proof stays until reclaim."""
+
+        state = self._requests.get((binding_id, request_id))
+        if state is None or state.mailbox_cleaned:
+            return
+        try:
+            state.mailbox.cleanup_request()
+            state.mailbox_cleaned = True
+        except OSError as cleanup_error:
+            if original_failure is None:
+                raise ProviderAdapterError("ephemeral_cleanup_failed") from cleanup_error
+            original_failure.add_note("ephemeral mailbox cleanup also failed")
+
+    @staticmethod
+    def _cleanup_state_mailbox(state: _RequestState) -> None:
+        if state.mailbox_cleaned:
+            return
+        try:
+            state.mailbox.cleanup_request()
+            state.mailbox_cleaned = True
+        except OSError as cleanup_error:
+            raise ProviderAdapterError("ephemeral_cleanup_failed") from cleanup_error
 
     async def _artifact_lock(self, binding_id: str) -> asyncio.Lock:
         async with self._artifact_locks_guard:

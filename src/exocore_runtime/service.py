@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
+from enum import Enum
+import logging
+import threading
 from uuid import UUID, uuid4
 
 from exocore_runtime.contracts import (
@@ -18,18 +21,64 @@ from exocore_runtime.contracts import (
     canonical_turn_request_hash,
 )
 from exocore_runtime.errors import (
+    CancelUnregisteredError,
     ConflictError,
     ProviderAdapterError,
     ProviderProtocolError,
     RetiredError,
 )
 from exocore_runtime.event_journal import EventJournal
-from exocore_runtime.providers.base import RuntimeProviderAdapter
+from exocore_runtime.providers.base import (
+    ProviderCancelOutcome,
+    ProviderCancelReceipt,
+    RuntimeProviderAdapter,
+)
 from exocore_runtime.state_store import RequestRecord, RuntimeStateStore
 
 
 _NONTERMINAL_TYPES = frozenset({"thinking_delta", "content_delta", "lifecycle", "usage"})
 _TERMINAL_TYPES = frozenset({"done", "error"})
+_LOGGER = logging.getLogger(__name__)
+
+
+class ArbiterState(str, Enum):
+    """Whole-request terminal arbitration states (Plan CP4 §3.3.1)."""
+
+    OPEN = "open"
+    NATURAL_TERMINAL_PENDING = "natural_terminal_pending"
+    CANCELLING = "cancelling"
+    TERMINAL = "terminal"
+
+
+class _RequestArbiter:
+    """One terminal winner slot per claimed Runtime request.
+
+    The lock is deliberately a plain ``threading.Lock``: every critical
+    section is synchronous (state compare/transition, task registration,
+    snapshot references) and must never await provider, journal, or network
+    I/O (Law 5). Holding it across an await would stall the single event loop;
+    the discipline is that no ``with arbiter.lock`` block in this module
+    contains an await.
+    """
+
+    __slots__ = (
+        "binding_id",
+        "request_id",
+        "state",
+        "lock",
+        "done_event",
+        "cancellation_task",
+        "failure",
+    )
+
+    def __init__(self, binding_id: str, request_id: str) -> None:
+        self.binding_id = binding_id
+        self.request_id = request_id
+        self.state = ArbiterState.OPEN
+        self.lock = threading.Lock()
+        self.done_event = asyncio.Event()
+        self.cancellation_task: asyncio.Task[bool] | None = None
+        self.failure: BaseException | None = None
 
 
 class RuntimeService:
@@ -50,6 +99,8 @@ class RuntimeService:
         self._claim_locks_guard = asyncio.Lock()
         self._generation_turn_locks: dict[str, asyncio.Lock] = {}
         self._generation_turn_locks_guard = asyncio.Lock()
+        self._arbiters: dict[tuple[str, str], _RequestArbiter] = {}
+        self._cancellation_tasks: set[asyncio.Task[bool]] = set()
         self._shutting_down = False
 
     async def ensure_generation(self, binding_id: UUID, spec: GenerationSpec) -> GenerationResult:
@@ -148,6 +199,13 @@ class RuntimeService:
             for event in self.journal.replay(binding, request_id):
                 yield event
             return
+        arbiter = self._get_or_create_arbiter(binding, request_id)
+        if not self._arbiter_open(arbiter):
+            # A cancellation arbiter claimed this request while the owner was
+            # waiting for its turn lock: produce no local effect and replay.
+            async for event in self._replay_arbiter_outcome(arbiter, binding, request_id, 0):
+                yield event
+            return
 
         if current.resolution_status == "pending":
             try:
@@ -158,16 +216,24 @@ class RuntimeService:
             except ProviderAdapterError as exc:
                 if exc.code != "unsupported_requested_execution":
                     raise
+                if not self._arbiter_open(arbiter):
+                    async for event in self._replay_arbiter_outcome(
+                        arbiter, binding, request_id, 0
+                    ):
+                        yield event
+                    return
                 self.store.mark_resolution_unsupported(binding, request_id, self.instance_id)
-                terminal, _ = self.journal.terminal(
+                async for event in self._conclude_with_terminal(
+                    arbiter,
                     binding,
                     request_id,
-                    "error",
-                    {"code": exc.code},
-                    "failed",
-                    exc.code,
-                )
-                yield terminal
+                    self._terminal_writer(
+                        binding, request_id, "error", {"code": exc.code}, "failed", exc.code
+                    ),
+                    provider,
+                    yielded_sequence=0,
+                ):
+                    yield event
                 return
             current = self.store.freeze_resolution(
                 binding,
@@ -176,15 +242,22 @@ class RuntimeService:
                 resolution,
             )
         elif current.resolution_status == "unsupported":
-            terminal, _ = self.journal.terminal(
+            async for event in self._conclude_with_terminal(
+                arbiter,
                 binding,
                 request_id,
-                "error",
-                {"code": "unsupported_requested_execution"},
-                "failed",
-                "unsupported_requested_execution",
-            )
-            yield terminal
+                self._terminal_writer(
+                    binding,
+                    request_id,
+                    "error",
+                    {"code": "unsupported_requested_execution"},
+                    "failed",
+                    "unsupported_requested_execution",
+                ),
+                provider,
+                yielded_sequence=0,
+            ):
+                yield event
             return
         resolution = self._resolution_from_record(current)
 
@@ -193,17 +266,28 @@ class RuntimeService:
         try:
             self._validate_bootstrap_state(generation.bootstrap_sent, request)
         except ConflictError:
-            terminal, _ = self.journal.terminal(
+            async for event in self._conclude_with_terminal(
+                arbiter,
                 binding,
                 request_id,
-                "error",
-                {"code": "bootstrap_state_conflict"},
-                "failed",
-                "bootstrap_state_conflict",
-            )
-            yield terminal
+                self._terminal_writer(
+                    binding,
+                    request_id,
+                    "error",
+                    {"code": "bootstrap_state_conflict"},
+                    "failed",
+                    "bootstrap_state_conflict",
+                ),
+                provider,
+                yielded_sequence=0,
+            ):
+                yield event
             return
 
+        if not self._arbiter_open(arbiter):
+            async for event in self._replay_arbiter_outcome(arbiter, binding, request_id, 0):
+                yield event
+            return
         try:
             acquired = await provider.prepare_turn(
                 generation,
@@ -211,6 +295,47 @@ class RuntimeService:
                 resolution.process_options,
                 is_first_turn=is_first_turn,
             )
+        except asyncio.CancelledError:
+            raise
+        except ProviderAdapterError as exc:
+            async for event in self._conclude_with_terminal(
+                arbiter,
+                binding,
+                request_id,
+                self._terminal_writer(
+                    binding, request_id, "error", {"code": exc.code}, "failed", exc.code
+                ),
+                provider,
+                yielded_sequence=0,
+            ):
+                yield event
+            return
+        except Exception:
+            async for event in self._conclude_with_terminal(
+                arbiter,
+                binding,
+                request_id,
+                self._terminal_writer(
+                    binding,
+                    request_id,
+                    "error",
+                    {"code": "provider_prepare_exception"},
+                    "failed",
+                    "provider_prepare_exception",
+                ),
+                provider,
+                yielded_sequence=0,
+            ):
+                yield event
+            return
+        # Post-provider-await re-observation (Plan CP4 §3.4.2): once a
+        # cancellation arbiter claimed the request, the owner must not
+        # activate, resolve, mark, or send anything else.
+        if not self._arbiter_open(arbiter):
+            async for event in self._replay_arbiter_outcome(arbiter, binding, request_id, 0):
+                yield event
+            return
+        try:
             self._validate_acquired_generation(generation.provider_session_id, resolution, acquired)
             was_starting = generation.status == "starting"
             if was_starting:
@@ -222,26 +347,35 @@ class RuntimeService:
         except asyncio.CancelledError:
             raise
         except ProviderAdapterError as exc:
-            terminal, _ = self.journal.terminal(
+            async for event in self._conclude_with_terminal(
+                arbiter,
                 binding,
                 request_id,
-                "error",
-                {"code": exc.code},
-                "failed",
-                exc.code,
-            )
-            yield terminal
+                self._terminal_writer(
+                    binding, request_id, "error", {"code": exc.code}, "failed", exc.code
+                ),
+                provider,
+                yielded_sequence=0,
+            ):
+                yield event
             return
         except Exception:
-            terminal, _ = self.journal.terminal(
+            async for event in self._conclude_with_terminal(
+                arbiter,
                 binding,
                 request_id,
-                "error",
-                {"code": "provider_prepare_exception"},
-                "failed",
-                "provider_prepare_exception",
-            )
-            yield terminal
+                self._terminal_writer(
+                    binding,
+                    request_id,
+                    "error",
+                    {"code": "provider_prepare_exception"},
+                    "failed",
+                    "provider_prepare_exception",
+                ),
+                provider,
+                yielded_sequence=0,
+            ):
+                yield event
             return
 
         control_events: list[RuntimeEvent] = []
@@ -269,15 +403,21 @@ class RuntimeService:
         )
         for event in sorted(control_events, key=lambda item: item.sequence):
             yield event
+        yielded_sequence = control_events[-1].sequence
 
         current = self.store.get_request(binding, request_id)
         if current is None:
             raise ConflictError("request disappeared")
         if current.terminal:
-            await provider.cancel(binding, request_id)
             for event in self.journal.replay(binding, request_id):
-                if event.sequence > control_events[-1].sequence:
+                if event.sequence > yielded_sequence:
                     yield event
+            return
+        if not self._arbiter_open(arbiter):
+            async for event in self._replay_arbiter_outcome(
+                arbiter, binding, request_id, yielded_sequence
+            ):
+                yield event
             return
         try:
             self.store.mark_sent(
@@ -287,18 +427,35 @@ class RuntimeService:
                 consume_bootstrap=is_first_turn,
             )
         except (ConflictError, RetiredError):
-            terminal, _ = self.journal.terminal(
-                binding,
-                request_id,
-                "error",
-                {"code": "send_boundary_conflict"},
-                "failed",
-                "send_boundary_conflict",
+            terminal = self._claim_natural_terminal(
+                arbiter,
+                self._terminal_writer(
+                    binding,
+                    request_id,
+                    "error",
+                    {"code": "send_boundary_conflict"},
+                    "failed",
+                    "send_boundary_conflict",
+                ),
             )
-            await provider.cancel(binding, request_id)
-            yield terminal
+            if terminal is None:
+                async for event in self._replay_arbiter_outcome(
+                    arbiter, binding, request_id, yielded_sequence
+                ):
+                    yield event
+                return
+            await self._cleanup_unsent_request(binding, request_id, provider)
+            self._reclaim_request_safely(binding, request_id, provider)
+            if terminal.sequence > yielded_sequence:
+                yield terminal
             return
-        async for event in self._stream_provider_events(binding_id, request, provider):
+        async for event in self._stream_provider_events(
+            binding_id,
+            request,
+            provider,
+            arbiter,
+            yielded_sequence,
+        ):
             yield event
 
     async def _stream_provider_events(
@@ -306,10 +463,11 @@ class RuntimeService:
         binding_id: UUID,
         request: TurnRequest,
         provider: RuntimeProviderAdapter,
+        arbiter: _RequestArbiter,
+        yielded_sequence: int,
     ) -> AsyncIterator[RuntimeEvent]:
         binding = str(binding_id)
         request_id = str(request.request_id)
-        yielded_sequence = self.store.get_request(binding, request_id).last_sequence
         pending_terminal: ProviderEvent | None = None
         failure_code: str | None = None
         failure_status = "indeterminate"
@@ -323,6 +481,10 @@ class RuntimeService:
                 if current is None:
                     raise ConflictError("request disappeared")
                 if current.terminal:
+                    break
+                if not self._arbiter_open(arbiter):
+                    # The cancellation arbiter owns the terminal; stop
+                    # producing durable output and replay the winner.
                     break
                 if pending_terminal is not None:
                     failure_code = "event_after_terminal"
@@ -363,16 +525,11 @@ class RuntimeService:
                     yield event
             return
         if failure_code is not None:
-            terminal, _ = self.journal.terminal(
-                binding,
-                request_id,
-                "error",
-                {"code": failure_code},
-                failure_status,
-                failure_code,
+            writer = self._terminal_writer(
+                binding, request_id, "error", {"code": failure_code}, failure_status, failure_code
             )
         elif pending_terminal is None:
-            terminal, _ = self.journal.terminal(
+            writer = self._terminal_writer(
                 binding,
                 request_id,
                 "error",
@@ -380,56 +537,83 @@ class RuntimeService:
                 "indeterminate",
                 "unexpected_provider_eof",
             )
-        elif pending_terminal.event_type == "error":
-            status = pending_terminal.terminal_status or "failed"
-            code = str(pending_terminal.payload.get("code", "provider_error"))
-            terminal, _ = self.journal.terminal(
-                binding, request_id, "error", pending_terminal.payload, status, code
-            )
         else:
-            terminal, _ = self.journal.terminal(
-                binding,
-                request_id,
-                "done",
-                pending_terminal.payload,
-                "completed",
-                "completed",
+            writer = lambda: self._persist_provider_terminal(  # noqa: E731
+                binding, request_id, pending_terminal
             )
-        if terminal.sequence > yielded_sequence:
-            yield terminal
+        async for event in self._conclude_with_terminal(
+            arbiter,
+            binding,
+            request_id,
+            writer,
+            provider,
+            yielded_sequence=yielded_sequence,
+        ):
+            yield event
 
     async def cancel(self, binding_id: UUID, request_id: UUID) -> CancelResult:
+        """Single-owner cancel entry: durable terminal wins, otherwise arbitrate.
+
+        Every cancel caller either (a) reads an already durable terminal and
+        changes nothing, (b) becomes the one first canceller that registers a
+        Runtime-owned settlement task, or (c) joins the in-flight settlement.
+        The arbitration block below is await-free on purpose: shutdown's
+        admission close + settlement snapshot cannot interleave with it, and
+        no two callers can both become the first canceller.
+        """
+
         binding = str(binding_id)
         request_key = str(request_id)
         generation = self.store.get_generation(binding)
         provider = self._provider_for_kind(generation.runtime_kind)
         record = self.store.get_request(binding, request_key)
         if record is None:
-            raise ConflictError("request has not been prepared")
+            raise CancelUnregisteredError("cancel arrived before durable registration")
         if record.terminal:
-            if record.status == "cancelled":
-                await provider.cancel(binding, request_key)
             return CancelResult(
                 binding_id=binding_id,
                 request_id=request_id,
                 status=record.status,
                 changed=False,
             )
-        _, changed = self.journal.terminal(
-            binding,
-            request_key,
-            "error",
-            {"code": "cancelled"},
-            "cancelled",
-            "cancelled",
-        )
-        if changed:
-            await provider.cancel(binding, request_key)
-        status = self.store.get_request(binding, request_key).status
+        if self._shutting_down:
+            raise ConflictError("runtime is shutting down")
+
+        first = False
+        task: asyncio.Task[bool] | None = None
+        wait_for_release = False
+        arbiter = self._get_or_create_arbiter(binding, request_key)
+        with arbiter.lock:
+            if arbiter.state is ArbiterState.OPEN:
+                if self._shutting_down:
+                    raise ConflictError("runtime is shutting down")
+                arbiter.state = ArbiterState.CANCELLING
+                task = asyncio.create_task(
+                    self._settle_cancellation(binding, request_key, provider, arbiter)
+                )
+                self._cancellation_tasks.add(task)
+                task.add_done_callback(self._cancellation_tasks.discard)
+                arbiter.cancellation_task = task
+                first = True
+            else:
+                task = arbiter.cancellation_task
+                wait_for_release = task is None
+
+        changed = False
+        if task is not None:
+            settlement_result = await asyncio.shield(task)
+            changed = bool(first and settlement_result)
+        elif wait_for_release:
+            await arbiter.done_event.wait()
+        if arbiter.failure is not None:
+            raise ProviderAdapterError("cancel_settlement_failed") from arbiter.failure
+        final = self.store.get_request(binding, request_key)
+        if final is None or not final.terminal:
+            raise ConflictError("cancel terminal truth is not durable")
         return CancelResult(
             binding_id=binding_id,
             request_id=request_id,
-            status=status,
+            status=final.status,
             changed=changed,
         )
 
@@ -442,14 +626,278 @@ class RuntimeService:
         return RetireResult(binding_id=binding_id, status=record.status, changed=changed)
 
     async def shutdown(self) -> None:
+        """Close admission atomically, settle, then terminalize what remains.
+
+        The admission close and the settlement snapshot are one await-free
+        block, so a concurrent cancel registration is either snapshotted here
+        or refused by ``_shutting_down``; there is no in-between state
+        (Law 8). Settlement tasks are shielded and never cancelled: the
+        cancellation task itself is the terminal-truth owner.
+        """
+
         self._shutting_down = True
+        settlement_tasks = tuple(self._cancellation_tasks)
+        if settlement_tasks:
+            await asyncio.gather(
+                *(asyncio.shield(task) for task in settlement_tasks),
+                return_exceptions=True,
+            )
         self.store.terminalize_open_requests_for_shutdown()
         unique = {id(provider): provider for provider in self.providers.values()}
         results = await asyncio.gather(
             *(provider.shutdown() for provider in unique.values()), return_exceptions=True
         )
+        self._arbiters.clear()
         if any(isinstance(result, BaseException) for result in results):
             raise ProviderAdapterError("provider_shutdown_failed")
+
+    async def _settle_cancellation(
+        self,
+        binding: str,
+        request_id: str,
+        provider: RuntimeProviderAdapter,
+        arbiter: _RequestArbiter,
+    ) -> bool:
+        """Settle one cancelled request; the caller only shield-waits (Law 7).
+
+        Returns whether this settlement is cancel-induced (``changed=True``
+        for the first canceller). A provider cancel that raises can only
+        produce an honest cancel-induced indeterminate; a receipt can only
+        produce ``cancelled`` from a positive disposal proof, otherwise the
+        adapter-certified natural terminal or ``cancel_ownership_unknown``.
+        """
+
+        changed = False
+        failure: BaseException | None = None
+        try:
+            try:
+                receipt = await provider.cancel(binding, request_id)
+            except asyncio.CancelledError as exc:
+                # Runtime-owned settlement tasks are never cancelled by
+                # callers or graceful shutdown; a cancellation here is a
+                # defect, journaled conservatively before propagating.
+                self._journal_cancel_failure(binding, request_id, "cancel_settlement_cancelled")
+                failure = exc
+                raise
+            except Exception:
+                self._journal_cancel_failure(binding, request_id, "cancel_cleanup_failed")
+                changed = True
+            else:
+                changed = self._persist_cancel_receipt(binding, request_id, receipt)
+        except BaseException as exc:
+            if failure is None:
+                failure = exc
+            raise
+        finally:
+            self._conclude_arbiter(arbiter, failure=failure)
+            self._reclaim_request_safely(binding, request_id, provider)
+        return changed
+
+    def _persist_cancel_receipt(
+        self,
+        binding: str,
+        request_id: str,
+        receipt: ProviderCancelReceipt,
+    ) -> bool:
+        if receipt.outcome in {
+            ProviderCancelOutcome.CANCELLED_PRESTART,
+            ProviderCancelOutcome.CANCELLED_ACTIVE,
+            ProviderCancelOutcome.CANCELLED_ABANDONED,
+        }:
+            self.journal.terminal(
+                binding,
+                request_id,
+                "error",
+                {"code": "cancelled"},
+                "cancelled",
+                "cancelled",
+            )
+            return True
+        if receipt.outcome is ProviderCancelOutcome.NATURAL_TERMINAL_READY:
+            natural = receipt.natural_terminal
+            if natural is None:
+                raise ProviderAdapterError("cancel_receipt_incomplete")
+            self._persist_provider_terminal(binding, request_id, natural)
+            return False
+        self._journal_cancel_failure(binding, request_id, "cancel_ownership_unknown")
+        return True
+
+    def _journal_cancel_failure(self, binding: str, request_id: str, code: str) -> RuntimeEvent:
+        terminal, _ = self.journal.terminal(
+            binding,
+            request_id,
+            "error",
+            {"code": code},
+            "indeterminate",
+            code,
+        )
+        return terminal
+
+    def _persist_provider_terminal(
+        self,
+        binding: str,
+        request_id: str,
+        event: ProviderEvent,
+    ) -> RuntimeEvent:
+        """Shared bounded mapping for one provider terminal (normal or rescued)."""
+
+        if event.event_type == "error":
+            status = event.terminal_status or "failed"
+            code = str(event.payload.get("code", "provider_error"))
+            terminal, _ = self.journal.terminal(
+                binding, request_id, "error", event.payload, status, code
+            )
+            return terminal
+        if event.event_type == "done":
+            terminal, _ = self.journal.terminal(
+                binding, request_id, "done", event.payload, "completed", "completed"
+            )
+            return terminal
+        raise ProviderAdapterError("provider_terminal_event_invalid")
+
+    async def _conclude_with_terminal(
+        self,
+        arbiter: _RequestArbiter,
+        binding: str,
+        request_id: str,
+        writer: Callable[[], RuntimeEvent],
+        provider: RuntimeProviderAdapter,
+        *,
+        yielded_sequence: int,
+    ) -> AsyncIterator[RuntimeEvent]:
+        """Claim the natural-terminal slot or replay the arbitration winner."""
+
+        terminal = self._claim_natural_terminal(arbiter, writer)
+        if terminal is not None:
+            self._reclaim_request_safely(binding, request_id, provider)
+            if terminal.sequence > yielded_sequence:
+                yield terminal
+            return
+        async for event in self._replay_arbiter_outcome(
+            arbiter, binding, request_id, yielded_sequence
+        ):
+            yield event
+
+    def _claim_natural_terminal(
+        self,
+        arbiter: _RequestArbiter,
+        writer: Callable[[], RuntimeEvent],
+    ) -> RuntimeEvent | None:
+        """Atomically claim and persist the natural terminal, or return None.
+
+        Returns ``None`` when a cancellation settlement already owns the
+        terminal; the caller must wait for the released outcome and replay it.
+        There is deliberately no await between the claim and the durable
+        write, so a claimed slot can never be left pending by task
+        cancellation (Plan CP4 §3.4.1).
+        """
+
+        with arbiter.lock:
+            if arbiter.state is not ArbiterState.OPEN:
+                return None
+            arbiter.state = ArbiterState.NATURAL_TERMINAL_PENDING
+        try:
+            terminal = writer()
+        except BaseException as exc:
+            self._conclude_arbiter(arbiter, failure=exc)
+            raise
+        self._conclude_arbiter(arbiter)
+        return terminal
+
+    def _conclude_arbiter(
+        self,
+        arbiter: _RequestArbiter,
+        failure: BaseException | None = None,
+    ) -> None:
+        with arbiter.lock:
+            arbiter.state = ArbiterState.TERMINAL
+            if failure is not None:
+                arbiter.failure = failure
+        arbiter.done_event.set()
+        self._arbiters.pop((arbiter.binding_id, arbiter.request_id), None)
+
+    async def _replay_arbiter_outcome(
+        self,
+        arbiter: _RequestArbiter,
+        binding: str,
+        request_id: str,
+        yielded_sequence: int,
+    ) -> AsyncIterator[RuntimeEvent]:
+        """Wait for the released arbitration outcome, then replay the winner."""
+
+        await arbiter.done_event.wait()
+        if arbiter.failure is not None:
+            raise ProviderAdapterError("terminal_arbitration_failed") from arbiter.failure
+        for event in self.journal.replay(binding, request_id):
+            if event.sequence > yielded_sequence:
+                yield event
+
+    def _get_or_create_arbiter(self, binding_id: str, request_id: str) -> _RequestArbiter:
+        """Await-free registry access so stream and cancel share one arbiter."""
+
+        key = (binding_id, request_id)
+        arbiter = self._arbiters.get(key)
+        if arbiter is None:
+            arbiter = _RequestArbiter(binding_id, request_id)
+            self._arbiters[key] = arbiter
+        return arbiter
+
+    @staticmethod
+    def _arbiter_open(arbiter: _RequestArbiter) -> bool:
+        with arbiter.lock:
+            return arbiter.state is ArbiterState.OPEN
+
+    def _reclaim_request_safely(
+        self,
+        binding: str,
+        request_id: str,
+        provider: RuntimeProviderAdapter,
+    ) -> None:
+        """Post-terminal provider-proof release; never rewrites terminal truth."""
+
+        try:
+            provider.reclaim_request(binding, request_id)
+        except Exception:
+            _LOGGER.warning("runtime provider request reclaim failed", exc_info=False)
+
+    async def _cleanup_unsent_request(
+        self,
+        binding: str,
+        request_id: str,
+        provider: RuntimeProviderAdapter,
+    ) -> None:
+        """Best-effort fence/cleanup for an exact request that failed the send boundary."""
+
+        try:
+            await provider.cancel(binding, request_id)
+        except BaseException:
+            _LOGGER.warning("runtime unsent request cleanup failed", exc_info=False)
+
+    def _terminal_writer(
+        self,
+        binding: str,
+        request_id: str,
+        event_type: str,
+        payload: dict[str, object],
+        status: str,
+        terminal_code: str,
+    ) -> Callable[[], RuntimeEvent]:
+        """Build one synchronous terminal persist step for the arbiter gate."""
+
+        journal = self.journal
+
+        def write_terminal() -> RuntimeEvent:
+            terminal, _ = journal.terminal(
+                binding,
+                request_id,
+                event_type,
+                payload,
+                status,
+                terminal_code,
+            )
+            return terminal
+
+        return write_terminal
 
     def _provider_for_kind(self, runtime_kind: str) -> RuntimeProviderAdapter:
         provider = self.providers.get(runtime_kind)
