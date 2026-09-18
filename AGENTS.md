@@ -23,3 +23,5 @@ python.exe -m exocore_runtime
 ```
 
 Use Python 3.12 and ASCII double quotes in Python source.
+
+Daily local launch (Alicia): `run-runtime` for this service (:8766) alongside `run-exocore` for Django — both are bash aliases in `~/.bashrc`; nginx runs as a persistent Docker container and is not part of the startup steps. `../start_backend_with_runtime.ps1` is an optional convenience wrapper only; do not present it as the normal startup path.
