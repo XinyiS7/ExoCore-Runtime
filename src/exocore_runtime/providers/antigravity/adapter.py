@@ -242,7 +242,11 @@ class AntigravityAdapter:
         Only one positive physical proof may produce ``CANCELLED_*``; a
         process result candidate is always routed through adapter
         certification, and everything else falls through to
-        ``OWNERSHIP_UNKNOWN``.
+        ``OWNERSHIP_UNKNOWN``. An abandoned-owner cleanup is an exact
+        request-scoped settlement: while it is in flight this request has
+        neither a session claim to classify nor a published receipt, so the
+        classification joins that same cleanup instead of reading a
+        half-built disposal state (RT-RACE-1).
         """
 
         lock = await self._artifact_lock(binding_id)
@@ -260,7 +264,7 @@ class AntigravityAdapter:
                     ProviderCancelOutcome.NATURAL_TERMINAL_READY,
                     certified,
                 )
-            abandoned = self.supervisor.abandoned_proof(binding_id, request_id)
+            abandoned = await self.supervisor.settle_abandonment(binding_id, request_id)
             if abandoned == "disposed":
                 return ProviderCancelReceipt(ProviderCancelOutcome.CANCELLED_ABANDONED)
             outcome = await self.supervisor.dispose_request(binding_id, request_id)
@@ -274,6 +278,13 @@ class AntigravityAdapter:
                 # stream entry can no longer find its prepared state.
                 self._requests.pop((binding_id, request_id), None)
                 return ProviderCancelReceipt(ProviderCancelOutcome.CANCELLED_PRESTART)
+            # The serialized disposal found no exact claim to dispose, but the
+            # abandoned-owner cleanup for this same request may have completed
+            # while this call waited for the binding lock. Its immutable proof
+            # decides, never an already emptied session registry (RT-RACE-1).
+            abandoned = await self.supervisor.settle_abandonment(binding_id, request_id)
+            if abandoned == "disposed":
+                return ProviderCancelReceipt(ProviderCancelOutcome.CANCELLED_ABANDONED)
             if state is not None:
                 self._requests.pop((binding_id, request_id), None)
             return ProviderCancelReceipt(ProviderCancelOutcome.OWNERSHIP_UNKNOWN)

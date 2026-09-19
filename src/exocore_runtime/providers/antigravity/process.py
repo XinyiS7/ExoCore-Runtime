@@ -149,6 +149,11 @@ class AgyProcessSupervisor:
         # ``discard_request_proofs`` after the Runtime durable ack.
         self._result_candidates: dict[tuple[str, str], ProviderEvent] = {}
         self._abandoned: dict[tuple[str, str], str] = {}
+        # Exact-request abandoned-owner cleanups whose immutable proof is still
+        # being generated. An explicit cancel for the same request joins this
+        # settlement instead of classifying a half-built disposal state
+        # (RT-RACE-1); entries follow the proof lifecycle.
+        self._abandonment_tasks: dict[tuple[str, str], asyncio.Task[None]] = {}
         self.quota_snapshot: dict[str, int] | None = None
         self.available_model_slugs: frozenset[str] = frozenset()
 
@@ -364,6 +369,7 @@ class AgyProcessSupervisor:
 
         self._result_candidates.pop((binding_id, request_id), None)
         self._abandoned.pop((binding_id, request_id), None)
+        self._abandonment_tasks.pop((binding_id, request_id), None)
 
     def discard_binding_proofs(self, binding_id: str) -> None:
         """Drop every residual proof for one binding (retire/shutdown)."""
@@ -372,6 +378,52 @@ class AgyProcessSupervisor:
             self._result_candidates.pop(key, None)
         for key in [key for key in self._abandoned if key[0] == binding_id]:
             self._abandoned.pop(key, None)
+        for key in [key for key in self._abandonment_tasks if key[0] == binding_id]:
+            self._abandonment_tasks.pop(key, None)
+
+    def _begin_abandonment(self, binding_id: str, request_id: str) -> asyncio.Task[None]:
+        """Register one exact-request abandoned-owner cleanup before it runs.
+
+        Registration is synchronous and request-scoped, so an explicit cancel
+        arriving while the force-dispose is still in flight finds and joins
+        exactly this settlement, and a second teardown for the same request
+        reuses the task instead of starting a duplicate cleanup.
+        """
+
+        key = (binding_id, request_id)
+        existing = self._abandonment_tasks.get(key)
+        if existing is not None and not existing.done():
+            return existing
+        task = asyncio.create_task(self._abandon_request(binding_id, request_id))
+        self._abandonment_tasks[key] = task
+        return task
+
+    async def settle_abandonment(self, binding_id: str, request_id: str) -> str | None:
+        """Join the exact in-flight abandoned-owner cleanup, then read its proof.
+
+        While that cleanup runs, this exact request has neither a session
+        claim to classify nor a published receipt, so a classification taken
+        here would be a guess. Joining the same settlement keeps a late
+        explicit cancel on the abandonment's own disposal proof; a finished
+        cleanup is a plain registry read.
+        """
+
+        key = (binding_id, request_id)
+        task = self._abandonment_tasks.get(key)
+        if task is not None and not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                # A cancelled join of ours must propagate; a cancelled cleanup
+                # itself is just an unfinished settlement with no proof.
+                if task.cancelled():
+                    return self._abandoned.get(key)
+                raise
+            except BaseException:
+                # Success or failure is carried by the immutable proof
+                # registry, never by this join.
+                pass
+        return self._abandoned.get(key)
 
     async def _finish_cancelled_stream_cleanup(
         self,
@@ -384,7 +436,7 @@ class AgyProcessSupervisor:
             # boundary; its terminal fate belongs to adapter certification,
             # never to an abandoned kill.
             return
-        cleanup = asyncio.create_task(self._abandon_request(binding_id, request_id))
+        cleanup = self._begin_abandonment(binding_id, request_id)
         while not cleanup.done():
             try:
                 await asyncio.shield(cleanup)
@@ -446,6 +498,12 @@ class AgyProcessSupervisor:
             self._sessions.pop(binding_id, None)
 
     async def shutdown(self) -> None:
+        in_flight = tuple(self._abandonment_tasks.values())
+        if in_flight:
+            await asyncio.gather(
+                *(asyncio.shield(task) for task in in_flight),
+                return_exceptions=True,
+            )
         bindings = tuple(self._sessions)
         failures: list[BaseException] = []
         for binding_id in bindings:
@@ -455,6 +513,7 @@ class AgyProcessSupervisor:
                 failures.append(exc)
         self._result_candidates.clear()
         self._abandoned.clear()
+        self._abandonment_tasks.clear()
         if failures:
             raise ProviderAdapterError("agy_shutdown_cleanup_failed")
 

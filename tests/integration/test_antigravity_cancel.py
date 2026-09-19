@@ -266,6 +266,280 @@ class AgyCancelRaceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.record(service, request).terminal_code, "cancelled")
         self.assertEqual(self.terminal_count(service, request), 1)
 
+    # ------------------------------------------------------------ RT-RACE-1
+
+    async def test_explicit_cancel_joins_inflight_abandonment_instead_of_ownership_unknown(
+        self,
+    ) -> None:
+        service, adapter = self.build_service("slow_tree")
+        await service.ensure_generation(self.binding_id, self.spec)
+        binding = str(self.binding_id)
+        request = self.turn(bootstrap={"history": []})
+        request_key = str(request.request_id)
+        owner = asyncio.create_task(collect(service, self.binding_id, request))
+        await wait_until(
+            lambda: [item for item in self.evidence() if item["kind"] == "child"]
+        )
+
+        begun = asyncio.Event()
+        dispose_entered = asyncio.Event()
+        release_dispose = asyncio.Event()
+        join_seen = asyncio.Event()
+        joins: list[tuple[str, str]] = []
+        dispose_calls = 0
+        real_begin = adapter.supervisor._begin_abandonment
+        real_dispose = adapter.supervisor._dispose_session
+        real_settle = adapter.supervisor.settle_abandonment
+
+        def observed_begin(binding_id, request_id):
+            task = real_begin(binding_id, request_id)
+            begun.set()
+            return task
+
+        async def gated_dispose(session, *, force):
+            nonlocal dispose_calls
+            dispose_calls += 1
+            dispose_entered.set()
+            await release_dispose.wait()
+            await real_dispose(session, force=force)
+
+        async def observed_settle(binding_id, request_id):
+            joins.append((binding_id, request_id))
+            join_seen.set()
+            return await real_settle(binding_id, request_id)
+
+        with patch.object(adapter.supervisor, "_begin_abandonment", side_effect=observed_begin):
+            with patch.object(adapter.supervisor, "_dispose_session", side_effect=gated_dispose):
+                with patch.object(
+                    adapter.supervisor, "settle_abandonment", side_effect=observed_settle
+                ):
+                    # The owner-stream teardown is inside the exact-request
+                    # abandonment and its force-dispose is in flight: the
+                    # immutable abandoned receipt is not published yet.
+                    owner.cancel()
+                    await asyncio.wait_for(begun.wait(), timeout=5)
+                    await asyncio.wait_for(dispose_entered.wait(), timeout=5)
+                    self.assertIsNone(
+                        adapter.supervisor.abandoned_proof(binding, request_key)
+                    )
+                    self.assertFalse(self.record(service, request).terminal)
+
+                    cancel_task = asyncio.create_task(
+                        service.cancel(self.binding_id, request.request_id)
+                    )
+                    await asyncio.wait_for(join_seen.wait(), timeout=5)
+                    # The explicit cancel joined the same settlement instead
+                    # of classifying the in-flight disposal as unknown.
+                    self.assertFalse(cancel_task.done())
+                    self.assertEqual(joins, [(binding, request_key)])
+
+                    release_dispose.set()
+                    result = await asyncio.wait_for(cancel_task, timeout=5)
+                    with self.assertRaises(asyncio.CancelledError):
+                        await owner
+
+        self.assertEqual(dispose_calls, 1)
+        self.assertEqual(result.status, "cancelled")
+        self.assertTrue(result.changed)
+        durable = self.record(service, request)
+        self.assertEqual(durable.status, "cancelled")
+        self.assertEqual(durable.terminal_code, "cancelled")
+        self.assertEqual(self.terminal_count(service, request), 1)
+        self.assertEqual(adapter.supervisor._abandoned, {})
+        self.assertEqual(adapter.supervisor._abandonment_tasks, {})
+        self.assertEqual(self.request_states(adapter), [])
+
+    async def test_explicit_cancel_joins_inflight_abandonment_after_request_state_removal(
+        self,
+    ) -> None:
+        service, adapter = self.build_service("slow_tree")
+        await service.ensure_generation(self.binding_id, self.spec)
+        binding = str(self.binding_id)
+        request = self.turn(bootstrap={"history": []})
+        request_key = str(request.request_id)
+        owner = asyncio.create_task(collect(service, self.binding_id, request))
+        await wait_until(
+            lambda: [item for item in self.evidence() if item["kind"] == "child"]
+        )
+
+        begun = asyncio.Event()
+        dispose_entered = asyncio.Event()
+        release_dispose = asyncio.Event()
+        join_seen = asyncio.Event()
+        dispose_calls = 0
+        real_begin = adapter.supervisor._begin_abandonment
+        real_dispose = adapter.supervisor._dispose_session
+        real_settle = adapter.supervisor.settle_abandonment
+
+        def observed_begin(binding_id, request_id):
+            task = real_begin(binding_id, request_id)
+            begun.set()
+            return task
+
+        async def gated_dispose(session, *, force):
+            nonlocal dispose_calls
+            dispose_calls += 1
+            dispose_entered.set()
+            await release_dispose.wait()
+            await real_dispose(session, force=force)
+
+        async def observed_settle(binding_id, request_id):
+            join_seen.set()
+            return await real_settle(binding_id, request_id)
+
+        with patch.object(adapter.supervisor, "_begin_abandonment", side_effect=observed_begin):
+            with patch.object(adapter.supervisor, "_dispose_session", side_effect=gated_dispose):
+                with patch.object(
+                    adapter.supervisor, "settle_abandonment", side_effect=observed_settle
+                ):
+                    owner.cancel()
+                    await asyncio.wait_for(begun.wait(), timeout=5)
+                    await asyncio.wait_for(dispose_entered.wait(), timeout=5)
+                    # E2E run #5 observed exactly this: the adapter request
+                    # state is already gone while the exact proof is still
+                    # being generated. The classification must not depend on
+                    # that registry.
+                    adapter._requests.pop((binding, request_key), None)
+                    self.assertEqual(self.request_states(adapter), [])
+
+                    cancel_task = asyncio.create_task(
+                        service.cancel(self.binding_id, request.request_id)
+                    )
+                    await asyncio.wait_for(join_seen.wait(), timeout=5)
+                    self.assertFalse(cancel_task.done())
+
+                    release_dispose.set()
+                    result = await asyncio.wait_for(cancel_task, timeout=5)
+                    with self.assertRaises(asyncio.CancelledError):
+                        await owner
+
+        self.assertEqual(dispose_calls, 1)
+        self.assertEqual(result.status, "cancelled")
+        self.assertTrue(result.changed)
+        self.assertEqual(self.record(service, request).terminal_code, "cancelled")
+        self.assertEqual(self.terminal_count(service, request), 1)
+        self.assertEqual(adapter.supervisor._abandoned, {})
+        self.assertEqual(adapter.supervisor._abandonment_tasks, {})
+
+    async def test_inflight_abandonment_cleanup_failure_stays_honest_indeterminate(
+        self,
+    ) -> None:
+        service, adapter = self.build_service("slow_tree")
+        await service.ensure_generation(self.binding_id, self.spec)
+        binding = str(self.binding_id)
+        request = self.turn(bootstrap={"history": []})
+        owner = asyncio.create_task(collect(service, self.binding_id, request))
+        await wait_until(
+            lambda: [item for item in self.evidence() if item["kind"] == "child"]
+        )
+
+        begun = asyncio.Event()
+        dispose_entered = asyncio.Event()
+        release_dispose = asyncio.Event()
+        join_seen = asyncio.Event()
+        dispose_calls = 0
+        real_begin = adapter.supervisor._begin_abandonment
+        real_settle = adapter.supervisor.settle_abandonment
+
+        def observed_begin(binding_id, request_id):
+            task = real_begin(binding_id, request_id)
+            begun.set()
+            return task
+
+        async def failing_dispose(session, *, force):
+            nonlocal dispose_calls
+            dispose_calls += 1
+            dispose_entered.set()
+            if dispose_calls == 1:
+                await release_dispose.wait()
+            raise ProviderAdapterError("fixture_cleanup_report")
+
+        async def observed_settle(binding_id, request_id):
+            join_seen.set()
+            return await real_settle(binding_id, request_id)
+
+        with patch.object(adapter.supervisor, "_begin_abandonment", side_effect=observed_begin):
+            with patch.object(adapter.supervisor, "_dispose_session", side_effect=failing_dispose):
+                with patch.object(
+                    adapter.supervisor, "settle_abandonment", side_effect=observed_settle
+                ):
+                    owner.cancel()
+                    await asyncio.wait_for(begun.wait(), timeout=5)
+                    await asyncio.wait_for(dispose_entered.wait(), timeout=5)
+                    cancel_task = asyncio.create_task(
+                        service.cancel(self.binding_id, request.request_id)
+                    )
+                    await asyncio.wait_for(join_seen.wait(), timeout=5)
+                    self.assertFalse(cancel_task.done())
+
+                    release_dispose.set()
+                    result = await asyncio.wait_for(cancel_task, timeout=5)
+                    with self.assertRaises(asyncio.CancelledError) as caught:
+                        await owner
+
+        self.assertIn(
+            "cancelled stream process cleanup also failed",
+            getattr(caught.exception, "__notes__", []),
+        )
+        # The abandonment cleanup failed; the cancel's own exact disposal is
+        # a second attempt and also fails, so the honest outcome can only be
+        # indeterminate - never a fabricated cancelled terminal.
+        self.assertEqual(dispose_calls, 2)
+        self.assertEqual(result.status, "indeterminate")
+        self.assertTrue(result.changed)
+        durable = self.record(service, request)
+        self.assertEqual(durable.status, "indeterminate")
+        self.assertEqual(durable.terminal_code, "cancel_cleanup_failed")
+        self.assertEqual(self.terminal_count(service, request), 1)
+        self.assertIn(binding, adapter.supervisor._sessions)
+        self.assertTrue(adapter.supervisor._sessions[binding].poisoned)
+
+    async def test_shutdown_waits_for_inflight_abandonment_without_deadlock(self) -> None:
+        service, adapter = self.build_service("slow_tree")
+        await service.ensure_generation(self.binding_id, self.spec)
+        binding = str(self.binding_id)
+        request = self.turn(bootstrap={"history": []})
+        owner = asyncio.create_task(collect(service, self.binding_id, request))
+        await wait_until(
+            lambda: [item for item in self.evidence() if item["kind"] == "child"]
+        )
+
+        begun = asyncio.Event()
+        dispose_entered = asyncio.Event()
+        release_dispose = asyncio.Event()
+        real_begin = adapter.supervisor._begin_abandonment
+        real_dispose = adapter.supervisor._dispose_session
+
+        def observed_begin(binding_id, request_id):
+            task = real_begin(binding_id, request_id)
+            begun.set()
+            return task
+
+        async def gated_dispose(session, *, force):
+            dispose_entered.set()
+            await release_dispose.wait()
+            await real_dispose(session, force=force)
+
+        with patch.object(adapter.supervisor, "_begin_abandonment", side_effect=observed_begin):
+            with patch.object(adapter.supervisor, "_dispose_session", side_effect=gated_dispose):
+                owner.cancel()
+                await asyncio.wait_for(begun.wait(), timeout=5)
+                await asyncio.wait_for(dispose_entered.wait(), timeout=5)
+                shutdown_task = asyncio.create_task(service.shutdown())
+                await asyncio.sleep(0)
+                # The in-flight exact-request cleanup gates the process tree,
+                # so shutdown cannot have finished; once released it must
+                # settle without deadlocking or leaking proof residue.
+                self.assertFalse(shutdown_task.done())
+                release_dispose.set()
+                await asyncio.wait_for(shutdown_task, timeout=5)
+        with self.assertRaises(asyncio.CancelledError):
+            await owner
+        self.services.remove(service)
+        self.assertNotIn(binding, adapter.supervisor._sessions)
+        self.assertEqual(adapter.supervisor._abandonment_tasks, {})
+        self.assertEqual(adapter.supervisor._abandoned, {})
+
     async def test_request_a_proof_is_not_consumed_by_request_b(self) -> None:
         service, adapter = self.build_service("slow_tree")
         await service.ensure_generation(self.binding_id, self.spec)
