@@ -1,6 +1,6 @@
 """Authenticated legacy agent-declaration upgrade through the production adapter.
 
-Frozen authority: ``Plan/Subscription_Runtime_AGY_Legacy_Tool_Declaration_Upgrade_Plan.md``
+Frozen authority: ``Plan/Archived/Subscription_Runtime_AGY_Legacy_Tool_Declaration_Upgrade_Plan.md``
 sections 2 and 4 plus the LU-01..LU-16 matrix. The historical frontmatter
 templates are spelled out literally here so the recognizer is never validated
 against its own renderer.

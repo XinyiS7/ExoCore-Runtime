@@ -1,6 +1,6 @@
 """Frozen declaration-history invariants and byte-exact shape recognition.
 
-Frozen authority: ``Plan/Subscription_Runtime_AGY_Legacy_Tool_Declaration_Upgrade_Plan.md``
+Frozen authority: ``Plan/Archived/Subscription_Runtime_AGY_Legacy_Tool_Declaration_Upgrade_Plan.md``
 section 5 (discipline guard) and section 4 (the two historical templates). This
 file is the reason a future tool-set edit cannot silently brick live
 generations or leave a running process on a stale declaration.
