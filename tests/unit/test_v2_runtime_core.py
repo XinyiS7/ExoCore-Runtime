@@ -56,7 +56,7 @@ class CapabilityPolicyTests(unittest.TestCase):
         options = resolve_execution("gemini-3.1-pro-preview", "auto").process_options
         self.assertIs(options.sandbox, False)
         self.assertEqual(options.security_policy_revision, SECURITY_POLICY_REVISION)
-        self.assertEqual(SECURITY_POLICY_REVISION, "agy-tool-perm-v3")
+        self.assertEqual(SECURITY_POLICY_REVISION, "agy-tool-perm-v4")
         # The provider-neutral default itself stays untouched.
         neutral = ProcessExecutionOptions(
             provider_model_slug="gemini-3.1-pro-high",

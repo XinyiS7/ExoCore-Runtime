@@ -18,6 +18,7 @@ NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 from exocore_runtime.contracts import GenerationSpec, TurnRequest
 from exocore_runtime.errors import ConflictError, ProviderAdapterError
 from exocore_runtime.providers.antigravity.adapter import AntigravityAdapter
+from exocore_runtime.providers.antigravity.capabilities import SECURITY_POLICY_REVISION
 from exocore_runtime.providers.antigravity.control import (
     CanonicalControlStore,
     ReservedControlArtifact,
@@ -244,8 +245,9 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
                 str(self.binding_id),
             ],
         )
-        # CP2/CP5: native workspace tools stay in the custom-agent declaration;
-        # MCP is exposed through its isolated-profile server config + scoped allow.
+        # CP2/CP5 + native search unlock: the declared workload tools stay in
+        # the custom-agent declaration; MCP is exposed through its isolated
+        # profile server config + scoped allow.
         agent_markdown = (
             generation_root
             / "profile"
@@ -264,6 +266,7 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
                 "  - view_file",
                 "  - write_to_file",
                 "  - run_command",
+                "  - search_web",
             ],
         )
         hooks = json.loads(
@@ -776,6 +779,26 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(len([item for item in self.evidence() if item["kind"] == "spawn"]), 1)
         self.assertNotIn(str(self.binding_id), adapter.supervisor._sessions)
+
+    async def test_stale_security_policy_options_are_rejected_before_spawn(self) -> None:
+        # The 3-tool unlock's frozen ``agy-tool-perm-v3`` options are no longer
+        # current: a request whose frozen resolution still carries them must
+        # fail closed instead of reacquiring a process under the old policy.
+        service, adapter = self.build_service()
+        await service.ensure_generation(self.binding_id, self.spec)
+        request = self.turn(bootstrap={"history": []})
+        generation = service.store.get_generation(str(self.binding_id))
+        current = adapter.resolve_execution(
+            request.requested_model_id,
+            request.requested_thinking_level,
+        ).process_options
+        self.assertEqual(current.security_policy_revision, SECURITY_POLICY_REVISION)
+        stale = current.model_copy(update={"security_policy_revision": "agy-tool-perm-v3"})
+        with self.assertRaises(ProviderAdapterError) as caught:
+            await adapter.prepare_turn(generation, request, stale, is_first_turn=True)
+        self.assertEqual(caught.exception.code, "agy_process_options_unsupported")
+        self.assertEqual([item for item in self.evidence() if item["kind"] == "spawn"], [])
+        self.assertEqual(adapter.supervisor._sessions, {})
 
     async def test_gateway_and_parent_secrets_are_not_inherited_by_agy(self) -> None:
         service, _ = self.build_service()

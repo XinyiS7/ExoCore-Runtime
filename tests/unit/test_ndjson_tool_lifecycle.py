@@ -23,8 +23,13 @@ def load_fixture(name: str) -> list[dict]:
     return [json.loads(line) for line in lines]
 
 
-def consume_fixture(payloads: list[dict]):
-    generation = parse_init(payloads[0], "gemini-3.1-pro-high", "high")
+def consume_fixture(
+    payloads: list[dict],
+    *,
+    model: str = "gemini-3.1-pro-high",
+    effort: str = "high",
+):
+    generation = parse_init(payloads[0], model, effort)
     normalizer = AgyTurnNormalizer(generation.provider_session_id)
     events = []
     for payload in payloads[1:]:
@@ -169,6 +174,92 @@ class ToolLifecycleFixtureTests(unittest.TestCase):
             "user_manual",
         ):
             self.assertNotIn(residue, serialized_mcp_lifecycle)
+
+    def test_captured_1_2_7_search_web_fixture_projects_bounded_lifecycle_and_grounded_content(self) -> None:
+        payloads = load_fixture("agy_1_2_7_search_web_success.jsonl")
+        events = consume_fixture(payloads, model="gemini-3.1-pro-low", effort="low")
+
+        tool_events = [
+            event.payload
+            for event in events
+            if event.payload.get("step_type") == "tool"
+        ]
+        self.assertEqual(
+            tool_events,
+            [
+                {
+                    "step_index": 2,
+                    "step_type": "tool",
+                    "state": "ACTIVE",
+                    "category": "provider_tool",
+                    "tool_name": "search_web",
+                },
+                {
+                    "step_index": 2,
+                    "step_type": "tool",
+                    "state": "DONE",
+                    "category": "provider_tool",
+                    "tool_name": "search_web",
+                    "duration_seconds": 2.3529645,
+                    "outcome": "tool_completed",
+                },
+            ],
+        )
+        # Exactly one native search invocation, and its real wire envelope
+        # repeats the query in ``tool_info`` with no ``output`` at all: the
+        # output-less DONE is the observed 1.2.7 shape, not a parser gap.
+        self.assertEqual({payload["tool_name"] for payload in tool_events}, {"search_web"})
+        done_step = next(
+            payload["step_update"]
+            for payload in payloads
+            if payload.get("event") == "step_update"
+            and payload["step_update"].get("step_type") == "tool"
+            and payload["step_update"].get("state") == "DONE"
+        )
+        self.assertEqual(sorted(done_step["tool_info"]), ["name", "parameters"])
+        self.assertNotIn("output", done_step["tool_info"])
+
+        serialized_lifecycle = "".join(
+            json.dumps(payload, sort_keys=True, ensure_ascii=False) for payload in tool_events
+        )
+        for residue in (
+            "tool_info",
+            "parameters",
+            "query",
+            "Python 3 official documentation",
+            "docs.python.org",
+            "grounding-api-redirect",
+            "vertexaisearch",
+            "<workspace>",
+        ):
+            self.assertNotIn(residue, serialized_lifecycle)
+
+        # Grounded search output travels as ordinary assistant content: the
+        # cited documentation link and the provider grounding source link stay
+        # in the text, and no search-specific result event exists.
+        content = "".join(
+            event.payload["text"]
+            for event in events
+            if event.event_type == "content_delta"
+        )
+        self.assertIn("[docs.python.org/3/](https://docs.python.org/3/)", content)
+        self.assertIn("https://vertexaisearch.cloud.google.com/grounding-api-redirect/", content)
+        self.assertEqual(content, payloads[-1]["result"]["response"])
+        self.assertNotIn(
+            "docs.python.org",
+            "".join(
+                event.model_dump_json()
+                for event in events
+                if event.event_type not in {"content_delta"}
+            ),
+        )
+
+        self.assertEqual(
+            [event.event_type for event in events][-3:],
+            ["content_delta", "usage", "done"],
+        )
+        usage_event = next(event for event in events if event.event_type == "usage")
+        self.assertEqual(usage_event.payload, payloads[-1]["result"]["usage"])
 
     def test_captured_1_2_5_failure_fixture_projects_tool_error_without_raw_body(self) -> None:
         events = consume_fixture(load_fixture("agy_1_2_5_tool_failure.jsonl"))

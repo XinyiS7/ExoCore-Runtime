@@ -16,17 +16,25 @@ from exocore_runtime.contracts import ContinuityDeltaTurn, TurnRequest
 # Subscription_Runtime_AGY_CP2_Checkpoint_Report.md section 5). These are
 # AGY-native tool ids and stay deliberately separate from the permission action
 # namespaces (``read_file``/``write_file``/``command``) used by DENY_POLICY.
+# ``search_web`` is AGY's own first-party web search: the accepted 1.2.7 probe
+# shows it stays callable while ``read_url(*)``/``execute_url(*)`` remain
+# denied, so direct URL reading and the browser surfaces stay undeclared and
+# closed. Capture evidence:
+# tests/fixtures/agy_1_2_7_search_web_success.jsonl.
 AGENT_TOOLS = (
     "view_file",
     "write_to_file",
     "run_command",
+    "search_web",
 )
 
 # Official fine-grained permission semantics are Deny > Ask > Allow, so the
 # deny list (not the tool declaration) decides what an exposed tool may do.
 # Captured 1.2.5 evidence: keeping ``unsandboxed(*)`` denies every ``command``
 # while ``sandbox=False``, so the first unlock drops it together with the
-# ``read_file``/``write_file``/``command`` namespaces. URL access stays denied.
+# ``read_file``/``write_file``/``command`` namespaces. Direct URL access stays
+# denied even though the native ``search_web`` tool is declared: search does not
+# travel through the URL permission families.
 # CP5 exposes exactly one generation-private MCP server; Deny > Allow means the
 # old global `mcp(*)` deny must be removed before a server-scoped allow can work.
 MCP_SERVER_NAME = "exocore-memory"

@@ -83,9 +83,10 @@ class AntigravityComponentTests(unittest.TestCase):
         )
 
     def test_rendered_agent_declares_only_the_intended_native_tools(self) -> None:
-        # Production rendering must expose exactly the CP2 first-unlock workload
-        # tool set. The boundary is the explicit declaration itself, never the
-        # CLI's no-declaration default surface (1.2.5 evidence: that default is
+        # Production rendering must expose exactly the declared workload tool
+        # set: the CP2 trio plus the accepted native ``search_web`` unlock. The
+        # boundary is the explicit declaration itself, never the CLI's
+        # no-declaration default surface (1.2.5 evidence: that default is
         # neither small nor stable).
         agent_name = f"exocore-runtime-{self.binding_id.replace('-', '')}"
         markdown = render_agent_markdown(agent_name, "system instructions body")
@@ -98,13 +99,43 @@ class AntigravityComponentTests(unittest.TestCase):
                 "  - view_file",
                 "  - write_to_file",
                 "  - run_command",
+                "  - search_web",
             ],
         )
-        self.assertEqual(AGENT_TOOLS, ("view_file", "write_to_file", "run_command"))
-        # URL/native MCP ids stay out of our custom-agent declaration. AGY 1.2.7
+        self.assertEqual(
+            AGENT_TOOLS,
+            ("view_file", "write_to_file", "run_command", "search_web"),
+        )
+        # No implicit expansion: every other AGY-advertised native tool family
+        # stays out of our custom-agent declaration, including the URL and
+        # browser surfaces that remain denied in the profile policy. AGY 1.2.7
         # may inject its generic call_mcp_tool dispatcher independently; scoped
         # MCP authorization is owned by profile permissions, not this frontmatter.
-        for closed_tool in ("read_url_content", "execute_url", "mcp"):
+        for closed_tool in (
+            "read_url_content",
+            "execute_url",
+            "mcp",
+            "open_browser_url",
+            "read_browser_page",
+            "execute_browser_javascript",
+            "browser_subagent",
+            "capture_browser_screenshot",
+            "click_browser_pixel",
+            "call_mcp_tool",
+            "read_resource",
+            "invoke_subagent",
+            "define_subagent",
+            "manage_subagents",
+            "schedule",
+            "generate_image",
+            "send_message",
+            "manage_inbox",
+            "list_dir",
+            "find_by_name",
+            "grep_search",
+            "notebook_execution",
+            "delete_knowledge",
+        ):
             self.assertNotIn(closed_tool, markdown)
         # Extraction shares the same prefix source, so the round trip stays exact.
         self.assertEqual(
