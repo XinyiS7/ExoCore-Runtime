@@ -77,7 +77,8 @@ class AntigravityComponentTests(unittest.TestCase):
             {
                 "read_url(*)",
                 "execute_url(*)",
-                "mcp(*)",
+                "mcp(chrome_devtools/*)",
+                "mcp(chrome-devtools/*)",
             },
         )
 
@@ -100,7 +101,9 @@ class AntigravityComponentTests(unittest.TestCase):
             ],
         )
         self.assertEqual(AGENT_TOOLS, ("view_file", "write_to_file", "run_command"))
-        # URL and MCP tools stay unexposed as well as denied.
+        # URL/native MCP ids stay out of our custom-agent declaration. AGY 1.2.7
+        # may inject its generic call_mcp_tool dispatcher independently; scoped
+        # MCP authorization is owned by profile permissions, not this frontmatter.
         for closed_tool in ("read_url_content", "execute_url", "mcp"):
             self.assertNotIn(closed_tool, markdown)
         # Extraction shares the same prefix source, so the round trip stays exact.

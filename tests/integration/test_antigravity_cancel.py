@@ -58,6 +58,11 @@ class AgyCancelRaceTests(unittest.IsolatedAsyncioTestCase):
         self.state_path = self.root / "runtime.sqlite3"
         self.data_root = self.root / "providers"
         self.evidence_path = self.root / "fixture-evidence.jsonl"
+        memory_server_marker = (
+            self.root / "engines" / "mcp" / "servers" / "memory" / "server.py"
+        )
+        memory_server_marker.parent.mkdir(parents=True)
+        memory_server_marker.write_text("# test Memory MCP marker\n", encoding="utf-8")
         self.binding_id = uuid4()
         self.spec = GenerationSpec(
             runtime_kind="antigravity",
@@ -95,6 +100,7 @@ class AgyCancelRaceTests(unittest.IsolatedAsyncioTestCase):
         adapter = AntigravityAdapter(
             self.data_root,
             AgyProcessSupervisor(process_config),
+            memory_mcp_root=self.root,
             mailbox_ttl_seconds=30,
         )
         service = RuntimeService(

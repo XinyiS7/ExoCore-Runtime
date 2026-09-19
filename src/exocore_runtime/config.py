@@ -19,6 +19,11 @@ def _default_state_path() -> Path:
     return _default_runtime_root() / "runtime.sqlite3"
 
 
+def _default_memory_mcp_root() -> Path:
+    """Resolve the canonical sibling ExoCore checkout without machine constants."""
+    return Path(__file__).resolve().parents[3] / "ExoCore"
+
+
 @dataclass(frozen=True, repr=False)
 class RuntimeConfig:
     """Validated runtime configuration. The token is deliberately absent from repr."""
@@ -34,6 +39,7 @@ class RuntimeConfig:
     agy_hard_timeout: float = 180.0
     agy_close_timeout: float = 5.0
     agy_mailbox_ttl: float = 120.0
+    memory_mcp_root: Path | None = None
 
     def __post_init__(self) -> None:
         try:
@@ -62,16 +68,21 @@ class RuntimeConfig:
         return (
             f"RuntimeConfig(host={self.host!r}, port={self.port!r}, "
             "token='[REDACTED]', state_path='[PRIVATE]', "
-            "provider_data_root='[PRIVATE]')"
+            "provider_data_root='[PRIVATE]', memory_mcp_root='[PRIVATE]')"
         )
 
     @property
     def effective_provider_data_root(self) -> Path:
         return self.provider_data_root or (self.state_path.parent / "providers")
 
+    @property
+    def effective_memory_mcp_root(self) -> Path:
+        return (self.memory_mcp_root or _default_memory_mcp_root()).resolve()
+
     @classmethod
     def from_env(cls) -> "RuntimeConfig":
         provider_root = os.environ.get("EXOCORE_RUNTIME_PROVIDER_DATA_ROOT")
+        memory_mcp_root = os.environ.get("EXOCORE_RUNTIME_MEMORY_MCP_ROOT")
         return cls(
             host=os.environ.get("EXOCORE_RUNTIME_HOST", "127.0.0.1"),
             port=int(os.environ.get("EXOCORE_RUNTIME_PORT", "8766")),
@@ -84,4 +95,5 @@ class RuntimeConfig:
             agy_hard_timeout=float(os.environ.get("EXOCORE_RUNTIME_AGY_HARD_TIMEOUT", "180")),
             agy_close_timeout=float(os.environ.get("EXOCORE_RUNTIME_AGY_CLOSE_TIMEOUT", "5")),
             agy_mailbox_ttl=float(os.environ.get("EXOCORE_RUNTIME_AGY_MAILBOX_TTL", "120")),
+            memory_mcp_root=Path(memory_mcp_root) if memory_mcp_root else None,
         )

@@ -1,5 +1,7 @@
 from pathlib import Path
+import tempfile
 import unittest
+from unittest.mock import patch
 
 from exocore_runtime.config import RuntimeConfig
 
@@ -21,6 +23,20 @@ class RuntimeConfigTests(unittest.TestCase):
         config = RuntimeConfig("127.0.0.1", 8766, "canary-token", Path("state.db"))
         self.assertNotIn("canary-token", repr(config))
         self.assertIn("[REDACTED]", repr(config))
+        self.assertIn("memory_mcp_root='[PRIVATE]'", repr(config))
+
+    def test_memory_mcp_root_env_override_is_resolved(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(
+            "os.environ",
+            {
+                "EXOCORE_RUNTIME_TOKEN": "canary-token",
+                "EXOCORE_RUNTIME_MEMORY_MCP_ROOT": temp_dir,
+            },
+            clear=False,
+        ):
+            config = RuntimeConfig.from_env()
+
+        self.assertEqual(config.effective_memory_mcp_root, Path(temp_dir).resolve())
 
 
 if __name__ == "__main__":

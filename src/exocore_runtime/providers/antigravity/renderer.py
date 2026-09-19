@@ -26,12 +26,22 @@ AGENT_TOOLS = (
 # deny list (not the tool declaration) decides what an exposed tool may do.
 # Captured 1.2.5 evidence: keeping ``unsandboxed(*)`` denies every ``command``
 # while ``sandbox=False``, so the first unlock drops it together with the
-# ``read_file``/``write_file``/``command`` namespaces. The URL and MCP families
-# stay denied and are also never declared as tools.
+# ``read_file``/``write_file``/``command`` namespaces. URL access stays denied.
+# CP5 exposes exactly one generation-private MCP server; Deny > Allow means the
+# old global `mcp(*)` deny must be removed before a server-scoped allow can work.
+MCP_SERVER_NAME = "exocore-memory"
+ALLOW_POLICY = (f"mcp({MCP_SERVER_NAME}/*)",)
+# AGY 1.2.6 contains a built-in Chrome-DevTools MCP surface. Both permission
+# spellings are embedded by the official binary, so deny both aliases explicitly:
+# Deny > Allow keeps that built-in surface closed while exocore-memory is open.
+CHROME_DEVTOOLS_MCP_DENIES = (
+    "mcp(chrome_devtools/*)",
+    "mcp(chrome-devtools/*)",
+)
 DENY_POLICY = (
     "read_url(*)",
     "execute_url(*)",
-    "mcp(*)",
+    *CHROME_DEVTOOLS_MCP_DENIES,
 )
 
 _TRANSPORT_INSTRUCTIONS = """

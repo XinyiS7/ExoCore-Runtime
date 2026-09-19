@@ -24,7 +24,9 @@ from exocore_runtime.providers.antigravity.control import (
 )
 from exocore_runtime.providers.antigravity.process import AgyProcessConfig, AgyProcessSupervisor
 from exocore_runtime.providers.antigravity.renderer import (
+    ALLOW_POLICY,
     DENY_POLICY,
+    MCP_SERVER_NAME,
     render_agent_markdown,
 )
 from exocore_runtime.service import RuntimeService
@@ -42,6 +44,11 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.state_path = self.root / "runtime.sqlite3"
         self.data_root = self.root / "providers"
         self.evidence_path = self.root / "fixture-evidence.jsonl"
+        memory_server_marker = (
+            self.root / "engines" / "mcp" / "servers" / "memory" / "server.py"
+        )
+        memory_server_marker.parent.mkdir(parents=True)
+        memory_server_marker.write_text("# test Memory MCP marker\n", encoding="utf-8")
         self.binding_id = uuid4()
         self.system_canary = "SYSTEM-INSTRUCTIONS-PRIVATE-CANARY"
         self.spec = GenerationSpec(
@@ -59,7 +66,12 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
                 pass
         self.temp.cleanup()
 
-    def build_service(self, scenario="normal", reserved_artifacts=None):
+    def build_service(
+        self,
+        scenario="normal",
+        reserved_artifacts=None,
+        memory_mcp_root=None,
+    ):
         fixture = Path(__file__).resolve().parents[1] / "fixtures" / "fake_agy.py"
         environment = {
             "FAKE_AGY_SCENARIO": scenario,
@@ -78,7 +90,10 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
             require_official_executable=False,
             environment_overrides=environment,
         )
-        adapter_kwargs = {"mailbox_ttl_seconds": 30}
+        adapter_kwargs = {
+            "memory_mcp_root": memory_mcp_root or self.root,
+            "mailbox_ttl_seconds": 30,
+        }
         if reserved_artifacts is not None:
             adapter_kwargs["reserved_artifacts"] = reserved_artifacts
         adapter = AntigravityAdapter(
@@ -92,6 +107,42 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
         )
         self.services.append(service)
         return service, adapter
+
+    def test_memory_mcp_root_requires_server_marker(self) -> None:
+        bad_root = self.root / "not-exocore"
+        bad_root.mkdir()
+
+        with self.assertRaisesRegex(ValueError, "engines/mcp/servers/memory/server.py"):
+            self.build_service(memory_mcp_root=bad_root)
+
+    def test_alternate_mcp_customization_sources_are_rejected(self) -> None:
+        cases = (
+            ("workspace-direct", "workspace", "mcp_config.json", False),
+            ("workspace-plugin", "workspace", "plugins", True),
+            ("profile-direct", "profile", "mcp_config.json", False),
+            ("profile-plugin", "profile", "plugins", True),
+        )
+        for name, scope, leaf, is_directory in cases:
+            with self.subTest(source=name):
+                case_root = self.root / f"guard-{name}"
+                profile = case_root / "profile"
+                workspace = case_root / "workspace"
+                profile.mkdir(parents=True)
+                workspace.mkdir(parents=True)
+                target = (profile if scope == "profile" else workspace) / ".agents" / leaf
+                if is_directory:
+                    target.mkdir(parents=True)
+                else:
+                    target.parent.mkdir(parents=True)
+                    target.write_text("{}", encoding="utf-8")
+
+                with self.assertRaises(ProviderAdapterError) as caught:
+                    AntigravityAdapter._require_profile_only_mcp_control(profile, workspace)
+
+                self.assertEqual(
+                    caught.exception.code,
+                    "agy_uncontrolled_mcp_source_forbidden",
+                )
 
     def turn(self, *, thinking="auto", bootstrap=None, ephemeral=None, request_id=None):
         return TurnRequest(
@@ -168,16 +219,33 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
             ).read_text(encoding="utf-8")
         )
         self.assertEqual(settings["modelProvider"], "account_default")
-        self.assertEqual(
-            set(settings["permissions"]["deny"]),
-            {
-                "read_url(*)",
-                "execute_url(*)",
-                "mcp(*)",
-            },
+        self.assertEqual(settings["permissions"]["deny"], list(DENY_POLICY))
+        self.assertEqual(settings["permissions"]["allow"], list(ALLOW_POLICY))
+        self.assertNotIn("mcp(*)", settings["permissions"]["deny"])
+        self.assertEqual(ALLOW_POLICY, (f"mcp({MCP_SERVER_NAME}/*)",))
+        self.assertIn("mcp(chrome_devtools/*)", settings["permissions"]["deny"])
+        self.assertIn("mcp(chrome-devtools/*)", settings["permissions"]["deny"])
+        mcp_config = json.loads(
+            (
+                generation_root / "profile" / ".gemini" / "config" / "mcp_config.json"
+            ).read_text(encoding="utf-8")
         )
-        # CP2: the production-rendered custom agent declares exactly the first
-        # unlock tool ids; URL and MCP tools are neither declared nor allowed.
+        self.assertEqual(list(mcp_config["mcpServers"]), [MCP_SERVER_NAME])
+        server_config = mcp_config["mcpServers"][MCP_SERVER_NAME]
+        self.assertEqual(server_config["command"], str(Path(sys.executable).resolve()))
+        self.assertEqual(server_config["cwd"], str(self.root.resolve()))
+        self.assertEqual(server_config["env"], {"PYTHONPATH": str(self.root.resolve())})
+        self.assertEqual(
+            server_config["args"],
+            [
+                "-m",
+                "engines.mcp.servers.memory.server",
+                "--runtime-binding-id",
+                str(self.binding_id),
+            ],
+        )
+        # CP2/CP5: native workspace tools stay in the custom-agent declaration;
+        # MCP is exposed through its isolated-profile server config + scoped allow.
         agent_markdown = (
             generation_root
             / "profile"
@@ -462,9 +530,11 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.services.remove(service)
         profile = generation_root / "profile"
         hooks_path = profile / ".gemini" / "config" / "hooks.json"
+        mcp_config_path = profile / ".gemini" / "config" / "mcp_config.json"
         settings_path = profile / ".gemini" / "antigravity-cli" / "settings.json"
         agent_path = next((profile / ".gemini" / "config" / "agents").glob("*/agent.md"))
         hooks_path.unlink()
+        mcp_config_path.write_text(json.dumps({"mcpServers": {}}), encoding="utf-8")
         settings_path.write_text(
             json.dumps({"modelProvider": "account_default", "permissions": {"deny": []}}),
             encoding="utf-8",
@@ -472,7 +542,7 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
         pollution = generation_root / "workspace" / "pollution.txt"
         pollution.write_text("workspace canary", encoding="utf-8")
 
-        restarted, _ = self.build_service()
+        restarted, restarted_adapter = self.build_service()
         await restarted.ensure_generation(self.binding_id, self.spec)
         await collect(restarted, self.binding_id, self.turn(thinking="low"))
         self.assertEqual(len([item for item in self.evidence() if item["kind"] == "spawn"]), 2)
@@ -485,6 +555,11 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
         settings = json.loads(settings_path.read_text(encoding="utf-8"))
         self.assertEqual(settings["modelProvider"], "account_default")
         self.assertEqual(settings["permissions"]["deny"], list(DENY_POLICY))
+        self.assertEqual(settings["permissions"]["allow"], list(ALLOW_POLICY))
+        self.assertEqual(
+            json.loads(mcp_config_path.read_text(encoding="utf-8")),
+            restarted_adapter._expected_mcp_config(str(self.binding_id)),
+        )
         self.assertIn(self.system_canary, agent_path.read_text(encoding="utf-8"))
         self.assertEqual(pollution.read_text(encoding="utf-8"), "workspace canary")
 
@@ -512,6 +587,29 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
         second = await collect(restarted, self.binding_id, self.turn(thinking="low"))
         self.assertEqual(second[-1].event_type, "done")
         self.assertEqual(ordinary.read_text(encoding="utf-8"), "turn one output")
+
+    async def test_workspace_mcp_config_is_rejected_before_process_acquire(self) -> None:
+        service, _ = self.build_service()
+        await service.ensure_generation(self.binding_id, self.spec)
+        first = await collect(service, self.binding_id, self.turn(bootstrap={"history": []}))
+        self.assertEqual(first[-1].event_type, "done")
+        generation_root = next(self.data_root.iterdir())
+        workspace_mcp = generation_root / "workspace" / ".agents" / "mcp_config.json"
+        workspace_mcp.parent.mkdir(parents=True)
+        workspace_mcp.write_text("{\"mcpServers\": {}}", encoding="utf-8")
+        spawn_count = len([item for item in self.evidence() if item["kind"] == "spawn"])
+
+        rejected = await collect(service, self.binding_id, self.turn(thinking="low"))
+
+        self.assertEqual(
+            rejected[-1].payload,
+            {"code": "agy_uncontrolled_mcp_source_forbidden"},
+        )
+        self.assertEqual(
+            len([item for item in self.evidence() if item["kind"] == "spawn"]),
+            spawn_count,
+        )
+        self.assertTrue(workspace_mcp.exists())
 
     async def test_registered_reserved_artifact_heals_from_canonical_backing(self) -> None:
         artifact = ReservedControlArtifact("canonical_demo.txt", "reserved/demo.txt")

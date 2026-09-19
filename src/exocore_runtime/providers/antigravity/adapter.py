@@ -46,7 +46,9 @@ from exocore_runtime.providers.antigravity.process import (
     GenerationLayout,
 )
 from exocore_runtime.providers.antigravity.renderer import (
+    ALLOW_POLICY,
     DENY_POLICY,
+    MCP_SERVER_NAME,
     extract_rendered_system_instructions,
     generation_agent_name,
     render_agent_markdown,
@@ -85,12 +87,22 @@ class AntigravityAdapter:
         data_root: Path,
         supervisor: AgyProcessSupervisor,
         *,
+        memory_mcp_root: Path,
         mailbox_ttl_seconds: float = 120.0,
         reserved_artifacts: tuple[ReservedControlArtifact, ...] = RESERVED_CONTROL_ARTIFACTS,
     ) -> None:
         self.data_root = Path(data_root).resolve()
         self.data_root.mkdir(parents=True, exist_ok=True)
         self.supervisor = supervisor
+        self.memory_mcp_root = Path(memory_mcp_root).resolve()
+        memory_server_marker = (
+            self.memory_mcp_root / "engines" / "mcp" / "servers" / "memory" / "server.py"
+        )
+        if not self.memory_mcp_root.is_dir() or not memory_server_marker.is_file():
+            raise ValueError(
+                "memory MCP root must contain engines/mcp/servers/memory/server.py"
+            )
+        self.memory_mcp_python = str(Path(sys.executable).resolve())
         self.mailbox_ttl_seconds = mailbox_ttl_seconds
         self.reserved_artifacts = tuple(reserved_artifacts)
         self._requests: dict[tuple[str, str], _RequestState] = {}
@@ -732,6 +744,7 @@ class AntigravityAdapter:
                 raise ProviderAdapterError("agy_workspace_invalid", fatal_generation=True)
         else:
             workspace.mkdir(parents=True)
+        self._require_profile_only_mcp_control(profile, workspace)
         CanonicalControlStore(root).prepare()
         mailbox = EphemeralMailbox(
             root / "mailbox",
@@ -746,6 +759,10 @@ class AntigravityAdapter:
         self._atomic_write_json(
             profile / ".gemini" / "antigravity-cli" / "settings.json",
             self._expected_settings(),
+        )
+        self._atomic_write_json(
+            profile / ".gemini" / "config" / "mcp_config.json",
+            self._expected_mcp_config(binding_id),
         )
         self._atomic_write_text(
             profile / ".gemini" / "config" / "agents" / agent_name / "agent.md",
@@ -853,6 +870,7 @@ class AntigravityAdapter:
                 "agy_artifact_identity_mismatch", fatal_generation=True
             )
         hooks_path = layout_profile / ".gemini" / "config" / "hooks.json"
+        mcp_config_path = layout_profile / ".gemini" / "config" / "mcp_config.json"
         settings_path = layout_profile / ".gemini" / "antigravity-cli" / "settings.json"
         agent_path = (
             layout_profile / ".gemini" / "config" / "agents" / agent_name / "agent.md"
@@ -874,6 +892,7 @@ class AntigravityAdapter:
             layout_profile / "Temp",
             mailbox_root,
             hooks_path,
+            mcp_config_path,
             settings_path,
             agent_path,
             layout_workspace,
@@ -890,6 +909,8 @@ class AntigravityAdapter:
             raise ProviderAdapterError("agy_hook_policy_invalid", fatal_generation=True)
         if self._read_json(settings_path) != self._expected_settings():
             raise ProviderAdapterError("agy_deny_policy_invalid", fatal_generation=True)
+        if self._read_json(mcp_config_path) != self._expected_mcp_config(generation.binding_id):
+            raise ProviderAdapterError("agy_mcp_config_invalid", fatal_generation=True)
         try:
             agent_bytes = agent_path.read_bytes()
             agent_markdown = agent_bytes.decode("utf-8", errors="strict")
@@ -920,10 +941,29 @@ class AntigravityAdapter:
             or self._is_link_or_reparse(layout_workspace)
         ):
             raise ProviderAdapterError("agy_workspace_invalid", fatal_generation=True)
+        self._require_profile_only_mcp_control(layout_profile, layout_workspace)
         control_store = CanonicalControlStore(root)
         for artifact in self._reserved_artifacts_for(metadata):
             if not control_store.verify(artifact):
                 raise ProviderAdapterError("agy_security_artifact_invalid", fatal_generation=True)
+
+    @classmethod
+    def _require_profile_only_mcp_control(cls, profile: Path, workspace: Path) -> None:
+        """Reject alternate MCP/plugin customization sources before AGY acquisition."""
+
+        for customization_root in (workspace / ".agents", profile / ".agents"):
+            direct_mcp = customization_root / "mcp_config.json"
+            plugins = customization_root / "plugins"
+            if (
+                cls._is_link_or_reparse(customization_root)
+                or cls._is_link_or_reparse(direct_mcp)
+                or cls._is_link_or_reparse(plugins)
+                or direct_mcp.exists()
+                or plugins.exists()
+            ):
+                raise ProviderAdapterError(
+                    "agy_uncontrolled_mcp_source_forbidden", fatal_generation=True
+                )
 
     @staticmethod
     def _expected_hooks(mailbox_root: Path) -> dict[str, object]:
@@ -953,7 +993,27 @@ class AntigravityAdapter:
     def _expected_settings() -> dict[str, object]:
         return {
             "modelProvider": "account_default",
-            "permissions": {"deny": list(DENY_POLICY)},
+            "permissions": {
+                "allow": list(ALLOW_POLICY),
+                "deny": list(DENY_POLICY),
+            },
+        }
+
+    def _expected_mcp_config(self, binding_id: str) -> dict[str, object]:
+        return {
+            "mcpServers": {
+                MCP_SERVER_NAME: {
+                    "command": self.memory_mcp_python,
+                    "args": [
+                        "-m",
+                        "engines.mcp.servers.memory.server",
+                        "--runtime-binding-id",
+                        binding_id,
+                    ],
+                    "cwd": str(self.memory_mcp_root),
+                    "env": {"PYTHONPATH": str(self.memory_mcp_root)},
+                }
+            }
         }
 
     def _layout_from_metadata(

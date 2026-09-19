@@ -393,6 +393,16 @@ class RuntimeHttpTests(unittest.TestCase):
         fixture = Path(__file__).resolve().parents[1] / "fixtures" / "fake_agy.py"
         data_root = Path(self.temp.name) / "providers"
         evidence = Path(self.temp.name) / "evidence.jsonl"
+        memory_server_marker = (
+            Path(self.temp.name)
+            / "engines"
+            / "mcp"
+            / "servers"
+            / "memory"
+            / "server.py"
+        )
+        memory_server_marker.parent.mkdir(parents=True)
+        memory_server_marker.write_text("# test Memory MCP marker\n", encoding="utf-8")
         supervisor = AgyProcessSupervisor(
             AgyProcessConfig(
                 command_prefix=(sys.executable, str(fixture)),
@@ -408,7 +418,7 @@ class RuntimeHttpTests(unittest.TestCase):
                 },
             )
         )
-        antigravity = AntigravityAdapter(data_root, supervisor)
+        antigravity = AntigravityAdapter(data_root, supervisor, memory_mcp_root=Path(self.temp.name))
         providers = {"fake": DeterministicFakeAdapter(), "antigravity": antigravity}
         spec = v2_spec(
             runtime_kind="antigravity",
@@ -466,6 +476,16 @@ class RuntimeHttpTests(unittest.TestCase):
         generation_path, turn_path, _ = self._generation_paths(binding_id)
         fixture = Path(__file__).resolve().parents[1] / "fixtures" / "fake_agy.py"
         evidence_path = Path(self.temp.name) / "disconnect-evidence.jsonl"
+        memory_server_marker = (
+            Path(self.temp.name)
+            / "engines"
+            / "mcp"
+            / "servers"
+            / "memory"
+            / "server.py"
+        )
+        memory_server_marker.parent.mkdir(parents=True)
+        memory_server_marker.write_text("# test Memory MCP marker\n", encoding="utf-8")
         supervisor = AgyProcessSupervisor(
             AgyProcessConfig(
                 command_prefix=(sys.executable, str(fixture)),
@@ -484,6 +504,7 @@ class RuntimeHttpTests(unittest.TestCase):
         antigravity = AntigravityAdapter(
             Path(self.temp.name) / "disconnect-providers",
             supervisor,
+            memory_mcp_root=Path(self.temp.name),
         )
         providers = {"fake": DeterministicFakeAdapter(), "antigravity": antigravity}
         spec = v2_spec(

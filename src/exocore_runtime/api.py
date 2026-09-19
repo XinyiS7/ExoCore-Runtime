@@ -57,6 +57,7 @@ def create_app(
             "antigravity": AntigravityAdapter(
                 config.effective_provider_data_root,
                 AgyProcessSupervisor(process_config),
+                memory_mcp_root=config.effective_memory_mcp_root,
                 mailbox_ttl_seconds=config.agy_mailbox_ttl,
             ),
         }

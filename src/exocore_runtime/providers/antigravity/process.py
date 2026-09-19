@@ -541,11 +541,11 @@ class AgyProcessSupervisor:
             if match is None:
                 raise ProviderAdapterError("agy_version_invalid", fatal_generation=True)
             major, minor, patch = (int(part) for part in match.groups())
-            # Verified envelope: 1.1.20 - 1.2.5 (1.2.4 captured as
-            # tests/fixtures/agy_1_2_4_success.jsonl; 1.2.5 tool success and
-            # failure captured as tests/fixtures/agy_1_2_5_tool_success.jsonl
-            # and agy_1_2_5_tool_failure.jsonl). Minor boundaries stay
-            # fail-closed: a 1.3.x CLI needs a fresh compatibility capture.
+            # Compatibility envelope: >=1.1.20,<1.3. Production fixtures cover
+            # 1.2.4 plus 1.2.5 tool success/failure; CP5 additionally captured
+            # 1.2.7 isolated-profile MCP/quota preflight evidence with zero model
+            # turns. Minor boundaries stay fail-closed: a 1.3.x CLI needs a
+            # fresh compatibility capture before the gate is widened.
             if (major, minor, patch) < (1, 1, 20) or (major, minor) >= (1, 3):
                 raise ProviderAdapterError("agy_version_unsupported", fatal_generation=True)
             models_stdout = await self._run_bounded(
@@ -600,8 +600,9 @@ class AgyProcessSupervisor:
             "--print-timeout",
             f"{int(self.config.hard_timeout_seconds)}s",
             # Headless AGY cannot answer an interactive Ask, so every
-            # Ask-state approval is auto-granted. Deny rules still win
-            # (Deny > Ask > Allow), which keeps the URL/MCP families closed.
+            # Ask-state approval is auto-granted. Explicit Deny rules still win
+            # (Deny > Ask > Allow), keeping URL access closed; CP5 exposes only
+            # the generation-private `exocore-memory` MCP server via scoped allow.
             "--dangerously-skip-permissions",
         ]
         if layout.execution_options.sandbox:
@@ -1047,6 +1048,10 @@ class AgyProcessSupervisor:
             groups = command["data"]["groups"]
         except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
             raise ProviderAdapterError("agy_auth_unavailable", fatal_generation=True) from exc
+        # `/quota` is a health/auth sentinel, not workload. The zero-turn/zero-usage
+        # invariant is deliberate drift detection: if a future AGY build starts
+        # billing this preflight, generation acquisition must fail closed rather
+        # than silently spend a model turn.
         if payload.get("status") != "SUCCESS" or payload.get("num_turns") != 0:
             raise ProviderAdapterError("agy_auth_unavailable", fatal_generation=True)
         if not isinstance(usage, dict) or any(value != 0 for value in usage.values()):

@@ -1,4 +1,4 @@
-"""Bounded tool lifecycle projection pinned to the captured AGY 1.2.5 evidence."""
+"""Bounded tool lifecycle projection pinned to captured AGY 1.2.x evidence."""
 
 from __future__ import annotations
 
@@ -116,6 +116,59 @@ class ToolLifecycleFixtureTests(unittest.TestCase):
             "<workspace>",
         ):
             self.assertNotIn(residue, serialized)
+
+    def test_captured_1_2_7_mcp_fixture_projects_generic_dispatch_without_raw_body(self) -> None:
+        payloads = load_fixture("agy_1_2_7_mcp_success.jsonl")
+        generation = parse_init(payloads[0], "gemini-3.1-pro-low", "low")
+        normalizer = AgyTurnNormalizer(generation.provider_session_id)
+        events = []
+        for payload in payloads[1:]:
+            events.extend(normalizer.consume(payload))
+
+        tool_events = [
+            event.payload
+            for event in events
+            if event.payload.get("step_type") == "tool"
+        ]
+        mcp_events = [
+            payload for payload in tool_events if payload.get("tool_name") == "call_mcp_tool"
+        ]
+        self.assertEqual(
+            mcp_events,
+            [
+                {
+                    "step_index": 4,
+                    "step_type": "tool",
+                    "state": "ACTIVE",
+                    "category": "provider_tool",
+                    "tool_name": "call_mcp_tool",
+                },
+                {
+                    "step_index": 4,
+                    "step_type": "tool",
+                    "state": "DONE",
+                    "category": "provider_tool",
+                    "tool_name": "call_mcp_tool",
+                    "duration_seconds": 0.062178,
+                    "outcome": "tool_completed",
+                },
+            ],
+        )
+        serialized_mcp_lifecycle = "".join(
+            json.dumps(payload, sort_keys=True, ensure_ascii=False) for payload in mcp_events
+        )
+        for residue in (
+            "tool_info",
+            "parameters",
+            "ServerName",
+            "ToolName",
+            "exocore-memory",
+            "memory_search",
+            "CP5-MEMORY-CANARY-9F3A",
+            "memory_plasmid",
+            "user_manual",
+        ):
+            self.assertNotIn(residue, serialized_mcp_lifecycle)
 
     def test_captured_1_2_5_failure_fixture_projects_tool_error_without_raw_body(self) -> None:
         events = consume_fixture(load_fixture("agy_1_2_5_tool_failure.jsonl"))
