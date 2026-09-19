@@ -26,7 +26,10 @@ from exocore_runtime.providers.antigravity.process import (
     AgyProcessConfig,
     AgyProcessSupervisor,
 )
-from exocore_runtime.providers.antigravity.renderer import generation_agent_name
+from exocore_runtime.providers.antigravity.renderer import (
+    generation_agent_name,
+    render_agent_markdown,
+)
 from exocore_runtime.service import RuntimeService
 from exocore_runtime.state_store import RuntimeStateStore
 
@@ -460,6 +463,130 @@ class LegacyDeclarationUpgradeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(caught.exception.code, "agy_artifact_identity_mismatch")
         self.assertEqual(metadata_file.read_bytes(), tampered_metadata)
         self.assertEqual(self.frontmatter(root), before)
+
+    # --- ordering probes (R2 recheck) --------------------------------------
+
+    async def test_staged_pre_cp2_with_wrong_identity_never_rewrites_metadata(self) -> None:
+        service, _ = self.build_service()
+        await service.ensure_generation(self.binding_id, self.spec)
+        root = self.generation_root()
+        self.write_legacy_artifact(root, template=L0_TEMPLATE, drop_rules_keys=True)
+        metadata_file = self.metadata_path(root)
+        metadata = json.loads(metadata_file.read_text(encoding="utf-8"))
+        # An identity field the legacy-rules guard cannot see, so only the strict
+        # expected-fields comparison rejects this state.
+        metadata["runtime_kind"] = "foreign-runtime"
+        metadata_file.write_text(json.dumps(metadata), encoding="utf-8")
+        tampered = metadata_file.read_bytes()
+        agent_bytes = self.agent_path(root).read_bytes()
+
+        with self.assertNoLogs(ADAPTER_LOGGER, level="INFO"):
+            with self.assertRaises(ProviderAdapterError) as caught:
+                await service.ensure_generation(self.binding_id, self.spec)
+
+        self.assertEqual(caught.exception.code, "agy_artifact_identity_mismatch")
+        # The pre-CP2 normalization must not have been persisted on the way to
+        # the fatal: metadata and declaration stay byte-unchanged.
+        self.assertEqual(metadata_file.read_bytes(), tampered)
+        self.assertEqual(self.agent_path(root).read_bytes(), agent_bytes)
+
+    async def test_active_pre_cp2_with_wrong_identity_never_rewrites_metadata(self) -> None:
+        service, _ = await self.activate()
+        root = self.generation_root()
+        self.write_legacy_artifact(root, template=L0_TEMPLATE, drop_rules_keys=True)
+        metadata_file = self.metadata_path(root)
+        metadata = json.loads(metadata_file.read_text(encoding="utf-8"))
+        metadata["bootstrap_fingerprint"] = "different-bootstrap"
+        metadata_file.write_text(json.dumps(metadata), encoding="utf-8")
+        tampered = metadata_file.read_bytes()
+        agent_bytes = self.agent_path(root).read_bytes()
+
+        with self.assertNoLogs(ADAPTER_LOGGER, level="INFO"):
+            events = await collect(service, self.binding_id, self.turn())
+
+        self.assertEqual(events[-1].payload, {"code": "agy_artifact_identity_mismatch"})
+        self.assertEqual(metadata_file.read_bytes(), tampered)
+        self.assertEqual(self.agent_path(root).read_bytes(), agent_bytes)
+
+    async def test_rules_owning_generation_cannot_upgrade_as_anchored_rules_free(self) -> None:
+        for label, drop_backing in (("backing-present", False), ("backing-removed", True)):
+            with self.subTest(disguise=label):
+                self.isolate(label)
+                spec = self.spec.model_copy(update={"project_rules": "PROJECT-RULES-CANARY"})
+                service, _ = await self.activate(spec=spec)
+                root = self.generation_root()
+                # The disguise: metadata declares rules-free explicitly, and the
+                # anchored declaration is a rules-free legacy shape carrying the
+                # real instructions.
+                if drop_backing:
+                    (root / "control" / PROJECT_RULES_ARTIFACT.canonical_name).unlink()
+                rules_free_body = render_agent_markdown(
+                    self.agent_name, self.system_canary, None
+                ).split("---\n", 2)[2]
+                pinned = (
+                    L3_TEMPLATE.format(agent_name=self.agent_name) + rules_free_body
+                ).encode("utf-8")
+                agent = self.agent_path(root)
+                agent.write_bytes(pinned)
+                metadata_file = self.metadata_path(root)
+                metadata = json.loads(metadata_file.read_text(encoding="utf-8"))
+                metadata["project_rules_present"] = False
+                metadata.pop("project_rules_sha256", None)
+                metadata["agent_markdown_sha256"] = hashlib.sha256(pinned).hexdigest()
+                metadata_file.write_text(json.dumps(metadata), encoding="utf-8")
+                tampered = metadata_file.read_bytes()
+
+                with self.assertNoLogs(ADAPTER_LOGGER, level="INFO"):
+                    events = await collect(service, self.binding_id, self.turn())
+
+                # The rules-derived identity is authenticated before the commit
+                # phase, so neither the declaration nor the metadata may have
+                # been upgraded on the way to the fatal.
+                self.assertEqual(
+                    events[-1].payload, {"code": "agy_artifact_identity_mismatch"}
+                )
+                self.assertEqual(agent.read_bytes(), pinned)
+                self.assertEqual(metadata_file.read_bytes(), tampered)
+
+    async def test_session_backfill_never_lands_before_identity_authentication(self) -> None:
+        service, _ = await self.activate()
+        root = self.generation_root()
+        metadata_file = self.metadata_path(root)
+        metadata = json.loads(metadata_file.read_text(encoding="utf-8"))
+        self.assertIsNotNone(metadata["provider_session_id"])
+        metadata["provider_session_id"] = None
+        metadata["bootstrap_fingerprint"] = "different-bootstrap"
+        metadata_file.write_text(json.dumps(metadata), encoding="utf-8")
+        tampered = metadata_file.read_bytes()
+        agent_bytes = self.agent_path(root).read_bytes()
+
+        with self.assertNoLogs(ADAPTER_LOGGER, level="INFO"):
+            events = await collect(service, self.binding_id, self.turn())
+
+        self.assertEqual(events[-1].payload, {"code": "agy_artifact_identity_mismatch"})
+        self.assertEqual(metadata_file.read_bytes(), tampered)
+        self.assertEqual(self.agent_path(root).read_bytes(), agent_bytes)
+
+    async def test_legitimate_backfill_and_rules_normalization_still_commit(self) -> None:
+        service, _ = await self.activate()
+        root = self.generation_root()
+        metadata_file = self.metadata_path(root)
+        metadata = json.loads(metadata_file.read_text(encoding="utf-8"))
+        recorded_session = metadata["provider_session_id"]
+        # A lost artifact session plus the pre-CP3 rules shape: both are legal
+        # commit-phase operations and must still land on an authenticated state.
+        metadata["provider_session_id"] = None
+        metadata.pop("project_rules_present", None)
+        metadata.pop("project_rules_sha256", None)
+        metadata_file.write_text(json.dumps(metadata), encoding="utf-8")
+
+        events = await collect(service, self.binding_id, self.turn())
+
+        self.assertEqual(events[-1].event_type, "done")
+        settled = json.loads(metadata_file.read_text(encoding="utf-8"))
+        self.assertEqual(settled["provider_session_id"], recorded_session)
+        self.assertIs(settled["project_rules_present"], False)
+        self.assertNotIn("project_rules_sha256", settled)
 
     # --- idempotency -------------------------------------------------------
 

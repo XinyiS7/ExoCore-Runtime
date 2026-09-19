@@ -517,7 +517,7 @@ class AntigravityAdapter:
         if rules_digest is not None:
             expected["project_rules_sha256"] = rules_digest
         if metadata_path.exists():
-            metadata = self._normalize_legacy_rules_metadata(
+            metadata, _rules_normalized = self._normalized_legacy_rules_metadata(
                 root,
                 self._read_json(metadata_path),
                 binding_id=binding_id,
@@ -559,11 +559,22 @@ class AntigravityAdapter:
         generation: GenerationRecord,
         options: ProcessExecutionOptions,
     ) -> GenerationLayout:
+        """Authenticate the generation's artifacts, then commit its upgrades.
+
+        Authentication is pure: the metadata record, the provider session, the
+        declaration and the rules axis are all proven before the first write,
+        so a fatal leaves ``generation.json`` and ``agent.md`` byte-unchanged and
+        no upgrade can be persisted on a state that the final verification would
+        reject. The final ``_verify_security_artifacts`` remains the authority;
+        the early checks are its authentication inputs, evaluated ahead of the
+        commit phase.
+        """
+
         self._validate_process_options(options)
         root = self._generation_root(generation.binding_id)
         metadata_path = root / "generation.json"
         if metadata_path.exists():
-            metadata = self._normalize_legacy_rules_metadata(
+            metadata, rules_normalized = self._normalized_legacy_rules_metadata(
                 root,
                 self._read_json(metadata_path),
                 binding_id=generation.binding_id,
@@ -574,6 +585,8 @@ class AntigravityAdapter:
             )
         else:
             metadata = self._rebuild_missing_metadata(root, generation)
+            rules_normalized = False
+        self._require_matching_identity_fields(generation, metadata)
         artifact_session = metadata.get("provider_session_id")
         if artifact_session is not None and not isinstance(artifact_session, str):
             raise ProviderAdapterError("agy_generation_artifact_invalid", fatal_generation=True)
@@ -583,10 +596,17 @@ class AntigravityAdapter:
             and artifact_session != generation.provider_session_id
         ):
             raise ProviderAdapterError("agy_artifact_session_conflict", fatal_generation=True)
-        if artifact_session is None and generation.provider_session_id is not None:
-            metadata["provider_session_id"] = generation.provider_session_id
-            self._atomic_write_json(metadata_path, metadata)
         agent_markdown, upgrade = self._resolve_agent_markdown(root, metadata, generation)
+        self._require_authenticated_rules_identity(root, generation, metadata)
+        backfill_session = (
+            artifact_session is None and generation.provider_session_id is not None
+        )
+        if backfill_session:
+            metadata["provider_session_id"] = generation.provider_session_id
+        if upgrade is not None:
+            metadata["agent_markdown_sha256"] = upgrade.current_hash
+        if rules_normalized or backfill_session or upgrade is not None:
+            self._atomic_write_json(metadata_path, metadata)
         self._restore_security_artifacts(root, metadata, agent_markdown)
         self._restore_reserved_control_artifacts(root, metadata)
         self._verify_security_artifacts(root, generation, metadata)
@@ -658,7 +678,7 @@ class AntigravityAdapter:
         self._atomic_write_json(root / "generation.json", metadata)
         return metadata
 
-    def _normalize_legacy_rules_metadata(
+    def _normalized_legacy_rules_metadata(
         self,
         root: Path,
         metadata: dict[str, object],
@@ -668,20 +688,22 @@ class AntigravityAdapter:
         bootstrap_fingerprint: str,
         system_instructions_digest: str,
         expected_identity_hash: str,
-    ) -> dict[str, object]:
-        """Upgrade a pre-CP3 (rules-free) metadata file to the CP3 absent shape.
+    ) -> tuple[dict[str, object], bool]:
+        """Compute the pre-CP3 (rules-free) metadata upgrade without writing it.
 
         A generation created before project rules existed carries no rules keys,
         no canonical rules backing, and a durable identity that is exactly the
-        rules-free identity. Missing keys then mean "absent" and the file is
-        rewritten deterministically in the CP3 shape without rotating identity.
+        rules-free identity. Missing keys then mean "absent" and the returned
+        dict is the deterministic CP3 shape without rotating identity; the second
+        element reports that it differs from the on-disk record so the caller can
+        persist it once every other authentication step has passed.
 
         Every other missing-key situation fails closed: a rules-present
         generation must never silently degrade into a rules-free one (R1-03).
         """
 
         if "project_rules_present" in metadata or "project_rules_sha256" in metadata:
-            return metadata
+            return metadata, False
         legacy_identity = generation_identity_parts(
             runtime_kind=runtime_kind,
             bootstrap_fingerprint=bootstrap_fingerprint,
@@ -703,9 +725,7 @@ class AntigravityAdapter:
             raise ProviderAdapterError(
                 "agy_generation_artifact_invalid", fatal_generation=True
             )
-        normalized = {**metadata, "project_rules_present": False}
-        self._atomic_write_json(root / "generation.json", normalized)
-        return normalized
+        return {**metadata, "project_rules_present": False}, True
 
     def _resolve_agent_markdown(
         self,
@@ -761,9 +781,10 @@ class AntigravityAdapter:
 
         Only the Runtime-owned declaration is re-rendered: the instructions body
         and the project rules are taken from the verified file itself, so they
-        still have to satisfy their own integrity anchors. The recorded artifact
-        hash is updated atomically; the caller writes the file through the
-        ordinary security-artifact restore.
+        still have to satisfy their own integrity anchors. Nothing is written
+        here; the caller records the returned hash and materializes the returned
+        declaration once every authentication step has passed, so a fatal never
+        leaves a half-upgraded generation behind.
         """
 
         for legacy_tools in LEGACY_AGENT_TOOLSETS:
@@ -787,8 +808,6 @@ class AntigravityAdapter:
             current = render_agent_markdown(agent_name, instructions, project_rules)
             previous_hash = str(metadata.get("agent_markdown_sha256"))
             current_hash = hashlib.sha256(current.encode("utf-8")).hexdigest()
-            metadata["agent_markdown_sha256"] = current_hash
-            self._atomic_write_json(root / "generation.json", metadata)
             return current, _AgentDeclarationUpgrade(
                 generation_id=str(metadata.get("generation_id", "")),
                 legacy_shape=_declaration_shape_label(legacy_tools),
@@ -880,6 +899,51 @@ class AntigravityAdapter:
             )
         except ValueError:
             return None
+
+    def _require_authenticated_rules_identity(
+        self,
+        root: Path,
+        generation: GenerationRecord,
+        metadata: dict[str, object],
+    ) -> str | None:
+        """Prove the rules axis of the identity before any upgrade may write.
+
+        The declared rules presence selects which canonical body, which
+        declaration shapes and which rules-derived identity the rest of the
+        layout is allowed to use, so it is authenticated ahead of the commit
+        phase and not only in the final verification. ``_verify_security_artifacts``
+        repeats these predicates as the last authority; the early copy exists so
+        a fatal can no longer land after a write. Materialized-copy verification
+        stays late by design: those artifacts are healed from the canonical body
+        rather than treated as an authentication input.
+        """
+
+        project_rules = self._canonical_project_rules(root, metadata)
+        expected_rules_digest = project_rules_identity_digest(project_rules)
+        if (
+            generation_identity_parts(
+                runtime_kind=generation.runtime_kind,
+                bootstrap_fingerprint=generation.bootstrap_fingerprint,
+                system_instructions_digest=generation.system_instructions_sha256,
+                project_rules_digest=expected_rules_digest,
+            )
+            != generation.identity_hash
+        ):
+            # A rules-present durable identity can never be reproduced from
+            # metadata that resolves to "no rules" (R1-03 masquerade guard).
+            raise ProviderAdapterError(
+                "agy_artifact_identity_mismatch", fatal_generation=True
+            )
+        stored_rules_digest = metadata.get("project_rules_sha256")
+        if expected_rules_digest is None:
+            # CP3 rules-absent metadata omits the digest; the pre-repair absent
+            # digest is tolerated so early CP3 artifacts are not declared broken.
+            rules_ok = stored_rules_digest in (None, project_rules_absent_digest())
+        else:
+            rules_ok = stored_rules_digest == expected_rules_digest
+        if not rules_ok:
+            raise ProviderAdapterError("agy_artifact_identity_mismatch", fatal_generation=True)
+        return project_rules
 
     @staticmethod
     def _has_canonical_project_rules(root: Path) -> bool:
