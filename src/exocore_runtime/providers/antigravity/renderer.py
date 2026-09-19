@@ -28,6 +28,24 @@ AGENT_TOOLS = (
     "search_web",
 )
 
+# Declaration history: every tool set this runtime has ever materialized into a
+# generation-private agent.md, oldest first. ``None`` is the pre-CP2 shape with
+# no ``tools:`` key at all; an empty tuple was never shipped and is not
+# renderable. The last entry must equal ``AGENT_TOOLS``, and the entries before
+# it are the only legacy declarations an existing artifact may be upgraded from
+# (see ``AntigravityAdapter._resolve_agent_markdown``).
+#
+# Changing ``AGENT_TOOLS`` therefore requires two companion edits: append the
+# predecessor here, and bump ``SECURITY_POLICY_REVISION`` so an already-live
+# process cannot keep serving the old declaration. Both halves are enforced by
+# the test suite (tests/unit/test_agent_declaration_history.py).
+AGENT_TOOLSET_HISTORY: tuple[tuple[str, ...] | None, ...] = (
+    None,
+    ("view_file", "write_to_file", "run_command"),
+    ("view_file", "write_to_file", "run_command", "search_web"),
+)
+LEGACY_AGENT_TOOLSETS: tuple[tuple[str, ...] | None, ...] = AGENT_TOOLSET_HISTORY[:-1]
+
 # Official fine-grained permission semantics are Deny > Ask > Allow, so the
 # deny list (not the tool declaration) decides what an exposed tool may do.
 # Captured 1.2.5 evidence: keeping ``unsandboxed(*)`` denies every ``command``
@@ -81,6 +99,15 @@ def generation_agent_name(binding_id: str) -> str:
 # model context is derived from.
 PROJECT_RULES_HEADING = "## ExoCore Project Rules"
 
+# Sentinel for "use the live current policy" in the extraction helper: the
+# legacy recognizer must be able to ask for ``tools=None`` (the pre-CP2 shape)
+# without colliding with that default.
+class _CurrentTools:
+    """Type of the "live ``AGENT_TOOLS``" selector used by extraction."""
+
+
+_CURRENT_TOOLS = _CurrentTools()
+
 # The rules section sits between the instructions body and the transport
 # envelope, separated by a blank line on both sides. The marker is a private
 # constant so the heading text itself cannot be mistaken for a rule body.
@@ -95,14 +122,14 @@ def render_agent_markdown(
     body = system_instructions.strip()
     if project_rules is None:
         return (
-            _agent_markdown_prefix(agent_name)
+            _agent_markdown_prefix(agent_name, AGENT_TOOLS)
             + body
             + "\n\n"
             + _TRANSPORT_INSTRUCTIONS
             + "\n"
         )
     return (
-        _agent_markdown_prefix(agent_name)
+        _agent_markdown_prefix(agent_name, AGENT_TOOLS)
         + body
         + _PROJECT_RULES_BLOCK_PREFIX
         + project_rules
@@ -117,6 +144,7 @@ def extract_rendered_system_instructions(
     markdown: str,
     *,
     project_rules: str | None = None,
+    tools: tuple[str, ...] | None | _CurrentTools = _CURRENT_TOOLS,
 ) -> str:
     """Recover the system instructions body, strictly shaped by the rules value.
 
@@ -125,12 +153,21 @@ def extract_rendered_system_instructions(
     split unambiguous: the returning body never has to be guessed from marker
     text that the instructions themselves could contain.
 
+    ``tools`` selects which declaration shape the framing must match: the
+    default is the live ``AGENT_TOOLS`` policy, ``None`` is the pre-CP2 shape
+    without a ``tools:`` key, and an explicit tuple is one historical shape.
+    Legacy recognition relies on this; the default path is byte-identical to
+    the pre-upgrade behavior.
+
     A rules-present generation is recovered only when the middle ends with
     exactly the expected rules section; a rules-free generation recovers the
     middle as-is (no marker scanning, see R1-02).
     """
 
-    prefix = _agent_markdown_prefix(agent_name)
+    prefix = _agent_markdown_prefix(
+        agent_name,
+        AGENT_TOOLS if tools is _CURRENT_TOOLS else tools,
+    )
     suffix = "\n\n" + _TRANSPORT_INSTRUCTIONS + "\n"
     if not markdown.startswith(prefix) or not markdown.endswith(suffix):
         raise ValueError("custom agent markdown structure is invalid")
@@ -151,13 +188,25 @@ def extract_rendered_system_instructions(
     return instructions
 
 
-def _agent_markdown_prefix(agent_name: str) -> str:
-    tools_block = "".join(f"  - {tool}\n" for tool in AGENT_TOOLS)
+def _agent_markdown_prefix(agent_name: str, tools: tuple[str, ...] | None) -> str:
+    """Render one declaration shape's frontmatter.
+
+    ``tools=None`` renders the pre-CP2 shape without a ``tools:`` key; an empty
+    tuple is not a declaration this runtime ever shipped and raises instead of
+    silently producing an empty block. The current-policy callers pass the live
+    ``AGENT_TOOLS`` so a test patch of that constant is still honored.
+    """
+
+    if tools is None:
+        tools_block = ""
+    else:
+        if not tools:
+            raise ValueError("an empty tool declaration is not renderable")
+        tools_block = "tools:\n" + "".join(f"  - {tool}\n" for tool in tools)
     return (
         "---\n"
         f"name: {agent_name}\n"
         "description: ExoCore generation-private subscription runtime agent.\n"
-        "tools:\n"
         f"{tools_block}"
         "---\n"
     )

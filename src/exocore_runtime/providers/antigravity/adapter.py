@@ -7,6 +7,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import shutil
@@ -46,8 +47,10 @@ from exocore_runtime.providers.antigravity.process import (
     GenerationLayout,
 )
 from exocore_runtime.providers.antigravity.renderer import (
+    AGENT_TOOLS,
     ALLOW_POLICY,
     DENY_POLICY,
+    LEGACY_AGENT_TOOLSETS,
     MCP_SERVER_NAME,
     extract_rendered_system_instructions,
     generation_agent_name,
@@ -59,6 +62,27 @@ from exocore_runtime.providers.base import (
     ProviderCancelReceipt,
 )
 from exocore_runtime.state_store import GenerationRecord
+
+
+_LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _AgentDeclarationUpgrade:
+    """One authenticated legacy -> current agent declaration transition."""
+
+    generation_id: str
+    legacy_shape: str
+    previous_hash: str
+    current_hash: str
+
+
+def _declaration_shape_label(tools: tuple[str, ...] | None) -> str:
+    """Stable label for a declaration shape in the upgrade log line."""
+
+    if tools is None:
+        return "pre-cp2-no-tools-block"
+    return "tools:" + ",".join(tools)
 
 
 @dataclass
@@ -504,10 +528,18 @@ class AntigravityAdapter:
                 ),
                 expected_identity_hash=identity_hash,
             )
+            upgrade = self._normalize_staged_legacy_declaration(
+                root,
+                metadata,
+                expected,
+                spec=spec,
+                agent_name=agent_name,
+            )
             if any(metadata.get(key) != value for key, value in expected.items()):
                 raise ProviderAdapterError("agy_artifact_identity_mismatch", fatal_generation=True)
         else:
             metadata = {**expected, "provider_session_id": None}
+            upgrade = None
         self._restore_security_artifacts(root, metadata, agent_markdown)
         if spec.project_rules is not None:
             # The canonical body is the only durable store of the rules; the
@@ -517,6 +549,10 @@ class AntigravityAdapter:
                 spec.project_rules,
             )
         self._atomic_write_json(metadata_path, metadata)
+        if upgrade is not None:
+            # The success line is emission-gated on the declaration and metadata
+            # writes having completed, so a torn upgrade stays unreported.
+            self._log_declaration_upgrade(binding_id, upgrade)
 
     def _load_layout(
         self,
@@ -550,10 +586,15 @@ class AntigravityAdapter:
         if artifact_session is None and generation.provider_session_id is not None:
             metadata["provider_session_id"] = generation.provider_session_id
             self._atomic_write_json(metadata_path, metadata)
-        agent_markdown = self._canonical_agent_markdown(root, metadata, generation)
+        agent_markdown, upgrade = self._resolve_agent_markdown(root, metadata, generation)
         self._restore_security_artifacts(root, metadata, agent_markdown)
         self._restore_reserved_control_artifacts(root, metadata)
         self._verify_security_artifacts(root, generation, metadata)
+        if upgrade is not None:
+            # Only after the declaration, its recorded hash and the final
+            # security-artifact verification have all converged is the upgrade
+            # allowed to be reported as successful.
+            self._log_declaration_upgrade(generation.binding_id, upgrade)
         return self._layout_from_metadata(root, metadata, options)
 
     def _rebuild_missing_metadata(
@@ -666,27 +707,234 @@ class AntigravityAdapter:
         self._atomic_write_json(root / "generation.json", normalized)
         return normalized
 
-    def _canonical_agent_markdown(
+    def _resolve_agent_markdown(
         self,
         root: Path,
         metadata: dict[str, object],
         generation: GenerationRecord,
-    ) -> str:
+    ) -> tuple[str, _AgentDeclarationUpgrade | None]:
+        """Return this generation's declaration, upgrading a known legacy shape.
+
+        The current policy shape is returned byte-identically and writes
+        nothing. Any other file is only considered as a legacy declaration when
+        it is provably the untouched artifact recorded in ``generation.json``
+        (its bytes hash to the durable ``agent_markdown_sha256``) and matches one
+        of the frozen historical declarations carrying the generation's own
+        instructions and rules. Everything else keeps failing closed exactly as
+        before, so an arbitrary edit cannot masquerade as a policy upgrade.
+        """
+
         agent_name = str(metadata.get("agent_name", ""))
         path = root / "profile" / ".gemini" / "config" / "agents" / agent_name / "agent.md"
         project_rules = self._canonical_project_rules(root, metadata)
         try:
-            content = path.read_text(encoding="utf-8")
-            rendered = extract_rendered_system_instructions(
+            raw = path.read_bytes()
+            content = raw.decode("utf-8", errors="strict")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise ProviderAdapterError("agy_custom_agent_invalid", fatal_generation=True) from exc
+        if self._declaration_instructions(content, agent_name, AGENT_TOOLS, project_rules) is not None:
+            return content, None
+        self._require_matching_identity_fields(generation, metadata)
+        durable_hash = metadata.get("agent_markdown_sha256")
+        if not isinstance(durable_hash, str) or hashlib.sha256(raw).hexdigest() != durable_hash:
+            raise ProviderAdapterError("agy_custom_agent_invalid", fatal_generation=True)
+        return self._upgrade_legacy_declaration(
+            root,
+            content,
+            metadata,
+            agent_name=agent_name,
+            project_rules=project_rules,
+            generation=generation,
+        )
+
+    def _upgrade_legacy_declaration(
+        self,
+        root: Path,
+        content: str,
+        metadata: dict[str, object],
+        *,
+        agent_name: str,
+        project_rules: str | None,
+        generation: GenerationRecord,
+    ) -> tuple[str, _AgentDeclarationUpgrade]:
+        """Re-render a recognized legacy declaration onto the current policy.
+
+        Only the Runtime-owned declaration is re-rendered: the instructions body
+        and the project rules are taken from the verified file itself, so they
+        still have to satisfy their own integrity anchors. The recorded artifact
+        hash is updated atomically; the caller writes the file through the
+        ordinary security-artifact restore.
+        """
+
+        for legacy_tools in LEGACY_AGENT_TOOLSETS:
+            if legacy_tools is None and (
+                project_rules is not None or self._has_canonical_project_rules(root)
+            ):
+                # The pre-CP2 declaration never shipped alongside project rules;
+                # accepting that combination would frame-match a file the
+                # runtime never produced.
+                continue
+            instructions = self._declaration_instructions(
+                content, agent_name, legacy_tools, project_rules
+            )
+            if instructions is None:
+                continue
+            if (
+                hashlib.sha256(instructions.encode("utf-8")).hexdigest()
+                != generation.system_instructions_sha256
+            ):
+                raise ProviderAdapterError("agy_custom_agent_invalid", fatal_generation=True)
+            current = render_agent_markdown(agent_name, instructions, project_rules)
+            previous_hash = str(metadata.get("agent_markdown_sha256"))
+            current_hash = hashlib.sha256(current.encode("utf-8")).hexdigest()
+            metadata["agent_markdown_sha256"] = current_hash
+            self._atomic_write_json(root / "generation.json", metadata)
+            return current, _AgentDeclarationUpgrade(
+                generation_id=str(metadata.get("generation_id", "")),
+                legacy_shape=_declaration_shape_label(legacy_tools),
+                previous_hash=previous_hash,
+                current_hash=current_hash,
+            )
+        raise ProviderAdapterError("agy_custom_agent_invalid", fatal_generation=True)
+
+    def _normalize_staged_legacy_declaration(
+        self,
+        root: Path,
+        metadata: dict[str, object],
+        expected: dict[str, object],
+        *,
+        spec: GenerationSpec,
+        agent_name: str,
+    ) -> _AgentDeclarationUpgrade | None:
+        """Bring a staged legacy declaration forward before the strict compare.
+
+        Every non-hash identity field must already match the generation this
+        stage call describes, so a metadata file with wrong identity can never
+        be partially rewritten on its way to the final fatal. Only the recorded
+        declaration hash changes, and only for an on-disk artifact that is
+        exactly what that hash recorded and matches a frozen historical shape
+        with this spec's instructions verbatim.
+        """
+
+        current_hash = str(expected["agent_markdown_sha256"])
+        recorded_hash = metadata.get("agent_markdown_sha256")
+        if recorded_hash == current_hash:
+            return None
+        non_hash = {
+            key: value for key, value in expected.items() if key != "agent_markdown_sha256"
+        }
+        if (
+            not isinstance(recorded_hash, str)
+            or any(metadata.get(key) != value for key, value in non_hash.items())
+        ):
+            raise ProviderAdapterError("agy_artifact_identity_mismatch", fatal_generation=True)
+        path = root / "profile" / ".gemini" / "config" / "agents" / agent_name / "agent.md"
+        try:
+            raw = path.read_bytes()
+            content = raw.decode("utf-8", errors="strict")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise ProviderAdapterError(
+                "agy_artifact_identity_mismatch", fatal_generation=True
+            ) from exc
+        if hashlib.sha256(raw).hexdigest() != recorded_hash:
+            raise ProviderAdapterError("agy_artifact_identity_mismatch", fatal_generation=True)
+        expected_body = spec.system_instructions.strip()
+        for legacy_tools in LEGACY_AGENT_TOOLSETS:
+            if legacy_tools is None and (
+                spec.project_rules is not None or self._has_canonical_project_rules(root)
+            ):
+                continue
+            instructions = self._declaration_instructions(
+                content, agent_name, legacy_tools, spec.project_rules
+            )
+            if instructions is None:
+                continue
+            if instructions != expected_body:
+                raise ProviderAdapterError(
+                    "agy_artifact_identity_mismatch", fatal_generation=True
+                )
+            metadata["agent_markdown_sha256"] = current_hash
+            return _AgentDeclarationUpgrade(
+                generation_id=str(expected["generation_id"]),
+                legacy_shape=_declaration_shape_label(legacy_tools),
+                previous_hash=recorded_hash,
+                current_hash=current_hash,
+            )
+        raise ProviderAdapterError("agy_artifact_identity_mismatch", fatal_generation=True)
+
+    @staticmethod
+    def _declaration_instructions(
+        content: str,
+        agent_name: str,
+        tools: tuple[str, ...] | None,
+        project_rules: str | None,
+    ) -> str | None:
+        """Extract the instructions body for one declaration shape, or None."""
+
+        try:
+            return extract_rendered_system_instructions(
                 agent_name,
                 content,
                 project_rules=project_rules,
+                tools=tools,
             )
-        except (OSError, UnicodeDecodeError, ValueError) as exc:
-            raise ProviderAdapterError("agy_custom_agent_invalid", fatal_generation=True) from exc
-        if hashlib.sha256(rendered.encode("utf-8")).hexdigest() != generation.system_instructions_sha256:
-            raise ProviderAdapterError("agy_custom_agent_invalid", fatal_generation=True)
-        return content
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _has_canonical_project_rules(root: Path) -> bool:
+        return (
+            CanonicalControlStore(root).read_canonical_if_present(
+                PROJECT_RULES_ARTIFACT.canonical_name
+            )
+            is not None
+        )
+
+    @staticmethod
+    def _log_declaration_upgrade(
+        binding_id: str,
+        upgrade: _AgentDeclarationUpgrade,
+    ) -> None:
+        """Report one converged declaration upgrade (no content, no paths)."""
+
+        _LOGGER.info(
+            "agy agent declaration upgraded: binding=%s generation=%s shape=%s %s->%s",
+            binding_id,
+            upgrade.generation_id,
+            upgrade.legacy_shape,
+            upgrade.previous_hash[:12],
+            upgrade.current_hash[:12],
+        )
+
+    def _expected_identity_fields(self, generation: GenerationRecord) -> dict[str, object]:
+        """Durable metadata fields a generation's artifact must agree with."""
+
+        return {
+            "schema_version": "v2",
+            "binding_id": generation.binding_id,
+            "runtime_kind": generation.runtime_kind,
+            "bootstrap_fingerprint": generation.bootstrap_fingerprint,
+            "system_instructions_sha256": generation.system_instructions_sha256,
+            "agent_name": generation_agent_name(generation.binding_id),
+            "generation_id": self._generation_id(
+                generation.binding_id,
+                generation.identity_hash,
+            ),
+            "identity_hash": generation.identity_hash,
+        }
+
+    def _require_matching_identity_fields(
+        self,
+        generation: GenerationRecord,
+        metadata: dict[str, object],
+    ) -> None:
+        """Prove the non-hash identity fields before any upgrade may write."""
+
+        if any(
+            metadata.get(key) != value
+            for key, value in self._expected_identity_fields(generation).items()
+        ):
+            raise ProviderAdapterError("agy_artifact_identity_mismatch", fatal_generation=True)
 
     @staticmethod
     def _validate_process_options(options: ProcessExecutionOptions) -> None:
@@ -823,19 +1071,7 @@ class AntigravityAdapter:
         generation_id = metadata.get("generation_id")
         agent_hash = metadata.get("agent_markdown_sha256")
         system_hash = metadata.get("system_instructions_sha256")
-        expected_fields = {
-            "schema_version": "v2",
-            "binding_id": generation.binding_id,
-            "runtime_kind": generation.runtime_kind,
-            "bootstrap_fingerprint": generation.bootstrap_fingerprint,
-            "system_instructions_sha256": generation.system_instructions_sha256,
-            "agent_name": generation_agent_name(generation.binding_id),
-            "generation_id": self._generation_id(
-                generation.binding_id,
-                generation.identity_hash,
-            ),
-            "identity_hash": generation.identity_hash,
-        }
+        expected_fields = self._expected_identity_fields(generation)
         if (
             not isinstance(generation_id, str)
             or not isinstance(agent_hash, str)
