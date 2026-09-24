@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 
 from exocore_runtime.contracts import ContinuityDeltaTurn, TurnRequest
+from exocore_runtime.providers.antigravity.mcp_policy import MCP_SERVER_NAME
 
 
 # Native tool exposure for the custom agent: the explicitly declared workload
@@ -55,7 +56,9 @@ LEGACY_AGENT_TOOLSETS: tuple[tuple[str, ...] | None, ...] = AGENT_TOOLSET_HISTOR
 # travel through the URL permission families.
 # CP5 exposes exactly one generation-private MCP server; Deny > Allow means the
 # old global `mcp(*)` deny must be removed before a server-scoped allow can work.
-MCP_SERVER_NAME = "exocore-memory"
+# The server name itself lives in ``mcp_policy`` so this renderer and the NDJSON
+# normalizer share one fact source; it stays re-exported here for the adapter and
+# integration tests that import it from this module.
 ALLOW_POLICY = (f"mcp({MCP_SERVER_NAME}/*)",)
 # AGY 1.2.6 contains a built-in Chrome-DevTools MCP surface. Both permission
 # spellings are embedded by the official binary, so deny both aliases explicitly:

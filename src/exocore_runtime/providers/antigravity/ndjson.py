@@ -8,6 +8,10 @@ from typing import Any
 
 from exocore_runtime.contracts import ProviderEvent, ProviderGeneration
 from exocore_runtime.errors import ProviderAdapterError
+from exocore_runtime.providers.antigravity.mcp_policy import (
+    MCP_SERVER_NAME,
+    MCP_TOOL_DISPLAY_ALLOWLIST,
+)
 
 
 _LIFECYCLE_STEP_TYPES = frozenset({"user_input", "checkpoint", "system_message"})
@@ -54,6 +58,45 @@ def _finite_duration(value: object) -> float | None:
     if not math.isfinite(duration) or duration < 0:
         return None
     return duration
+
+
+# The one AGY provider tool whose real identity is hidden behind a generic
+# dispatcher name. Every other provider tool name is already its own identity.
+_MCP_DISPATCH_TOOL_NAME = "call_mcp_tool"
+
+
+def _project_display_tool_name(provider_tool_name: str, tool_info: object) -> str:
+    """Project a bounded provider tool name for safe display.
+
+    Native tool names pass through unchanged. ``call_mcp_tool`` is the only
+    provider tool that carries its real identity in ``tool_info.parameters``,
+    and it resolves to a Memory short name only when every frozen condition
+    holds at once: ``tool_info`` is an object, ``tool_info.parameters`` is an
+    object, ``ServerName`` is exactly ``MCP_SERVER_NAME``, and ``ToolName``
+    exactly matches the Runtime display allowlist (``mcp_policy``'s
+    ``MCP_TOOL_DISPLAY_ALLOWLIST``, mirroring ExoCore's
+    ``RUNTIME_BINDING_TOOL_NAMES``).
+
+    Anything else - missing or malformed ``tool_info``, another server, an
+    unknown, non-string, or future tool name - degrades to the generic
+    dispatcher name instead of failing the turn. This projection is display
+    only: it grants no execution authority and must never be treated as proof
+    that a tool ran.
+    """
+
+    if provider_tool_name != _MCP_DISPATCH_TOOL_NAME:
+        return provider_tool_name
+    if not isinstance(tool_info, dict):
+        return provider_tool_name
+    parameters = tool_info.get("parameters")
+    if not isinstance(parameters, dict):
+        return provider_tool_name
+    if parameters.get("ServerName") != MCP_SERVER_NAME:
+        return provider_tool_name
+    tool_name = parameters.get("ToolName")
+    if not isinstance(tool_name, str) or tool_name not in MCP_TOOL_DISPLAY_ALLOWLIST:
+        return provider_tool_name
+    return tool_name
 
 
 def parse_line(line: bytes) -> dict[str, Any]:
@@ -166,16 +209,22 @@ class AgyTurnNormalizer:
                 raise ProviderAdapterError("agy_unknown_step", terminal_status="indeterminate")
             return [ProviderEvent(event_type="lifecycle", payload=lifecycle)]
         if step_type == "tool":
-            # Bounded lifecycle only: the tool name is a short provider-declared
-            # identifier, while tool_info (parameters, output, error bodies)
-            # must never reach a ProviderEvent or the durable journal. Capture
-            # evidence: tests/fixtures/agy_1_2_5_tool_success.jsonl and
-            # agy_1_2_5_tool_failure.jsonl.
+            # Bounded lifecycle only: the projected tool name is a short
+            # provider-declared identifier or a whitelisted Memory short name,
+            # while tool_info (parameters, output, error bodies) must never
+            # reach a ProviderEvent or the durable journal. The raw name stays
+            # the fail-closed bound; only ``_project_display_tool_name`` may
+            # rewrite a generic ``call_mcp_tool`` into its frozen Memory
+            # identity. Capture evidence:
+            # tests/fixtures/agy_1_2_5_tool_success.jsonl,
+            # agy_1_2_5_tool_failure.jsonl, agy_1_2_7_mcp_success.jsonl.
             raw_tool_name = step.get("tool_name")
             if not isinstance(raw_tool_name, str) or not (1 <= len(raw_tool_name) <= 100):
                 raise ProviderAdapterError("agy_malformed_step", terminal_status="indeterminate")
             lifecycle["category"] = "provider_tool"
-            lifecycle["tool_name"] = raw_tool_name
+            lifecycle["tool_name"] = _project_display_tool_name(
+                raw_tool_name, step.get("tool_info")
+            )
             duration = _finite_duration(step.get("duration_seconds"))
             if duration is not None:
                 lifecycle["duration_seconds"] = duration
