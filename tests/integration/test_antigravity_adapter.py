@@ -83,6 +83,7 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
             "FAKE_AGY_EVIDENCE": str(self.evidence_path),
             "FAKE_AGY_CONVERSATION": "11111111-2222-3333-4444-555555555555",
             "FAKE_AGY_RELEASE_TAIL": str(self.root / "tail-release"),
+            "FAKE_AGY_QUOTA_MARKER": str(self.root / "quota-retry-marker"),
             "PYTHONPATH": str(Path(__file__).resolve().parents[2] / "src"),
         }
         process_config = AgyProcessConfig(
@@ -980,6 +981,48 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
                 self.state_path = original_state
                 self.data_root = original_data
                 self.evidence_path = original_evidence
+
+    async def test_cold_start_quota_probe_retries_and_then_succeeds(self) -> None:
+        # A cold CLI can fail the first ``/quota`` probe transiently (token
+        # refresh / warm-up). The bounded retry must absorb it, leaving the
+        # generation usable with a correct quota snapshot.
+        service, adapter = self.build_service("quota_retry")
+        await service.ensure_generation(self.binding_id, self.spec)
+
+        events = await collect(
+            service,
+            self.binding_id,
+            self.turn(bootstrap={"history": []}),
+        )
+
+        self.assertEqual(events[-1].event_type, "done")
+        self.assertEqual(
+            len([item for item in self.evidence() if item["kind"] == "quota"]), 2
+        )
+        self.assertEqual(
+            adapter.supervisor.quota_snapshot, {"weekly": 84, "5h": 93}
+        )
+        self.assertTrue(any(item["kind"] == "spawn" for item in self.evidence()))
+
+    async def test_cold_start_quota_probe_exhaustion_stays_fail_closed(self) -> None:
+        # ``auth_missing`` is the fixture's always-failing ``/quota`` scenario.
+        # Exhausting the bounded attempts must keep the original fail-closed
+        # outcome: same code, exactly three attempts, nothing spawned.
+        service, _ = self.build_service("auth_missing")
+        await service.ensure_generation(self.binding_id, self.spec)
+
+        events = await collect(
+            service,
+            self.binding_id,
+            self.turn(bootstrap={"history": []}),
+        )
+
+        self.assertEqual(events[-1].payload, {"code": "agy_auth_unavailable"})
+        self.assertEqual(
+            len([item for item in self.evidence() if item["kind"] == "quota"]), 3
+        )
+        self.assertFalse(any(item["kind"] == "turn" for item in self.evidence()))
+        self.assertFalse(any(item["kind"] == "spawn" for item in self.evidence()))
 
     async def test_shutdown_attempts_mailbox_cleanup_when_supervisor_cleanup_reports_failure(self) -> None:
         service, adapter = self.build_service()

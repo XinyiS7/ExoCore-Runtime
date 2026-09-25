@@ -8,6 +8,7 @@ import ctypes
 from ctypes import wintypes
 from dataclasses import dataclass, field
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -43,12 +44,20 @@ _FORBIDDEN_AUTH_ENV = frozenset(
     }
 )
 _VERSION_PATTERN = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
+_LOGGER = logging.getLogger(__name__)
 _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
 _PROCESS_TERMINATE = 0x0001
 _PROCESS_SET_QUOTA = 0x0100
 _GATEWAY_CRASH_JOB_HANDLE: int | None = None
 _GATEWAY_CRASH_JOB_LOCK = threading.Lock()
+
+# The ``/quota`` preflight probe is the only preflight step with a known
+# transient cold-start failure mode (first probe stalls on token refresh /
+# warm-up until the bounded timeout). Retries stay bounded and fixed-backoff so
+# a real outage still fails closed with the same error code.
+QUOTA_PREFLIGHT_ATTEMPTS = 3
+QUOTA_PREFLIGHT_BACKOFF_SECONDS = 2.0
 
 
 class _JobObjectBasicLimitInformation(ctypes.Structure):
@@ -556,14 +565,51 @@ class AgyProcessSupervisor:
                 allow_stderr=True,
             )
             self.available_model_slugs = self._parse_models(models_stdout)
-            quota_stdout = await self._run_bounded(
-                (*self.config.command_prefix, "-p", "/quota", "--output-format", "json"),
-                environment,
-                workspace,
-                "agy_auth_unavailable",
-            )
-            self.quota_snapshot = self._parse_quota(quota_stdout)
+            self.quota_snapshot = await self._probe_quota_snapshot(environment, workspace)
             self._preflight_complete = True
+
+    async def _probe_quota_snapshot(
+        self, environment: dict[str, str], workspace: Path
+    ) -> dict[str, int]:
+        """Run the ``/quota`` probe and parse it, with bounded retries.
+
+        Only ``agy_auth_unavailable`` is absorbed: it is the single code this
+        probe can raise (bounded timeout, non-zero exit, stderr, or an
+        unparsable payload), and a cold CLI can fail the first attempt
+        transiently. Any other code propagates immediately, and exhausting the
+        attempts re-raises the same code, so fail-closed behaviour is unchanged.
+        ``--version`` and ``models`` stay single-attempt: they have no
+        equivalent transient failure mode.
+        """
+
+        attempts_left = QUOTA_PREFLIGHT_ATTEMPTS
+        while True:
+            try:
+                quota_stdout = await self._run_bounded(
+                    (
+                        *self.config.command_prefix,
+                        "-p",
+                        "/quota",
+                        "--output-format",
+                        "json",
+                    ),
+                    environment,
+                    workspace,
+                    "agy_auth_unavailable",
+                )
+                return self._parse_quota(quota_stdout)
+            except ProviderAdapterError as exc:
+                if exc.code != "agy_auth_unavailable":
+                    raise
+                attempts_left -= 1
+                if attempts_left <= 0:
+                    raise
+                _LOGGER.warning(
+                    "[agy-preflight] /quota probe failed (%s); retrying in %ss",
+                    exc.code,
+                    QUOTA_PREFLIGHT_BACKOFF_SECONDS,
+                )
+                await asyncio.sleep(QUOTA_PREFLIGHT_BACKOFF_SECONDS)
 
     def _validate_executable(self) -> None:
         if not self.config.require_official_executable:

@@ -106,6 +106,13 @@ def quota_response():
     }
 
 
+def quota_retry_marker() -> Path:
+    raw = os.environ.get("FAKE_AGY_QUOTA_MARKER")
+    if not raw:
+        raise SystemExit("FAKE_AGY_QUOTA_MARKER is required for the quota_retry scenario")
+    return Path(raw)
+
+
 def main():
     scenario = os.environ.get("FAKE_AGY_SCENARIO", "normal")
     if "--version" in sys.argv:
@@ -138,6 +145,13 @@ def main():
             return 7
         if scenario == "quota_stderr":
             print("fixture quota warning", file=sys.stderr)
+        if scenario == "quota_retry":
+            # Cross-process state: every probe attempt is a fresh process, so the
+            # first attempt records itself on disk and later attempts succeed.
+            marker = quota_retry_marker()
+            if not marker.exists():
+                marker.write_text("first quota probe failed\n", encoding="utf-8")
+                return 9
         print(json.dumps(quota_response(), separators=(",", ":")))
         return 0
 
