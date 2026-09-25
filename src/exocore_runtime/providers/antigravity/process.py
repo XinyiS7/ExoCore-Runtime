@@ -573,13 +573,15 @@ class AgyProcessSupervisor:
     ) -> dict[str, int]:
         """Run the ``/quota`` probe and parse it, with bounded retries.
 
-        Only ``agy_auth_unavailable`` is absorbed: it is the single code this
-        probe can raise (bounded timeout, non-zero exit, stderr, or an
-        unparsable payload), and a cold CLI can fail the first attempt
-        transiently. Any other code propagates immediately, and exhausting the
-        attempts re-raises the same code, so fail-closed behaviour is unchanged.
-        ``--version`` and ``models`` stay single-attempt: they have no
-        equivalent transient failure mode.
+        Only ``agy_auth_unavailable`` is absorbed: it covers the probe's own
+        transient failures (bounded timeout, non-zero exit, stderr, and
+        payload-shape problems), and a cold CLI can fail the first attempt
+        transiently. Codes that mean something else propagate immediately:
+        ``agy_quota_not_zero_turn`` (deliberate drift detection in
+        ``_parse_quota``) and ``agy_preflight_cleanup_failed`` (bounded-run
+        cleanup). Exhausting the attempts re-raises the same code, so
+        fail-closed behaviour is unchanged. ``--version`` and ``models`` stay
+        single-attempt: they have no equivalent transient failure mode.
         """
 
         attempts_left = QUOTA_PREFLIGHT_ATTEMPTS
