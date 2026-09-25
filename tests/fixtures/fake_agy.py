@@ -313,6 +313,213 @@ def main():
                         },
                     }
                 )
+        if scenario == "cp5_surface":
+            # X-C1 zero-cost shape: one eager memory_search call plus one lazy
+            # trace_self descriptor/call round, both carrying the seeded
+            # canaries. The acceptance harness sets FAKE_AGY_SCENARIO to this
+            # scenario only for its own zero-cost mode.
+            memory_canary = (
+                os.environ.get("FAKE_AGY_CP5_MEMORY_CANARY")
+                or "CP5-MEMORY-CANARY-FAKE"
+            )
+            trace_canary = (
+                os.environ.get("FAKE_AGY_CP5_TRACE_CANARY")
+                or "CP5-TRACE-CANARY-FAKE"
+            )
+            descriptor = (
+                Path(os.environ["HOME"])
+                / ".gemini"
+                / "antigravity-cli"
+                / "mcp"
+                / "exocore-memory"
+                / "trace_self.json"
+            )
+            descriptor.parent.mkdir(parents=True, exist_ok=True)
+            descriptor.write_text(
+                json.dumps(
+                    {
+                        "name": "trace_self",
+                        "description": "fixture descriptor for the lazy trace_self tool",
+                        "parameters": {"action": "overview", "source": "chat"},
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            tool_step = turn_number * 10 + 3
+            emit(
+                {
+                    "event": "step_update",
+                    "step_update": {
+                        "conversation_id": conversation_id,
+                        "step_index": tool_step,
+                        "step_type": "tool",
+                        "state": "ACTIVE",
+                        "tool_name": "mcp_exocore-memory_memory_search",
+                        "tool_info": {
+                            "name": "mcp_exocore-memory_memory_search",
+                            "parameters": {
+                                "keywords": [memory_canary],
+                                "mode": "keywords",
+                                "object": "memory_plasmid",
+                            },
+                        },
+                    },
+                }
+            )
+            emit(
+                {
+                    "event": "step_update",
+                    "step_update": {
+                        "conversation_id": conversation_id,
+                        "step_index": tool_step,
+                        "step_type": "tool",
+                        "state": "DONE",
+                        "tool_name": "mcp_exocore-memory_memory_search",
+                        "duration_seconds": 0.11,
+                        "tool_info": {
+                            "name": "mcp_exocore-memory_memory_search",
+                            "parameters": {
+                                "keywords": [memory_canary],
+                                "mode": "keywords",
+                                "object": "memory_plasmid",
+                            },
+                            "output": (
+                                "## memory_plasmid 搜索结果\n"
+                                f"- [1] [user_manual] {memory_canary}\n"
+                            ),
+                        },
+                    },
+                }
+            )
+            descriptor_step = tool_step + 1
+            emit(
+                {
+                    "event": "step_update",
+                    "step_update": {
+                        "conversation_id": conversation_id,
+                        "step_index": descriptor_step,
+                        "step_type": "tool",
+                        "state": "ACTIVE",
+                        "tool_name": "view_file",
+                        "tool_info": {
+                            "name": "view_file",
+                            "parameters": {"AbsolutePath": str(descriptor)},
+                        },
+                    },
+                }
+            )
+            emit(
+                {
+                    "event": "step_update",
+                    "step_update": {
+                        "conversation_id": conversation_id,
+                        "step_index": descriptor_step,
+                        "step_type": "tool",
+                        "state": "DONE",
+                        "tool_name": "view_file",
+                        "duration_seconds": 0.02,
+                        "tool_info": {
+                            "name": "view_file",
+                            "parameters": {"AbsolutePath": str(descriptor)},
+                            "output": "1 lines, 128 bytes",
+                        },
+                    },
+                }
+            )
+            lazy_step = tool_step + 2
+            lazy_parameters = {
+                "Arguments": {"action": "overview"},
+                "ServerName": "exocore-memory",
+                "ToolName": "trace_self",
+            }
+            emit(
+                {
+                    "event": "step_update",
+                    "step_update": {
+                        "conversation_id": conversation_id,
+                        "step_index": lazy_step,
+                        "step_type": "tool",
+                        "state": "ACTIVE",
+                        "tool_name": "call_mcp_tool",
+                        "tool_info": {
+                            "name": "call_mcp_tool",
+                            "parameters": lazy_parameters,
+                        },
+                    },
+                }
+            )
+            emit(
+                {
+                    "event": "step_update",
+                    "step_update": {
+                        "conversation_id": conversation_id,
+                        "step_index": lazy_step,
+                        "step_type": "tool",
+                        "state": "DONE",
+                        "tool_name": "call_mcp_tool",
+                        "duration_seconds": 0.05,
+                        "tool_info": {
+                            "name": "call_mcp_tool",
+                            "parameters": lazy_parameters,
+                            "output": json.dumps(
+                                {
+                                    "action": "overview",
+                                    "sources": {
+                                        "maintenance": [],
+                                        "chat": [
+                                            {
+                                                "entry_id": "conversation_message:1",
+                                                "type": "private",
+                                                "preview": (
+                                                    "fixture witness message "
+                                                    f"{trace_canary}"
+                                                ),
+                                            }
+                                        ],
+                                        "heartbeat": [],
+                                    },
+                                },
+                                ensure_ascii=False,
+                            ),
+                        },
+                    },
+                }
+            )
+            fixture_answer = f"{memory_canary}\n{trace_canary}"
+            emit(
+                {
+                    "event": "step_update",
+                    "step_update": {
+                        "conversation_id": conversation_id,
+                        "step_index": tool_step + 3,
+                        "step_type": "agent_response",
+                        "state": "DONE",
+                        "text_delta": fixture_answer,
+                    },
+                }
+            )
+            emit(
+                {
+                    "event": "result",
+                    "result": {
+                        "conversation_id": conversation_id,
+                        "status": "SUCCESS",
+                        "response": fixture_answer,
+                        "num_turns": turn_number,
+                        "usage": {
+                            "input_tokens": 100 * turn_number,
+                            "output_tokens": 10 * turn_number,
+                            "thinking_tokens": 4 * turn_number,
+                            "cache_read_tokens": (
+                                50 * (turn_number - 1) if turn_number > 1 else 0
+                            ),
+                            "total_tokens": 110 * turn_number,
+                        },
+                    },
+                }
+            )
+            continue
         step_usage = {
             "input_tokens": 100,
             "output_tokens": 10,
