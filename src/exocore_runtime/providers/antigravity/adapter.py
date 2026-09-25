@@ -42,6 +42,10 @@ from exocore_runtime.providers.antigravity.control import (
     ReservedControlArtifact,
 )
 from exocore_runtime.providers.antigravity.ephemeral_hook import EphemeralMailbox
+from exocore_runtime.providers.antigravity.mcp_policy import (
+    MCP_EAGER_TOOL_NAMES,
+    MCP_ENABLED_TOOL_NAMES,
+)
 from exocore_runtime.providers.antigravity.process import (
     AgyProcessSupervisor,
     GenerationLayout,
@@ -1300,6 +1304,9 @@ class AntigravityAdapter:
         }
 
     def _expected_mcp_config(self, binding_id: str) -> dict[str, object]:
+        # ``enabledTools`` / ``tools`` come from the single Runtime MCP fact
+        # source (``mcp_policy``): the model-visible enumeration and the eager
+        # (schema-in-context) subset. No tool-name list is duplicated here.
         return {
             "mcpServers": {
                 MCP_SERVER_NAME: {
@@ -1312,6 +1319,10 @@ class AntigravityAdapter:
                     ],
                     "cwd": str(self.memory_mcp_root),
                     "env": {"PYTHONPATH": str(self.memory_mcp_root)},
+                    "enabledTools": list(MCP_ENABLED_TOOL_NAMES),
+                    "tools": {
+                        name: {"eager": True} for name in MCP_EAGER_TOOL_NAMES
+                    },
                 }
             }
         }

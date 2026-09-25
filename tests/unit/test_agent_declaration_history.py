@@ -49,6 +49,9 @@ FROZEN_POLICY_HISTORY = (
     ("agy-tool-perm-v2", ("view_file", "write_to_file", "run_command")),
     ("agy-tool-perm-v3", ("view_file", "write_to_file", "run_command")),
     ("agy-tool-perm-v4", ("view_file", "write_to_file", "run_command", "search_web")),
+    # v5 widens the Runtime-bound Memory MCP tool surface (enabledTools + eager)
+    # without touching the declared AGY toolset, so the tool tuple repeats.
+    ("agy-tool-perm-v5", ("view_file", "write_to_file", "run_command", "search_web")),
 )
 
 L3_TOOLSET = ("view_file", "write_to_file", "run_command")

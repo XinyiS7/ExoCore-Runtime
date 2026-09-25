@@ -10,7 +10,10 @@ import unittest
 
 from exocore_runtime.errors import ProviderAdapterError
 from exocore_runtime.providers.antigravity import ndjson as ndjson_parser
-from exocore_runtime.providers.antigravity.mcp_policy import MCP_TOOL_DISPLAY_ALLOWLIST
+from exocore_runtime.providers.antigravity.mcp_policy import (
+    MCP_EAGER_TOOL_NAMES,
+    MCP_ENABLED_TOOL_NAMES,
+)
 from exocore_runtime.providers.antigravity.ndjson import AgyTurnNormalizer, parse_init
 
 
@@ -335,8 +338,8 @@ class McpToolIdentityProjectionTests(unittest.TestCase):
         normalizer = AgyTurnNormalizer(_SYNTHETIC_CONVERSATION)
         return normalizer.consume(payload)
 
-    def test_every_allowlisted_memory_tool_projects_its_short_name(self) -> None:
-        for tool_name in MCP_TOOL_DISPLAY_ALLOWLIST:
+    def test_every_enabled_memory_tool_projects_its_short_name(self) -> None:
+        for tool_name in MCP_ENABLED_TOOL_NAMES:
             with self.subTest(tool_name=tool_name):
                 event = self.normalize(
                     tool_step(
@@ -355,13 +358,71 @@ class McpToolIdentityProjectionTests(unittest.TestCase):
                 self.assertEqual(event.payload["category"], "provider_tool")
                 self.assertNotIn("tool_info", event.payload)
 
-    def test_display_allowlist_is_the_frozen_memory_five(self) -> None:
-        # The Runtime display allowlist mirrors ExoCore's
+    def test_enabled_tool_names_are_the_frozen_memory_nine(self) -> None:
+        # The Runtime MCP fact source mirrors ExoCore's
         # RUNTIME_BINDING_TOOL_NAMES; widening it takes a deliberate edit here.
         self.assertEqual(
-            MCP_TOOL_DISPLAY_ALLOWLIST,
+            MCP_ENABLED_TOOL_NAMES,
+            (
+                "register",
+                "memory_plasmid",
+                "chronicle",
+                "memory_search",
+                "private_log",
+                "schedule_wakeup",
+                "heartbeat_policy",
+                "use_skill",
+                "trace_self",
+            ),
+        )
+
+    def test_eager_tool_names_are_the_frozen_five_subset(self) -> None:
+        self.assertEqual(
+            MCP_EAGER_TOOL_NAMES,
             ("register", "memory_plasmid", "chronicle", "memory_search", "private_log"),
         )
+        self.assertLessEqual(
+            set(MCP_EAGER_TOOL_NAMES), set(MCP_ENABLED_TOOL_NAMES)
+        )
+
+    def test_eager_tool_names_project_their_short_name(self) -> None:
+        """eager 调用名是 ``mcp_<server>_<tool>``，身份直接就是短名（无需 tool_info）。"""
+        for tool_name in MCP_EAGER_TOOL_NAMES:
+            with self.subTest(tool_name=tool_name):
+                event = self.normalize(
+                    tool_step(
+                        tool_name=f"mcp_exocore-memory_{tool_name}",
+                        tool_info=object(),
+                    )
+                )[0]
+                self.assertEqual(event.payload["tool_name"], tool_name)
+                self.assertEqual(event.payload["category"], "provider_tool")
+                self.assertNotIn("tool_info", event.payload)
+
+    def test_eager_projection_keys_on_the_enabled_set_not_the_eager_set(self) -> None:
+        # 一个 enabled 但选择 lazy 的工具，若被以 eager 名字调用，身份仍是短名：
+        # 白名单管「是谁」，eager 集合只管「schema 是否随上下文预置」。
+        event = self.normalize(
+            tool_step(tool_name="mcp_exocore-memory_trace_self", tool_info=object())
+        )[0]
+        self.assertEqual(event.payload["tool_name"], "trace_self")
+
+    def test_eager_projection_is_fail_closed(self) -> None:
+        cases = (
+            "mcp_exocore-memory_exec_shell",
+            "mcp_exocore-memory_shell",
+            "mcp_exocore-memory_",
+            "mcp_exocore-memory_memory_search_extra",
+            "mcp_ExoCore-Memory_memory_search",
+            "mcp_exocore-memory-memory_search",
+            "mcp_other-server_memory_search",
+            "mcp_chrome_devtools_click",
+            "x-mcp_exocore-memory_memory_search",
+        )
+        for name in cases:
+            with self.subTest(provider_tool_name=name):
+                event = self.normalize(tool_step(tool_name=name, tool_info=object()))[0]
+                self.assertEqual(event.payload["tool_name"], name)
 
     def test_non_dispatch_tool_names_are_never_projected(self) -> None:
         shaped = {"parameters": {"ServerName": "exocore-memory", "ToolName": "memory_search"}}

@@ -23,6 +23,10 @@ from exocore_runtime.providers.antigravity.control import (
     CanonicalControlStore,
     ReservedControlArtifact,
 )
+from exocore_runtime.providers.antigravity.mcp_policy import (
+    MCP_EAGER_TOOL_NAMES,
+    MCP_ENABLED_TOOL_NAMES,
+)
 from exocore_runtime.providers.antigravity.process import AgyProcessConfig, AgyProcessSupervisor
 from exocore_runtime.providers.antigravity.renderer import (
     ALLOW_POLICY,
@@ -244,6 +248,17 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
                 "--runtime-binding-id",
                 str(self.binding_id),
             ],
+        )
+        # The model-visible enumeration and the eager subset come from the single
+        # Runtime MCP fact source; the entry carries no other field.
+        self.assertEqual(server_config["enabledTools"], list(MCP_ENABLED_TOOL_NAMES))
+        self.assertEqual(
+            server_config["tools"],
+            {name: {"eager": True} for name in MCP_EAGER_TOOL_NAMES},
+        )
+        self.assertEqual(
+            set(server_config),
+            {"command", "args", "cwd", "env", "enabledTools", "tools"},
         )
         # CP2/CP5 + native search unlock: the declared workload tools stay in
         # the custom-agent declaration; MCP is exposed through its isolated
@@ -781,9 +796,10 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(str(self.binding_id), adapter.supervisor._sessions)
 
     async def test_stale_security_policy_options_are_rejected_before_spawn(self) -> None:
-        # The 3-tool unlock's frozen ``agy-tool-perm-v3`` options are no longer
-        # current: a request whose frozen resolution still carries them must
-        # fail closed instead of reacquiring a process under the old policy.
+        # Frozen earlier policies are no longer current: a request whose frozen
+        # resolution still carries them must fail closed instead of reacquiring
+        # a process under the old policy. ``v3`` is the 3-tool unlock; ``v4``
+        # predates the widened Memory MCP surface (enabledTools + eager).
         service, adapter = self.build_service()
         await service.ensure_generation(self.binding_id, self.spec)
         request = self.turn(bootstrap={"history": []})
@@ -793,10 +809,14 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
             request.requested_thinking_level,
         ).process_options
         self.assertEqual(current.security_policy_revision, SECURITY_POLICY_REVISION)
-        stale = current.model_copy(update={"security_policy_revision": "agy-tool-perm-v3"})
-        with self.assertRaises(ProviderAdapterError) as caught:
-            await adapter.prepare_turn(generation, request, stale, is_first_turn=True)
-        self.assertEqual(caught.exception.code, "agy_process_options_unsupported")
+        for stale_revision in ("agy-tool-perm-v3", "agy-tool-perm-v4"):
+            with self.subTest(stale_revision=stale_revision):
+                stale = current.model_copy(
+                    update={"security_policy_revision": stale_revision}
+                )
+                with self.assertRaises(ProviderAdapterError) as caught:
+                    await adapter.prepare_turn(generation, request, stale, is_first_turn=True)
+                self.assertEqual(caught.exception.code, "agy_process_options_unsupported")
         self.assertEqual([item for item in self.evidence() if item["kind"] == "spawn"], [])
         self.assertEqual(adapter.supervisor._sessions, {})
 

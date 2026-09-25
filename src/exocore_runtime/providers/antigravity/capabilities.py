@@ -7,7 +7,7 @@ from exocore_runtime.errors import ProviderAdapterError
 
 
 RESOLVER_POLICY_REVISION = "agy-gemini-3.1-pro-v1"
-SECURITY_POLICY_REVISION = "agy-tool-perm-v4"
+SECURITY_POLICY_REVISION = "agy-tool-perm-v5"
 LAUNCH_ENVIRONMENT_REVISION = "agy-isolated-env-v1"
 
 _POLICY: dict[tuple[str, str], tuple[str, str]] = {

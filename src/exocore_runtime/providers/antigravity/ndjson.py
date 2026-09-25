@@ -9,8 +9,8 @@ from typing import Any
 from exocore_runtime.contracts import ProviderEvent, ProviderGeneration
 from exocore_runtime.errors import ProviderAdapterError
 from exocore_runtime.providers.antigravity.mcp_policy import (
+    MCP_ENABLED_TOOL_NAMES,
     MCP_SERVER_NAME,
-    MCP_TOOL_DISPLAY_ALLOWLIST,
 )
 
 
@@ -60,32 +60,48 @@ def _finite_duration(value: object) -> float | None:
     return duration
 
 
-# The one AGY provider tool whose real identity is hidden behind a generic
-# dispatcher name. Every other provider tool name is already its own identity.
+# The AGY provider hides a Memory tool's real identity in exactly two shapes:
+# the generic dispatcher (``call_mcp_tool`` + ``tool_info.parameters``) for lazy
+# tools, and the derived ``mcp_<server>_<tool>`` name for eager tools. Every
+# other provider tool name is already its own identity.
 _MCP_DISPATCH_TOOL_NAME = "call_mcp_tool"
+_MCP_EAGER_TOOL_PREFIX = f"mcp_{MCP_SERVER_NAME}_"
 
 
 def _project_display_tool_name(provider_tool_name: str, tool_info: object) -> str:
     """Project a bounded provider tool name for safe display.
 
-    Native tool names pass through unchanged. ``call_mcp_tool`` is the only
-    provider tool that carries its real identity in ``tool_info.parameters``,
-    and it resolves to a Memory short name only when every frozen condition
-    holds at once: ``tool_info`` is an object, ``tool_info.parameters`` is an
-    object, ``ServerName`` is exactly ``MCP_SERVER_NAME``, and ``ToolName``
-    exactly matches the Runtime display allowlist (``mcp_policy``'s
-    ``MCP_TOOL_DISPLAY_ALLOWLIST``, mirroring ExoCore's
-    ``RUNTIME_BINDING_TOOL_NAMES``).
+    Native tool names pass through unchanged. Two provider shapes carry a Memory
+    tool's real identity, and both resolve to a short name only when the name is
+    in ``MCP_ENABLED_TOOL_NAMES`` (``mcp_policy``, mirroring ExoCore's
+    ``RUNTIME_BINDING_TOOL_NAMES``):
 
-    Anything else - missing or malformed ``tool_info``, another server, an
-    unknown, non-string, or future tool name - degrades to the generic
-    dispatcher name instead of failing the turn. This projection is display
+    - lazy: ``call_mcp_tool`` with ``tool_info.parameters.{ServerName,ToolName}``
+      resolves when ``tool_info`` is an object, ``parameters`` is an object,
+      ``ServerName`` is exactly ``MCP_SERVER_NAME``, and ``ToolName`` is an
+      enabled name;
+    - eager: ``mcp_<MCP_SERVER_NAME>_<tool>`` resolves when ``<tool>`` is an
+      enabled name.
+
+    Anything else - missing or malformed ``tool_info``, another server, another
+    server's eager prefix, an unknown, non-string, or future tool name - passes
+    through unchanged instead of failing the turn. This projection is display
     only: it grants no execution authority and must never be treated as proof
     that a tool ran.
     """
 
-    if provider_tool_name != _MCP_DISPATCH_TOOL_NAME:
-        return provider_tool_name
+    if provider_tool_name == _MCP_DISPATCH_TOOL_NAME:
+        return _project_lazy_mcp_tool_name(provider_tool_name, tool_info)
+    if provider_tool_name.startswith(_MCP_EAGER_TOOL_PREFIX):
+        tool_name = provider_tool_name[len(_MCP_EAGER_TOOL_PREFIX) :]
+        if tool_name in MCP_ENABLED_TOOL_NAMES:
+            return tool_name
+    return provider_tool_name
+
+
+def _project_lazy_mcp_tool_name(provider_tool_name: str, tool_info: object) -> str:
+    """Resolve the lazy dispatcher shape, or keep the dispatcher name when unsure."""
+
     if not isinstance(tool_info, dict):
         return provider_tool_name
     parameters = tool_info.get("parameters")
@@ -94,7 +110,7 @@ def _project_display_tool_name(provider_tool_name: str, tool_info: object) -> st
     if parameters.get("ServerName") != MCP_SERVER_NAME:
         return provider_tool_name
     tool_name = parameters.get("ToolName")
-    if not isinstance(tool_name, str) or tool_name not in MCP_TOOL_DISPLAY_ALLOWLIST:
+    if not isinstance(tool_name, str) or tool_name not in MCP_ENABLED_TOOL_NAMES:
         return provider_tool_name
     return tool_name
 
