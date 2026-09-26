@@ -8,3 +8,7 @@ __pycache__/
 *.sqlite3-wal
 build/
 dist/
+
+# ── IDE ──
+.idea/
+.vscode/
