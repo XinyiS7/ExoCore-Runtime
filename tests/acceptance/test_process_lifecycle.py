@@ -63,6 +63,7 @@ class ProcessLifecycleTests(unittest.TestCase):
                             "requested_effective_execution",
                             "strict_session_resume",
                             "request_journal_replay",
+                            "turn_attachments",
                         ],
                     },
                 )

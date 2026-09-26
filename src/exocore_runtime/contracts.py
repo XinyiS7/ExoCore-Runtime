@@ -17,6 +17,7 @@ RUNTIME_CAPABILITIES = (
     "requested_effective_execution",
     "strict_session_resume",
     "request_journal_replay",
+    "turn_attachments",
 )
 
 
@@ -25,6 +26,11 @@ class StrictContract(BaseModel):
 
 
 PROJECT_RULES_MAX_CHARS = 256_000
+MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
+MAX_ATTACHMENT_COUNT = 5
+MAX_ATTACHMENT_TOTAL_BYTES = 50 * 1024 * 1024
+ATTACHMENT_ID_PATTERN = r"^att-[1-9][0-9]{0,18}$"
+SHA256_PATTERN = r"^[0-9a-f]{64}$"
 
 
 class GenerationSpec(StrictContract):
@@ -206,14 +212,27 @@ class ContinuityDeltaTurn(StrictContract):
         return self
 
 
+class AttachmentManifest(StrictContract):
+    artifact_id: str = Field(pattern=ATTACHMENT_ID_PATTERN)
+    display_name: str = Field(min_length=1, max_length=255)
+    mime_type: Literal["image/png", "image/jpeg", "image/webp"]
+    size: StrictInt = Field(gt=0, le=MAX_ATTACHMENT_BYTES)
+    sha256: str = Field(pattern=SHA256_PATTERN)
+
+
 class TurnRequest(StrictContract):
     schema_version: Literal["v2"] = "v2"
     request_id: UUID
-    user_message: str = Field(min_length=1, max_length=1_000_000, repr=False)
+    user_message: str = Field(max_length=1_000_000, repr=False)
     requested_model_id: str = Field(min_length=1, max_length=200)
     requested_thinking_level: ThinkingLevel
     bootstrap_context: dict[str, Any] | None = Field(default=None, repr=False)
     continuity_delta: tuple[ContinuityDeltaTurn, ...] = ()
+    attachments: tuple[AttachmentManifest, ...] = Field(
+        default=(),
+        max_length=MAX_ATTACHMENT_COUNT,
+        repr=False,
+    )
     ephemeral_current: str | None = Field(
         default=None,
         max_length=1_000_000,
@@ -222,6 +241,13 @@ class TurnRequest(StrictContract):
 
     @model_validator(mode="after")
     def validate_payload_budget(self) -> "TurnRequest":
+        if not self.user_message and not self.attachments:
+            raise ValueError("turn requires user text or attachments")
+        artifact_ids = [attachment.artifact_id for attachment in self.attachments]
+        if len(artifact_ids) != len(set(artifact_ids)):
+            raise ValueError("attachment artifact IDs must be request-unique")
+        if sum(attachment.size for attachment in self.attachments) > MAX_ATTACHMENT_TOTAL_BYTES:
+            raise ValueError("attachments exceed the per-turn byte budget")
         if self.bootstrap_context is not None:
             encoded = json.dumps(
                 self.bootstrap_context,

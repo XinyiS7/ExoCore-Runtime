@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import time
@@ -232,6 +233,7 @@ def main():
             current_user_occurrences=content.count("CURRENT-USER-CANARY"),
             bootstrap_present="ExoCorePriorContinuity" in content,
             ephemeral_in_stdin="EPHEMERAL-CANARY" in content,
+            attachment_paths=sorted(set(re.findall(r'path="([^"]+)"', content))),
             hook_injected=injected,
         )
         emit(

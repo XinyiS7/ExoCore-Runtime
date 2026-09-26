@@ -65,6 +65,20 @@ class BootstrapBoundaryAdapter:
     def stage_generation(self, binding_id: str, spec: GenerationSpec) -> None:
         return None
 
+    async def stage_attachment(
+        self,
+        binding_id,
+        request_id,
+        artifact_id,
+        data,
+        *,
+        guard,
+    ) -> None:
+        guard()
+
+    async def discard_attachments(self, binding_id, request_id, *, guard) -> None:
+        guard()
+
     async def prepare_turn(
         self,
         generation,

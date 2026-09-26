@@ -15,8 +15,17 @@ from pydantic import ValidationError
 # Windows: helper processes must never open a visible console window.
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
-from exocore_runtime.contracts import GenerationSpec, TurnRequest
-from exocore_runtime.errors import ConflictError, ProviderAdapterError
+PNG_BYTES = b"\x89PNG\r\n\x1a\nattachment-pixels"
+JPEG_BYTES = b"\xff\xd8\xffattachment-jpeg"
+
+from exocore_runtime.contracts import AttachmentManifest, GenerationSpec, TurnRequest
+from exocore_runtime.errors import (
+    AttachmentCapacityExceededError,
+    ConflictError,
+    ProviderAdapterError,
+    RequestRegisteredError,
+    RetiredError,
+)
 from exocore_runtime.providers.antigravity.adapter import AntigravityAdapter
 from exocore_runtime.providers.antigravity.capabilities import SECURITY_POLICY_REVISION
 from exocore_runtime.providers.antigravity.control import (
@@ -170,6 +179,23 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
 
     def session_id(self, service):
         return service.store.get_generation(str(self.binding_id)).provider_session_id
+
+    def generation_root(self) -> Path:
+        return self.data_root / self.binding_id.hex
+
+    def request_attachment_dir(self, request_id) -> Path:
+        return self.generation_root() / "workspace" / str(request_id) / "attachments"
+
+    def attachment_manifest(self, data=PNG_BYTES, **overrides) -> AttachmentManifest:
+        values = {
+            "artifact_id": "att-7",
+            "display_name": "photo.png",
+            "mime_type": "image/png",
+            "size": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+        }
+        values.update(overrides)
+        return AttachmentManifest(**values)
 
     async def test_first_same_process_restart_resume_and_retire(self) -> None:
         service, adapter = self.build_service()
@@ -1276,6 +1302,304 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn(str(child_pid), check.stdout)
 
+
+    async def test_attachment_turn_projects_only_a_workspace_absolute_path(self) -> None:
+        service, _adapter = self.build_service()
+        await service.ensure_generation(self.binding_id, self.spec)
+        generation_root = self.generation_root()
+        metadata_before = json.loads(
+            (generation_root / "generation.json").read_text(encoding="utf-8")
+        )
+        request = self.turn(bootstrap={"continuity_anchor": "anchor"})
+        manifest = self.attachment_manifest(display_name="diagram.png")
+        await service.stage_attachment(
+            self.binding_id,
+            request.request_id,
+            manifest.artifact_id,
+            PNG_BYTES,
+        )
+        events = await collect(
+            service,
+            self.binding_id,
+            request.model_copy(update={"attachments": (manifest,)}),
+        )
+        self.assertEqual(events[-1].event_type, "done")
+        self.assertEqual(events[-1].provider_input_effect, "may_have_reached_provider")
+        turns = [item for item in self.evidence() if item["kind"] == "turn"]
+        self.assertEqual(len(turns), 1)
+        paths = turns[0]["attachment_paths"]
+        self.assertEqual(len(paths), 1)
+        projected = Path(paths[0])
+        self.assertTrue(projected.is_absolute())
+        self.assertTrue(projected.is_file())
+        self.assertEqual(projected.name, "att-7.png")
+        self.assertTrue(projected.is_relative_to(self.data_root))
+        self.assertEqual(
+            projected.parent,
+            self.request_attachment_dir(request.request_id),
+        )
+        metadata_after = json.loads(
+            (generation_root / "generation.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            metadata_before["agent_markdown_sha256"],
+            metadata_after["agent_markdown_sha256"],
+        )
+        self.assertEqual(
+            metadata_before["generation_id"],
+            metadata_after["generation_id"],
+        )
+        self.assertEqual(
+            len([item for item in self.evidence() if item["kind"] == "spawn"]),
+            1,
+        )
+
+    async def test_attachment_verify_failures_are_pre_send_and_never_spawn(self) -> None:
+        service, _adapter = self.build_service()
+        await service.ensure_generation(self.binding_id, self.spec)
+
+        missing_request = self.turn(bootstrap={"history": []})
+        events = await collect(
+            service,
+            self.binding_id,
+            missing_request.model_copy(
+                update={"attachments": (self.attachment_manifest(),)}
+            ),
+        )
+        self.assertEqual(events[-1].payload["code"], "attachment_not_staged")
+        self.assertEqual(events[-1].provider_input_effect, "not_sent")
+        self.assertFalse(
+            self.request_attachment_dir(missing_request.request_id).exists()
+        )
+
+        digest_request = self.turn(bootstrap={"history": []})
+        await service.stage_attachment(
+            self.binding_id,
+            digest_request.request_id,
+            "att-7",
+            PNG_BYTES,
+        )
+        events = await collect(
+            service,
+            self.binding_id,
+            digest_request.model_copy(
+                update={"attachments": (self.attachment_manifest(b"different-bytes"),)}
+            ),
+        )
+        self.assertEqual(events[-1].payload["code"], "attachment_digest_mismatch")
+        self.assertEqual(events[-1].provider_input_effect, "not_sent")
+        self.assertFalse(
+            self.request_attachment_dir(digest_request.request_id).exists()
+        )
+
+        mime_request = self.turn(bootstrap={"history": []})
+        await service.stage_attachment(
+            self.binding_id,
+            mime_request.request_id,
+            "att-7",
+            PNG_BYTES,
+        )
+        events = await collect(
+            service,
+            self.binding_id,
+            mime_request.model_copy(
+                update={
+                    "attachments": (
+                        self.attachment_manifest(
+                            PNG_BYTES,
+                            mime_type="image/jpeg",
+                            display_name="photo.jpg",
+                        ),
+                    )
+                }
+            ),
+        )
+        self.assertEqual(events[-1].payload["code"], "attachment_mime_mismatch")
+        self.assertEqual(events[-1].provider_input_effect, "not_sent")
+        self.assertFalse(self.request_attachment_dir(mime_request.request_id).exists())
+        self.assertEqual(
+            [item for item in self.evidence() if item["kind"] == "spawn"],
+            [],
+        )
+
+    async def test_concurrent_attachment_stages_share_one_cap_lock(self) -> None:
+        service, _adapter = self.build_service()
+        await service.ensure_generation(self.binding_id, self.spec)
+        request_id = uuid4()
+        results = await asyncio.gather(
+            *[
+                service.stage_attachment(
+                    self.binding_id,
+                    request_id,
+                    f"att-{index}",
+                    b"x" * 4,
+                )
+                for index in range(1, 7)
+            ],
+            return_exceptions=True,
+        )
+        self.assertEqual(sum(result is None for result in results), 5)
+        self.assertEqual(
+            sum(
+                isinstance(result, AttachmentCapacityExceededError)
+                for result in results
+            ),
+            1,
+        )
+        files = list(self.request_attachment_dir(request_id).iterdir())
+        self.assertEqual(len(files), 5)
+        self.assertEqual(sum(path.stat().st_size for path in files), 20)
+
+        total_request = uuid4()
+        with patch(
+            "exocore_runtime.providers.antigravity.attachments."
+            "MAX_ATTACHMENT_TOTAL_BYTES",
+            10,
+        ):
+            results = await asyncio.gather(
+                *[
+                    service.stage_attachment(
+                        self.binding_id,
+                        total_request,
+                        f"att-{index}",
+                        b"y" * 4,
+                    )
+                    for index in range(1, 6)
+                ],
+                return_exceptions=True,
+            )
+        self.assertGreaterEqual(
+            sum(
+                isinstance(result, AttachmentCapacityExceededError)
+                for result in results
+            ),
+            1,
+        )
+        self.assertLessEqual(
+            sum(
+                path.stat().st_size
+                for path in self.request_attachment_dir(total_request).iterdir()
+            ),
+            10,
+        )
+
+    async def test_registered_request_blocks_stage_and_discard_and_retire_cleans(self) -> None:
+        service, _adapter = self.build_service()
+        await service.ensure_generation(self.binding_id, self.spec)
+        request_id = uuid4()
+        await service.stage_attachment(
+            self.binding_id,
+            request_id,
+            "att-7",
+            b"payload",
+        )
+        attachment_dir = self.request_attachment_dir(request_id)
+        self.assertTrue(attachment_dir.is_dir())
+
+        service.store.claim_request(
+            str(self.binding_id),
+            str(request_id),
+            "a" * 64,
+            "gemini-3.1-pro-preview",
+            "auto",
+            "owner",
+        )
+        with self.assertRaises(RequestRegisteredError):
+            await service.stage_attachment(
+                self.binding_id,
+                request_id,
+                "att-8",
+                b"payload",
+            )
+        with self.assertRaises(RequestRegisteredError):
+            await service.discard_attachments(self.binding_id, request_id)
+        self.assertEqual(
+            sorted(path.name for path in attachment_dir.iterdir()),
+            ["att-7.blob"],
+        )
+
+        generation_root = self.generation_root()
+        await service.retire(self.binding_id, "test")
+        self.assertFalse(generation_root.exists())
+        with self.assertRaises(RetiredError):
+            await service.stage_attachment(
+                self.binding_id,
+                request_id,
+                "att-9",
+                b"payload",
+            )
+        self.assertFalse(generation_root.exists())
+
+    async def test_stage_vs_retire_linearizes_without_recreating_the_root(self) -> None:
+        service, adapter = self.build_service()
+        await service.ensure_generation(self.binding_id, self.spec)
+        generation_root = self.generation_root()
+        request_id = uuid4()
+        lock = await adapter._artifact_lock(str(self.binding_id))
+        await lock.acquire()
+        stage_task = asyncio.create_task(
+            service.stage_attachment(
+                self.binding_id,
+                request_id,
+                "att-7",
+                b"payload",
+            )
+        )
+        await asyncio.sleep(0.01)
+        retire_task = asyncio.create_task(service.retire(self.binding_id, "race"))
+        await asyncio.sleep(0.01)
+        lock.release()
+        stage_result, retire_result = await asyncio.gather(
+            stage_task,
+            retire_task,
+            return_exceptions=True,
+        )
+        self.assertNotIsInstance(retire_result, BaseException)
+        if isinstance(stage_result, BaseException):
+            self.assertIsInstance(stage_result, RetiredError)
+        self.assertFalse(generation_root.exists())
+
+    async def test_materialize_recovers_blob_only_and_final_only_windows(self) -> None:
+        service, _adapter = self.build_service()
+        await service.ensure_generation(self.binding_id, self.spec)
+        manifest = self.attachment_manifest()
+
+        final_only = self.turn(bootstrap={"history": []})
+        await service.stage_attachment(
+            self.binding_id,
+            final_only.request_id,
+            "att-7",
+            PNG_BYTES,
+        )
+        blob = self.request_attachment_dir(final_only.request_id) / "att-7.blob"
+        final = blob.with_suffix(".png")
+        os.replace(blob, final)
+        events = await collect(
+            service,
+            self.binding_id,
+            final_only.model_copy(update={"attachments": (manifest,)}),
+        )
+        self.assertEqual(events[-1].event_type, "done")
+        self.assertEqual(final.read_bytes(), PNG_BYTES)
+
+        both = self.turn()
+        await service.stage_attachment(
+            self.binding_id,
+            both.request_id,
+            "att-7",
+            PNG_BYTES,
+        )
+        both_blob = self.request_attachment_dir(both.request_id) / "att-7.blob"
+        both_final = both_blob.with_suffix(".png")
+        both_final.write_bytes(b"corrupt-final")
+        events = await collect(
+            service,
+            self.binding_id,
+            both.model_copy(update={"attachments": (manifest,)}),
+        )
+        self.assertEqual(events[-1].event_type, "done")
+        self.assertEqual(both_final.read_bytes(), PNG_BYTES)
+        self.assertFalse(both_blob.exists())
 
 if __name__ == "__main__":
     unittest.main()

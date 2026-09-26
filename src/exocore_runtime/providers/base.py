@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from enum import Enum
 from typing import Protocol
@@ -70,6 +70,24 @@ class RuntimeProviderAdapter(Protocol):
     ) -> EffectiveResolution: ...
 
     def stage_generation(self, binding_id: str, spec: GenerationSpec) -> None: ...
+
+    async def stage_attachment(
+        self,
+        binding_id: str,
+        request_id: str,
+        artifact_id: str,
+        data: bytes,
+        *,
+        guard: Callable[[], None],
+    ) -> None: ...
+
+    async def discard_attachments(
+        self,
+        binding_id: str,
+        request_id: str,
+        *,
+        guard: Callable[[], None],
+    ) -> None: ...
 
     async def prepare_turn(
         self,

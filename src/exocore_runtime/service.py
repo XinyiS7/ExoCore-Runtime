@@ -25,6 +25,7 @@ from exocore_runtime.errors import (
     ConflictError,
     ProviderAdapterError,
     ProviderProtocolError,
+    RequestRegisteredError,
     RetiredError,
 )
 from exocore_runtime.event_journal import EventJournal
@@ -140,6 +141,48 @@ class RuntimeService:
         if generation.status not in {"starting", "active"}:
             raise ConflictError("generation is not executable")
         self._validate_bootstrap_state(generation.bootstrap_sent, request)
+
+    async def stage_attachment(
+        self,
+        binding_id: UUID,
+        request_id: UUID,
+        artifact_id: str,
+        data: bytes,
+    ) -> None:
+        if self._shutting_down:
+            raise ConflictError("runtime is shutting down")
+        binding = str(binding_id)
+        request_key = str(request_id)
+        generation = self.store.get_generation(binding)
+        provider = self._provider_for_kind(generation.runtime_kind)
+        request_lock = await self._get_claim_lock(binding, request_key)
+        async with request_lock:
+            await provider.stage_attachment(
+                binding,
+                request_key,
+                artifact_id,
+                data,
+                guard=self._attachment_mutation_guard(binding, request_key),
+            )
+
+    async def discard_attachments(
+        self,
+        binding_id: UUID,
+        request_id: UUID,
+    ) -> None:
+        if self._shutting_down:
+            raise ConflictError("runtime is shutting down")
+        binding = str(binding_id)
+        request_key = str(request_id)
+        generation = self.store.get_generation(binding)
+        provider = self._provider_for_kind(generation.runtime_kind)
+        request_lock = await self._get_claim_lock(binding, request_key)
+        async with request_lock:
+            await provider.discard_attachments(
+                binding,
+                request_key,
+                guard=self._attachment_mutation_guard(binding, request_key),
+            )
 
     async def stream_turn(
         self,
@@ -898,6 +941,24 @@ class RuntimeService:
             return terminal
 
         return write_terminal
+
+    def _attachment_mutation_guard(
+        self,
+        binding_id: str,
+        request_id: str,
+    ) -> Callable[[], None]:
+        """Recheck durable state inside the provider artifact critical section."""
+
+        def guard() -> None:
+            generation = self.store.get_generation(binding_id)
+            if generation.status == "retired":
+                raise RetiredError("generation is retired")
+            if generation.status not in {"starting", "active"}:
+                raise ConflictError("generation does not accept attachments")
+            if self.store.get_request(binding_id, request_id) is not None:
+                raise RequestRegisteredError("request is already registered")
+
+        return guard
 
     def _provider_for_kind(self, runtime_kind: str) -> RuntimeProviderAdapter:
         provider = self.providers.get(runtime_kind)

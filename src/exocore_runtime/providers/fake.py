@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import Counter
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 
 from exocore_runtime.contracts import (
     EffectiveResolution,
@@ -32,6 +32,8 @@ class DeterministicFakeAdapter:
         self.cancel_calls: Counter[tuple[str, str]] = Counter()
         self.cancel_cancelled: set[tuple[str, str]] = set()
         self.reclaims: Counter[tuple[str, str]] = Counter()
+        self.staged_attachments: dict[tuple[str, str, str], bytes] = {}
+        self.attachment_discards: Counter[tuple[str, str]] = Counter()
         self.resolver_calls: Counter[tuple[str, str]] = Counter()
         self._cancel_signals: dict[tuple[str, str], asyncio.Event] = {}
         self._behaviors: dict[str, str] = {}
@@ -118,6 +120,34 @@ class DeterministicFakeAdapter:
 
     def stage_generation(self, binding_id: str, spec: GenerationSpec) -> None:
         self.generation_stages[binding_id] += 1
+
+    async def stage_attachment(
+        self,
+        binding_id: str,
+        request_id: str,
+        artifact_id: str,
+        data: bytes,
+        *,
+        guard: Callable[[], None],
+    ) -> None:
+        guard()
+        self.staged_attachments[(binding_id, request_id, artifact_id)] = data
+
+    async def discard_attachments(
+        self,
+        binding_id: str,
+        request_id: str,
+        *,
+        guard: Callable[[], None],
+    ) -> None:
+        guard()
+        self.attachment_discards[(binding_id, request_id)] += 1
+        for key in [
+            key
+            for key in self.staged_attachments
+            if key[:2] == (binding_id, request_id)
+        ]:
+            self.staged_attachments.pop(key, None)
 
     async def prepare_turn(
         self,
@@ -239,6 +269,8 @@ class DeterministicFakeAdapter:
 
     async def retire(self, binding_id: str, reason: str) -> None:
         self._options.pop(binding_id, None)
+        for key in [key for key in self.staged_attachments if key[0] == binding_id]:
+            self.staged_attachments.pop(key, None)
 
     async def shutdown(self) -> None:
         self._options.clear()

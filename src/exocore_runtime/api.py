@@ -5,14 +5,17 @@ from __future__ import annotations
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
 import hmac
+import re
 from uuid import UUID
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from exocore_runtime.config import RuntimeConfig
 from exocore_runtime.contracts import (
+    ATTACHMENT_ID_PATTERN,
+    MAX_ATTACHMENT_BYTES,
     PROTOCOL_VERSION,
     RUNTIME_CAPABILITIES,
     GenerationSpec,
@@ -21,6 +24,7 @@ from exocore_runtime.contracts import (
     TurnRequest,
 )
 from exocore_runtime.errors import (
+    AttachmentSizeExceededError,
     InvalidRequestError,
     NotFoundError,
     RuntimeGatewayError,
@@ -151,6 +155,53 @@ def create_app(
                 yield event.model_dump_json() + "\n"
 
         return StreamingResponse(lines(), media_type="application/x-ndjson")
+
+    @app.put(
+        "/v2/generations/{binding_id}/turns/{request_id}/attachments/{artifact_id}"
+    )
+    async def stage_attachment(
+        binding_id: UUID,
+        request_id: UUID,
+        artifact_id: str,
+        request: Request,
+    ) -> Response:
+        if re.fullmatch(ATTACHMENT_ID_PATTERN, artifact_id) is None:
+            raise InvalidRequestError("invalid artifact id")
+        if request.headers.get("transfer-encoding") is not None:
+            raise InvalidRequestError("chunked attachment uploads are not accepted")
+        content_type = request.headers.get("content-type", "").split(";", 1)[0]
+        if content_type.strip().lower() != "application/octet-stream":
+            raise InvalidRequestError("attachment content type is invalid")
+        declared_text = request.headers.get("content-length")
+        if declared_text is None or not declared_text.isdigit():
+            raise InvalidRequestError("attachment content length is required")
+        declared_size = int(declared_text)
+        if declared_size <= 0:
+            raise InvalidRequestError("attachment body cannot be empty")
+        if declared_size > MAX_ATTACHMENT_BYTES:
+            raise AttachmentSizeExceededError()
+        body = bytearray()
+        async for chunk in request.stream():
+            body.extend(chunk)
+            if len(body) > MAX_ATTACHMENT_BYTES:
+                raise AttachmentSizeExceededError()
+        if len(body) != declared_size:
+            raise InvalidRequestError("attachment content length does not match body")
+        await service.stage_attachment(
+            binding_id,
+            request_id,
+            artifact_id,
+            bytes(body),
+        )
+        return Response(status_code=200)
+
+    @app.delete("/v2/generations/{binding_id}/turns/{request_id}/attachments")
+    async def discard_attachments(
+        binding_id: UUID,
+        request_id: UUID,
+    ) -> Response:
+        await service.discard_attachments(binding_id, request_id)
+        return Response(status_code=200)
 
     @app.post("/v2/generations/{binding_id}/turns/{request_id}/cancel")
     async def cancel(binding_id: UUID, request_id: UUID):

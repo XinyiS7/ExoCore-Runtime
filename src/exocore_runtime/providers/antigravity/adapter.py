@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 import hashlib
 import json
@@ -30,6 +30,7 @@ from exocore_runtime.contracts import (
     system_instructions_sha256,
 )
 from exocore_runtime.errors import ProviderAdapterError
+from exocore_runtime.providers.antigravity.attachments import AttachmentStore
 from exocore_runtime.providers.antigravity.capabilities import (
     LAUNCH_ENVIRONMENT_REVISION,
     SECURITY_POLICY_REVISION,
@@ -151,6 +152,36 @@ class AntigravityAdapter:
             raise ProviderAdapterError("agy_generation_spec_invalid", fatal_generation=True)
         self._ensure_generation_artifacts(binding_id, spec)
 
+    async def stage_attachment(
+        self,
+        binding_id: str,
+        request_id: str,
+        artifact_id: str,
+        data: bytes,
+        *,
+        guard: Callable[[], None],
+    ) -> None:
+        lock = await self._artifact_lock(binding_id)
+        async with lock:
+            guard()
+            AttachmentStore(self._generation_root(binding_id)).stage(
+                request_id,
+                artifact_id,
+                data,
+            )
+
+    async def discard_attachments(
+        self,
+        binding_id: str,
+        request_id: str,
+        *,
+        guard: Callable[[], None],
+    ) -> None:
+        lock = await self._artifact_lock(binding_id)
+        async with lock:
+            guard()
+            AttachmentStore(self._generation_root(binding_id)).discard(request_id)
+
     async def prepare_turn(
         self,
         generation: GenerationRecord,
@@ -160,6 +191,7 @@ class AntigravityAdapter:
         is_first_turn: bool,
     ) -> ProviderGeneration:
         binding_id = generation.binding_id
+        request_id = str(request.request_id)
         mailbox: EphemeralMailbox | None = None
         acquired: ProviderGeneration | None = None
         try:
@@ -168,12 +200,21 @@ class AntigravityAdapter:
                 if self._shutting_down:
                     raise ProviderAdapterError("agy_adapter_shutting_down", fatal_generation=True)
                 layout = self._load_layout(generation, options)
+                attachment_paths = AttachmentStore(
+                    self._generation_root(binding_id)
+                ).materialize(request_id, request.attachments)
                 acquired = await self.supervisor.ensure(layout)
                 self._update_provider_session(binding_id, acquired.provider_session_id)
                 mailbox = self._mailbox(binding_id)
-                request_id = str(request.request_id)
                 payload_hash = mailbox.prepare(request_id, request.ephemeral_current)
-                stdin_line = render_stdin_line(request, is_first_turn=is_first_turn)
+                stdin_line = render_stdin_line(
+                    request,
+                    is_first_turn=is_first_turn,
+                    attachment_paths={
+                        artifact_id: str(path)
+                        for artifact_id, path in attachment_paths.items()
+                    },
+                )
                 self._requests[(binding_id, request_id)] = _RequestState(
                     request_id=request_id,
                     mailbox=mailbox,
@@ -182,13 +223,13 @@ class AntigravityAdapter:
                 )
         except asyncio.CancelledError as original_error:
             try:
-                self._cleanup_presend_payloads(binding_id, mailbox)
+                self._cleanup_presend_payloads(binding_id, request_id, mailbox)
             except OSError:
                 original_error.add_note("pre-send mailbox cleanup also failed")
             raise
         except ProviderAdapterError as original_error:
             try:
-                self._cleanup_presend_payloads(binding_id, mailbox)
+                self._cleanup_presend_payloads(binding_id, request_id, mailbox)
             except OSError as cleanup_error:
                 failure = ProviderAdapterError(
                     "ephemeral_presend_cleanup_failed",
@@ -207,7 +248,7 @@ class AntigravityAdapter:
             raise
         except Exception as exc:
             try:
-                self._cleanup_presend_payloads(binding_id, mailbox)
+                self._cleanup_presend_payloads(binding_id, request_id, mailbox)
             except OSError as cleanup_error:
                 failure = ProviderAdapterError(
                     "ephemeral_presend_cleanup_failed",
@@ -479,14 +520,19 @@ class AntigravityAdapter:
     def _cleanup_presend_payloads(
         self,
         binding_id: str,
+        request_id: str,
         mailbox: EphemeralMailbox | None,
     ) -> None:
         if mailbox is not None:
             mailbox.cleanup_request()
-            return
-        EphemeralMailbox.cleanup_payload_files(
-            self._generation_root(binding_id) / "mailbox"
-        )
+        else:
+            EphemeralMailbox.cleanup_payload_files(
+                self._generation_root(binding_id) / "mailbox"
+            )
+        try:
+            AttachmentStore(self._generation_root(binding_id)).prune(request_id)
+        except Exception as exc:
+            raise OSError("attachment pre-send cleanup failed") from exc
 
     def _ensure_generation_artifacts(
         self,

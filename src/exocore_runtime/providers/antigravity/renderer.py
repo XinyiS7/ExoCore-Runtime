@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 import json
+from pathlib import Path
 
 from exocore_runtime.contracts import ContinuityDeltaTurn, TurnRequest
 from exocore_runtime.providers.antigravity.mcp_policy import MCP_SERVER_NAME
@@ -304,8 +306,40 @@ def _render_delta_sections(
     return sections
 
 
-def render_user_content(request: TurnRequest, *, is_first_turn: bool) -> str:
-    if not is_first_turn and not request.continuity_delta:
+def _current_user_content(
+    request: TurnRequest,
+    attachment_paths: Mapping[str, str] | None,
+) -> str:
+    if not request.attachments:
+        return request.user_message
+    paths = dict(attachment_paths or {})
+    expected = {attachment.artifact_id for attachment in request.attachments}
+    if set(paths) != expected:
+        raise ValueError("attachment path mapping does not match request")
+    lines = [
+        request.user_message,
+        "",
+        "Files supplied by the user for this turn (read with view_file when relevant):",
+    ]
+    for index, attachment in enumerate(request.attachments, start=1):
+        path = paths[attachment.artifact_id]
+        if not isinstance(path, str) or not Path(path).is_absolute():
+            raise ValueError("attachment path must be absolute")
+        lines.append(
+            f"{index}. name={json.dumps(attachment.display_name, ensure_ascii=False)} "
+            f"mime={attachment.mime_type} "
+            f"path={json.dumps(path, ensure_ascii=False)}"
+        )
+    return "\n".join(lines)
+
+
+def render_user_content(
+    request: TurnRequest,
+    *,
+    is_first_turn: bool,
+    attachment_paths: Mapping[str, str] | None = None,
+) -> str:
+    if not is_first_turn and not request.continuity_delta and not request.attachments:
         return request.user_message
     if is_first_turn:
         if request.bootstrap_context is None:
@@ -319,14 +353,30 @@ def render_user_content(request: TurnRequest, *, is_first_turn: bool) -> str:
     else:
         sections = []
     sections.extend(_render_delta_sections(request.continuity_delta))
-    sections.append(_raw_section("CurrentUserMessage", request.user_message))
+    sections.append(
+        _raw_section(
+            "CurrentUserMessage",
+            _current_user_content(request, attachment_paths),
+        )
+    )
     return "\n\n".join(sections)
 
 
-def render_stdin_line(request: TurnRequest, *, is_first_turn: bool) -> bytes:
+def render_stdin_line(
+    request: TurnRequest,
+    *,
+    is_first_turn: bool,
+    attachment_paths: Mapping[str, str] | None = None,
+) -> bytes:
     payload = {
         "event": "user",
-        "message": {"content": render_user_content(request, is_first_turn=is_first_turn)},
+        "message": {
+            "content": render_user_content(
+                request,
+                is_first_turn=is_first_turn,
+                attachment_paths=attachment_paths,
+            )
+        },
     }
     return (
         json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"

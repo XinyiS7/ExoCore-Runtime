@@ -45,6 +45,26 @@ class RetiredError(RuntimeGatewayError):
     status_code = 409
 
 
+class RequestRegisteredError(RuntimeGatewayError):
+    code = "request_registered"
+    status_code = 409
+
+
+class AttachmentSizeExceededError(RuntimeGatewayError):
+    code = "attachment_size_exceeded"
+    status_code = 400
+
+
+class AttachmentCapacityExceededError(RuntimeGatewayError):
+    code = "attachment_capacity_exceeded"
+    status_code = 400
+
+
+class AttachmentStagingError(RuntimeGatewayError):
+    code = "attachment_staging_failed"
+    status_code = 500
+
+
 class StateResetRequiredError(RuntimeGatewayError):
     code = "v2_state_reset_required"
     status_code = 409
