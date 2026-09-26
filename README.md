@@ -1,6 +1,8 @@
 # ExoCore Runtime Gateway
 
-A provider-neutral loopback service for subscription-backed model transports. It owns only durable provider transport state; canonical conversation and memory data remain outside this sibling service.
+A provider-neutral loopback service for subscription-backed model transports. It owns only durable provider transport state; canonical conversation and memory data remain outside this service.
+
+Repository: `XinyiS7/ExoCore-Runtime` — standalone since 2026-09-26, extracted from the umbrella `ExoCore_Project` repository with history preserved.
 
 ## Run
 
@@ -49,7 +51,7 @@ Startup check: `8000` and `8766` free -> migrate check -> start the Runtime -> `
 
 Pre-send reconcile: a `runserver` reload session reconciles abandoned pre-send turns automatically in its `RUN_MAIN` child startup; a `--noreload` session has to run `python manage.py reconcile_runtime_presend` itself. The sweep assumes one serving Django process.
 
-Token hygiene (not correctness): the bearer is process-scoped. `../start_backend_with_runtime.ps1` stays an optional convenience that starts both halves with one in-memory bearer; the daily flow above does not need it.
+Token hygiene (not correctness): the bearer is process-scoped. The umbrella's `../start_backend_with_runtime.ps1` stays an optional convenience that starts both halves with one in-memory bearer; the daily flow above does not need it.
 
 ## Runtime providers
 

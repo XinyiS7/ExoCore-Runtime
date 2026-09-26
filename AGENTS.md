@@ -1,6 +1,13 @@
 # ExoCore-Runtime Agent Guide
 
-This sibling service is an outbound provider runtime. It must remain independent from Django and the ExoCore Python packages.
+This service is an outbound provider runtime. It must remain independent from Django and the ExoCore Python packages.
+
+## Repository
+
+- Independent repository: `git@github.com:XinyiS7/ExoCore-Runtime.git`, branch `main`.
+- Extracted 2026-09-26 from the umbrella `ExoCore_Project` repository with full history preserved. The umbrella no longer tracks this directory; it now only holds cross-repo docs/scripts, nginx config and local data.
+- The live worktree normally sits at `ExoCore_Project/ExoCore-Runtime/` as a nested independent checkout, so sibling paths such as `../ExoCore` or `../start_backend_with_runtime.ps1` belong to the umbrella and are local conveniences, not part of this repository.
+- Cross-repo plans that cover this service together with Django live in `ExoCore/Plan/` of the sibling `ExoCore` repository.
 
 ## Boundaries
 
@@ -24,4 +31,4 @@ python.exe -m exocore_runtime
 
 Use Python 3.12 and ASCII double quotes in Python source.
 
-Daily local launch (Alicia): `run-runtime` for this service (:8766) alongside `run-exocore` for Django — both are bash aliases in `~/.bashrc`; nginx runs as a persistent Docker container and is not part of the startup steps. `../start_backend_with_runtime.ps1` is an optional convenience wrapper only; do not present it as the normal startup path.
+Daily local launch (Alicia): `run-runtime` for this service (:8766) alongside `run-exocore` for Django — both are bash aliases in `~/.bashrc`; nginx runs as a persistent Docker container and is not part of the startup steps. The umbrella's `../start_backend_with_runtime.ps1` is an optional convenience wrapper only; do not present it as the normal startup path.
