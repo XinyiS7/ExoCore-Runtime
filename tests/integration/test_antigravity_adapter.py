@@ -197,6 +197,16 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
         values.update(overrides)
         return AttachmentManifest(**values)
 
+    async def wait_for_claim_waiters(self, lock, expected: int) -> None:
+        """Deterministic ordering: wait until N tasks are queued on the lock."""
+
+        for _ in range(500):
+            waiters = getattr(lock, "_waiters", None)
+            if waiters is not None and len(waiters) >= expected:
+                return
+            await asyncio.sleep(0.001)
+        raise AssertionError(f"claim lock did not queue {expected} waiter(s)")
+
     async def test_first_same_process_restart_resume_and_retire(self) -> None:
         service, adapter = self.build_service()
         generation = await service.ensure_generation(self.binding_id, self.spec)
@@ -1600,6 +1610,211 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[-1].event_type, "done")
         self.assertEqual(both_final.read_bytes(), PNG_BYTES)
         self.assertFalse(both_blob.exists())
+
+    async def test_stage_wins_claim_race_before_registration(self) -> None:
+        from exocore_runtime.providers.antigravity import attachments as attachments_module
+
+        service, _adapter = self.build_service()
+        await service.ensure_generation(self.binding_id, self.spec)
+        request = self.turn(bootstrap={"history": []})
+        manifest = self.attachment_manifest()
+        binding = str(self.binding_id)
+        request_key = str(request.request_id)
+        stage_written = asyncio.Event()
+        original_stage = attachments_module.AttachmentStore.stage
+
+        def recording_stage(store_self, request_id, artifact_id, data):
+            path = original_stage(store_self, request_id, artifact_id, data)
+            stage_written.set()
+            return path
+
+        claim_observations: list[bool] = []
+        original_claim = service.store.claim_request
+
+        def recording_claim(*args, **kwargs):
+            claim_observations.append(stage_written.is_set())
+            return original_claim(*args, **kwargs)
+
+        attachments_module.AttachmentStore.stage = recording_stage
+        service.store.claim_request = recording_claim
+        claim_lock = await service._get_claim_lock(binding, request_key)
+        stage_task = None
+        turn_task = None
+        try:
+            await claim_lock.acquire()
+            stage_task = asyncio.create_task(
+                service.stage_attachment(
+                    self.binding_id,
+                    request.request_id,
+                    manifest.artifact_id,
+                    PNG_BYTES,
+                )
+            )
+            await self.wait_for_claim_waiters(claim_lock, 1)
+            turn_task = asyncio.create_task(
+                collect(
+                    service,
+                    self.binding_id,
+                    request.model_copy(update={"attachments": (manifest,)}),
+                )
+            )
+            await self.wait_for_claim_waiters(claim_lock, 2)
+            self.assertIsNone(service.store.get_request(binding, request_key))
+            claim_lock.release()
+            await asyncio.wait_for(stage_task, timeout=5)
+            events = await asyncio.wait_for(turn_task, timeout=5)
+        finally:
+            attachments_module.AttachmentStore.stage = original_stage
+            service.store.claim_request = original_claim
+            if claim_lock.locked():
+                claim_lock.release()
+            pending = [
+                task for task in (stage_task, turn_task) if task is not None and not task.done()
+            ]
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+        self.assertEqual(claim_observations, [True])
+        self.assertEqual(events[-1].event_type, "done")
+        final = self.request_attachment_dir(request.request_id) / "att-7.png"
+        self.assertEqual(final.read_bytes(), PNG_BYTES)
+        self.assertFalse((final.parent / "att-7.blob").exists())
+        self.assertEqual(
+            service.store.get_request(binding, request_key).status,
+            "completed",
+        )
+
+    async def test_discard_wins_claim_race_before_registration(self) -> None:
+        from exocore_runtime.providers.antigravity import attachments as attachments_module
+
+        service, _adapter = self.build_service()
+        await service.ensure_generation(self.binding_id, self.spec)
+        request = self.turn(bootstrap={"history": []})
+        binding = str(self.binding_id)
+        request_key = str(request.request_id)
+        await service.stage_attachment(
+            self.binding_id,
+            request.request_id,
+            "att-7",
+            PNG_BYTES,
+        )
+        staged_dir = self.request_attachment_dir(request.request_id)
+        self.assertTrue((staged_dir / "att-7.blob").is_file())
+
+        discard_done = asyncio.Event()
+        original_discard = attachments_module.AttachmentStore.discard
+
+        def recording_discard(store_self, request_id):
+            original_discard(store_self, request_id)
+            discard_done.set()
+
+        claim_observations: list[bool] = []
+        original_claim = service.store.claim_request
+
+        def recording_claim(*args, **kwargs):
+            claim_observations.append(discard_done.is_set())
+            return original_claim(*args, **kwargs)
+
+        attachments_module.AttachmentStore.discard = recording_discard
+        service.store.claim_request = recording_claim
+        claim_lock = await service._get_claim_lock(binding, request_key)
+        discard_task = None
+        turn_task = None
+        try:
+            await claim_lock.acquire()
+            discard_task = asyncio.create_task(
+                service.discard_attachments(self.binding_id, request.request_id)
+            )
+            await self.wait_for_claim_waiters(claim_lock, 1)
+            turn_task = asyncio.create_task(
+                collect(service, self.binding_id, request)
+            )
+            await self.wait_for_claim_waiters(claim_lock, 2)
+            self.assertIsNone(service.store.get_request(binding, request_key))
+            claim_lock.release()
+            await asyncio.wait_for(discard_task, timeout=5)
+            self.assertFalse(staged_dir.exists())
+            events = await asyncio.wait_for(turn_task, timeout=5)
+        finally:
+            attachments_module.AttachmentStore.discard = original_discard
+            service.store.claim_request = original_claim
+            if claim_lock.locked():
+                claim_lock.release()
+            pending = [
+                task for task in (discard_task, turn_task) if task is not None and not task.done()
+            ]
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+        self.assertEqual(claim_observations, [True])
+        self.assertEqual(events[-1].event_type, "done")
+        self.assertFalse(staged_dir.exists())
+        self.assertEqual(
+            service.store.get_request(binding, request_key).status,
+            "completed",
+        )
+
+    async def test_claim_wins_race_blocks_stage_and_discard_without_mutation(self) -> None:
+        service, adapter = self.build_service()
+        await service.ensure_generation(self.binding_id, self.spec)
+        request = self.turn(bootstrap={"history": []})
+        manifest = self.attachment_manifest()
+        await service.stage_attachment(
+            self.binding_id,
+            request.request_id,
+            manifest.artifact_id,
+            PNG_BYTES,
+        )
+        attachment_dir = self.request_attachment_dir(request.request_id)
+        blob = attachment_dir / "att-7.blob"
+        final = blob.with_suffix(".png")
+        final.write_bytes(PNG_BYTES)
+
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        original_prepare = adapter.prepare_turn
+
+        async def blocked_prepare(*args, **kwargs):
+            entered.set()
+            await release.wait()
+            return await original_prepare(*args, **kwargs)
+
+        adapter.prepare_turn = blocked_prepare
+        turn_task = asyncio.create_task(
+            collect(
+                service,
+                self.binding_id,
+                request.model_copy(update={"attachments": (manifest,)}),
+            )
+        )
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        durable = service.store.get_request(
+            str(self.binding_id),
+            str(request.request_id),
+        )
+        self.assertIsNotNone(durable)
+        self.assertEqual(durable.status, "prepared")
+
+        with self.assertRaises(RequestRegisteredError):
+            await service.stage_attachment(
+                self.binding_id,
+                request.request_id,
+                "att-8",
+                b"other-bytes",
+            )
+        with self.assertRaises(RequestRegisteredError):
+            await service.discard_attachments(self.binding_id, request.request_id)
+        self.assertEqual(blob.read_bytes(), PNG_BYTES)
+        self.assertEqual(final.read_bytes(), PNG_BYTES)
+        self.assertFalse((attachment_dir / "att-8.blob").exists())
+
+        release.set()
+        events = await asyncio.wait_for(turn_task, timeout=5)
+        self.assertEqual(events[-1].event_type, "done")
+        self.assertEqual(final.read_bytes(), PNG_BYTES)
+        self.assertFalse(blob.exists())
 
 if __name__ == "__main__":
     unittest.main()

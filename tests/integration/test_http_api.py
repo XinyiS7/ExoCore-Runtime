@@ -141,6 +141,38 @@ class LiveGateway:
         finally:
             connection.close()
 
+    def put_incomplete_body_and_disconnect(self, path, declared_length, body):
+        """Declare more bytes than are sent, then close the write side."""
+
+        request = (
+            f"PUT {path} HTTP/1.1\r\n"
+            f"Host: 127.0.0.1:{self.port}\r\n"
+            f"Authorization: Bearer {self.token}\r\n"
+            "Content-Type: application/octet-stream\r\n"
+            f"Content-Length: {declared_length}\r\n"
+            "Connection: close\r\n\r\n"
+        ).encode("ascii") + body
+        connection = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+        try:
+            connection.sendall(request)
+            connection.settimeout(0.25)
+            pending = None
+            try:
+                pending = connection.recv(4096)
+            except socket.timeout:
+                pending = b""
+            connection.settimeout(5)
+            connection.shutdown(socket.SHUT_WR)
+            response = b""
+            while True:
+                chunk = connection.recv(4096)
+                if not chunk:
+                    break
+                response += chunk
+            return pending, response
+        finally:
+            connection.close()
+
     @staticmethod
     def assert_response_started(response_head):
         if not response_head.startswith(b"HTTP/1.1 200"):
@@ -584,6 +616,77 @@ class RuntimeHttpTests(unittest.TestCase):
             self.assertEqual(first, replay)
             self.assertEqual(sum(second_gateway.provider.turn_sends.values()), 0)
         self.assertFalse(any(thread.name == "runtime-test-server" for thread in threading.enumerate()))
+    def test_incomplete_attachment_upload_leaves_no_staged_artifact(self) -> None:
+        binding_id = uuid4()
+        request_id = uuid4()
+        generation_path, _, _ = self._generation_paths(binding_id)
+        data_root = Path(self.temp.name) / "interrupted-upload-providers"
+        fixture = Path(__file__).resolve().parents[1] / "fixtures" / "fake_agy.py"
+        memory_server_marker = (
+            Path(self.temp.name) / "engines" / "mcp" / "servers" / "memory" / "server.py"
+        )
+        memory_server_marker.parent.mkdir(parents=True)
+        memory_server_marker.write_text("# test Memory MCP marker\n", encoding="utf-8")
+        supervisor = AgyProcessSupervisor(
+            AgyProcessConfig(
+                command_prefix=(sys.executable, str(fixture)),
+                init_timeout_seconds=1,
+                idle_timeout_seconds=1,
+                hard_timeout_seconds=3,
+                close_timeout_seconds=1,
+                require_official_executable=False,
+                environment_overrides={
+                    "FAKE_AGY_SCENARIO": "normal",
+                    "FAKE_AGY_EVIDENCE": str(
+                        Path(self.temp.name) / "interrupted-evidence.jsonl"
+                    ),
+                    "PYTHONPATH": str(Path(__file__).resolve().parents[2] / "src"),
+                },
+            )
+        )
+        antigravity = AntigravityAdapter(
+            data_root,
+            supervisor,
+            memory_mcp_root=Path(self.temp.name),
+        )
+        providers = {"fake": DeterministicFakeAdapter(), "antigravity": antigravity}
+        spec = v2_spec(
+            runtime_kind="antigravity",
+            system_instructions="private system contract",
+        )
+        attachment_path = (
+            f"/v2/generations/{binding_id}/turns/{request_id}/attachments/att-7"
+        )
+        with LiveGateway(self.state_path, self.token, providers) as gateway:
+            self.assertEqual(
+                gateway.request("PUT", generation_path, spec, self.token)[0],
+                200,
+            )
+            probe = gateway.put_incomplete_body_and_disconnect(
+                attachment_path,
+                declared_length=24,
+                body=b"\x89PNG\r\n\x1a\npartial",
+            )
+            pending, response = probe
+            self.assertEqual(pending, b"")
+            self.assertFalse(response.startswith(b"HTTP/1.1 200"))
+            self.assertIsNone(
+                gateway.app.state.runtime_store.get_request(
+                    str(binding_id), str(request_id)
+                )
+            )
+
+        generation_root = data_root / binding_id.hex
+        request_root = generation_root / "workspace" / str(request_id)
+        self.assertFalse(request_root.exists())
+        artifacts = [
+            path.name
+            for path in generation_root.rglob("*")
+            if path.is_file()
+            and path.suffix.lower()
+            in {".blob", ".png", ".jpg", ".jpeg", ".webp", ".tmp"}
+        ]
+        self.assertEqual(artifacts, [])
 
 
 if __name__ == "__main__":
