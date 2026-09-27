@@ -45,7 +45,7 @@ Runtime correctness depends on:
 2. **Bearer alignment** - Django `SUBSCRIPTION_RUNTIME_TOKEN` against Runtime `EXOCORE_RUNTIME_TOKEN`.
 3. **Django authorizes the intended Runtime preset** in `SUBSCRIPTION_RUNTIME_PRESET_ALLOWLIST` (the current local setup authorizes presets 1 and 8).
 4. **Migrations current** - `python.exe manage.py migrate --check --noinput`.
-5. **Exact health contract** - `GET /v2/health` returns `status=ok`, `schema_version=v2`, `protocol=subscription-runtime-v2` and all five capabilities (`generation_state_only`, `durable_control_events`, `requested_effective_execution`, `strict_session_resume`, `request_journal_replay`).
+5. **Exact health contract** - `GET /v2/health` returns `status=ok`, `schema_version=v2`, `protocol=subscription-runtime-v2` and all six capabilities (`generation_state_only`, `durable_control_events`, `requested_effective_execution`, `strict_session_resume`, `request_journal_replay`, `turn_attachments`).
 
 Startup check: `8000` and `8766` free -> migrate check -> start the Runtime -> `curl http://127.0.0.1:8766/v2/health` -> start Django with the matching URL and bearer.
 
@@ -58,10 +58,20 @@ Token hygiene (not correctness): the bearer is process-scoped. The umbrella's `.
 - `fake`: deterministic protocol and lifecycle fixture retained from Milestone A.
 - `antigravity`: official AGY `>=1.1.20,<1.3` using consumer `account_default` authentication and the pinned `gemini-3.1-pro-high` model. The verified envelope is 1.1.20 - 1.2.4 (1.2.4 NDJSON capture lives in `tests/fixtures/agy_1_2_4_success.jsonl`); a new minor boundary needs a fresh capture before the gate is widened.
 
-The AGY adapter has no API-key, Vertex, Python SDK, shell, or unofficial executable fallback. Each generation receives an isolated profile, custom agent, deny-all tool policy, empty workspace, one-shot PreInvocation mailbox, and supervised process tree. SQLite remains the durable source for bootstrap, send, replay, cancellation, and terminal status.
+The AGY adapter has no API-key, Vertex, Python SDK, shell, or unofficial executable fallback. Each generation receives an isolated profile, custom agent, deny-all tool policy, a generation-private workspace (request-scoped attachment staging only), a one-shot PreInvocation mailbox, and a supervised process tree. SQLite remains the durable source for bootstrap, send, replay, cancellation, and terminal status.
 
 Retiring a generation immediately stops its process and deletes only its generation-owned provider root. Completed journal replay remains available in SQLite. The adapter never deletes or copies the official Windows keyring or canonical ExoCore data.
 
+### Turn attachments
+
+Current-turn image attachments are staged before send and rendered into the provider's `CurrentUserMessage`; earlier turns are never replayed.
+
+- Capability is declared by the handshake: `turn_attachments` is part of `RUNTIME_CAPABILITIES` and of the `GET /v2/health` capabilities; clients must gate on that exact list instead of any static endpoint table.
+- Staging uses an authenticated raw `PUT /v2/generations/{binding_id}/turns/{request_id}/attachments/{artifact_id}`, writing request-scoped opaque `.blob` artifacts under the generation workspace with atomic writes; a request accepts up to 5 files, 20 MiB each and 50 MiB total.
+- Before provider spawn, size, SHA256 and MIME are verified; staged artifacts materialize crash-idempotently into the request's attachment directory, and only Runtime-owned absolute paths are projected into the rendered input.
+- `DELETE /v2/generations/{binding_id}/turns/{request_id}/attachments` prunes pre-send staging idempotently; once the request is durably registered, both PUT and DELETE refuse with `request_registered` and leave bytes unchanged.
+- Retire deletes only the generation-owned provider root, which holds every staging and materialized attachment artifact.
+
 ## Scope limits
 
-This service does not import Django or ExoCore production packages and does not own Endpoint, AgentPreset, Conversation, Message, memory compaction, attachments, MCP, frontend behavior, or other provider adapters.
+This service does not import Django or ExoCore production packages and does not own Endpoint, AgentPreset, Conversation, Message, memory compaction, canonical attachment records or content (it only stages, materializes and retires request-scoped attachment bytes under the generation root), MCP, frontend behavior, or other provider adapters.
