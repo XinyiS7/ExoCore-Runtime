@@ -165,6 +165,48 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
             adapter._validate_mcp_manifest(bounded, options)
         self.assertEqual(caught.exception.code, "agy_mcp_tool_timeout_invalid")
 
+    async def test_manifest_digest_mismatch_fails_before_config_or_process_mutation(self) -> None:
+        service, adapter = self.build_service()
+        await service.ensure_generation(self.binding_id, self.spec)
+        request = self.turn(bootstrap={"history": []})
+        generation = service.store.get_generation(str(self.binding_id))
+        config_path = (
+            next(self.data_root.iterdir())
+            / "profile"
+            / ".gemini"
+            / "config"
+            / "mcp_config.json"
+        )
+        original_config = config_path.read_bytes()
+        base = adapter.resolve_execution(
+            request.requested_model_id,
+            request.requested_thinking_level,
+        ).process_options
+
+        for label, options in (
+            ("missing", base),
+            (
+                "mismatched",
+                base.model_copy(update={"mcp_manifest_sha256": "a" * 64}),
+            ),
+        ):
+            with self.subTest(label=label):
+                with self.assertRaises(ProviderAdapterError) as caught:
+                    await adapter.prepare_turn(
+                        generation,
+                        request,
+                        options,
+                        is_first_turn=True,
+                    )
+                self.assertEqual(caught.exception.code, "agy_mcp_manifest_mismatch")
+                self.assertEqual(config_path.read_bytes(), original_config)
+                self.assertEqual(adapter.supervisor._sessions, {})
+                self.assertEqual(
+                    [item for item in self.evidence() if item["kind"] == "spawn"],
+                    [],
+                )
+                self.assertEqual(adapter._requests, {})
+
     def test_memory_mcp_root_requires_server_marker(self) -> None:
         bad_root = self.root / "not-exocore"
         bad_root.mkdir()

@@ -9,6 +9,7 @@ import tokenize
 import unittest
 
 from exocore_runtime.errors import ProviderAdapterError
+from exocore_runtime.providers.antigravity import mcp_policy
 from exocore_runtime.providers.antigravity import ndjson as ndjson_parser
 from exocore_runtime.providers.antigravity.ndjson import AgyTurnNormalizer, parse_init
 
@@ -559,6 +560,18 @@ class McpToolIdentityProjectionTests(unittest.TestCase):
                 "keywords",
             ):
                 self.assertNotIn(residue, rendered)
+
+    def test_mcp_policy_exposes_only_runtime_owned_server_fact(self) -> None:
+        self.assertFalse(hasattr(mcp_policy, "MCP_ENABLED_TOOL_NAMES"))
+        self.assertFalse(hasattr(mcp_policy, "MCP_EAGER_TOOL_NAMES"))
+        self.assertEqual(
+            {
+                name
+                for name in vars(mcp_policy)
+                if name.startswith("MCP_") and name.isupper()
+            },
+            {"MCP_SERVER_NAME"},
+        )
 
     def test_mcp_server_literal_has_one_runtime_fact_source(self) -> None:
         package = Path(ndjson_parser.__file__).resolve().parent

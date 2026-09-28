@@ -45,7 +45,7 @@ Runtime correctness depends on:
 2. **Bearer alignment** - Django `SUBSCRIPTION_RUNTIME_TOKEN` against Runtime `EXOCORE_RUNTIME_TOKEN`.
 3. **Django authorizes the intended Runtime preset** in `SUBSCRIPTION_RUNTIME_PRESET_ALLOWLIST` (the current local setup authorizes presets 1 and 8).
 4. **Migrations current** - `python.exe manage.py migrate --check --noinput`.
-5. **Exact health contract** - `GET /v2/health` returns `status=ok`, `schema_version=v2`, `protocol=subscription-runtime-v2` and all six capabilities (`generation_state_only`, `durable_control_events`, `requested_effective_execution`, `strict_session_resume`, `request_journal_replay`, `turn_attachments`).
+5. **Exact health contract** - `GET /v2/health` returns `status=ok`, `schema_version=v2`, `protocol=subscription-runtime-v2` and all seven capabilities, in order: `generation_state_only`, `durable_control_events`, `requested_effective_execution`, `strict_session_resume`, `request_journal_replay`, `turn_attachments`, `runtime_mcp_tool_manifest`.
 
 Startup check: `8000` and `8766` free -> migrate check -> start the Runtime -> `curl http://127.0.0.1:8766/v2/health` -> start Django with the matching URL and bearer.
 
@@ -62,11 +62,19 @@ The AGY adapter has no API-key, Vertex, Python SDK, shell, or unofficial executa
 
 Retiring a generation immediately stops its process and deletes only its generation-owned provider root. Completed journal replay remains available in SQLite. The adapter never deletes or copies the official Windows keyring or canonical ExoCore data.
 
+### Dynamic Runtime MCP manifest
+
+`runtime_mcp_tool_manifest` is a lockstep wire capability. Every turn carries an ordered ExoCore-owned `runtime_mcp_tools` manifest whose exact item fields are `name`, `eager`, and `max_call_seconds`. Runtime validates its bounded shape, uniqueness, canonical names, digest, and timeout budget, then materializes AGY `enabledTools` and eager entries solely from that manifest. Runtime intentionally keeps no mirror of ExoCore tool names; its own facts remain the MCP server identity, scoped permissions, and AGY-native tools.
+
+The manifest participates in the turn request fingerprint and process execution options, not generation identity. A changed manifest disposes and respawns the AGY process once while resuming the same provider session. Every non-null `max_call_seconds` must be less than the configured AGY idle timeout, and idle must not exceed hard timeout; defaults satisfy `45 < 60 <= 180`.
+
+Django and Runtime must deploy this capability together. With no active turn, stop both services, update both repositories, start Runtime first, verify the exact health capability list, then start Django. A new client with an old Runtime or an old client with a new Runtime fails closed at exact capability/preflight validation before a turn is sent; this checkpoint must not be split-pushed.
+
 ### Turn attachments
 
 Current-turn image attachments are staged before send and rendered into the provider's `CurrentUserMessage`; earlier turns are never replayed.
 
-- Capability is declared by the handshake: `turn_attachments` is part of `RUNTIME_CAPABILITIES` and of the `GET /v2/health` capabilities; clients must gate on that exact list instead of any static endpoint table.
+- Capability is declared by the handshake: `turn_attachments` is part of the exact seven-item `RUNTIME_CAPABILITIES` / `GET /v2/health` list; clients must gate on that exact list instead of any static endpoint table.
 - Staging uses an authenticated raw `PUT /v2/generations/{binding_id}/turns/{request_id}/attachments/{artifact_id}`, writing request-scoped opaque `.blob` artifacts under the generation workspace with atomic writes; a request accepts up to 5 files, 20 MiB each and 50 MiB total.
 - Before provider spawn, size, SHA256 and MIME are verified; staged artifacts materialize crash-idempotently into the request's attachment directory, and only Runtime-owned absolute paths are projected into the rendered input.
 - `DELETE /v2/generations/{binding_id}/turns/{request_id}/attachments` prunes pre-send staging idempotently; once the request is durably registered, both PUT and DELETE refuse with `request_registered` and leave bytes unchanged.
