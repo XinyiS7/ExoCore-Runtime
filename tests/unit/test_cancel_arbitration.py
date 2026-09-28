@@ -36,6 +36,7 @@ def turn(*, request_id=None, thinking="auto", bootstrap=None):
         user_message="hello",
         requested_model_id="gemini-3.1-pro-preview",
         requested_thinking_level=thinking,
+        runtime_mcp_tools=({"name": "memory_search", "eager": True, "max_call_seconds": None},),
         bootstrap_context=bootstrap,
     )
 

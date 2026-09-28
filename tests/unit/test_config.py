@@ -25,6 +25,22 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertIn("[REDACTED]", repr(config))
         self.assertIn("memory_mcp_root='[PRIVATE]'", repr(config))
 
+    def test_default_agy_timeout_budget_supports_voice_manifest(self) -> None:
+        config = RuntimeConfig(
+            "127.0.0.1", 8766, "canary-token", Path("state.db")
+        )
+        self.assertLess(45, config.agy_idle_timeout)
+        self.assertLessEqual(config.agy_idle_timeout, config.agy_hard_timeout)
+        with self.assertRaisesRegex(ValueError, "cannot exceed hard timeout"):
+            RuntimeConfig(
+                "127.0.0.1",
+                8766,
+                "canary-token",
+                Path("state.db"),
+                agy_idle_timeout=181,
+                agy_hard_timeout=180,
+            )
+
     def test_memory_mcp_root_env_override_is_resolved(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir, patch.dict(
             "os.environ",

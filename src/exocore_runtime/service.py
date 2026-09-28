@@ -19,6 +19,7 @@ from exocore_runtime.contracts import (
     RuntimeEvent,
     TurnRequest,
     canonical_turn_request_hash,
+    runtime_mcp_manifest_sha256,
 )
 from exocore_runtime.errors import (
     CancelUnregisteredError,
@@ -255,6 +256,17 @@ class RuntimeService:
                 resolution = provider.resolve_execution(
                     current.requested_model_id,
                     current.requested_thinking_level,
+                )
+                resolution = resolution.model_copy(
+                    update={
+                        "process_options": resolution.process_options.model_copy(
+                            update={
+                                "mcp_manifest_sha256": runtime_mcp_manifest_sha256(
+                                    request.runtime_mcp_tools
+                                )
+                            }
+                        )
+                    }
                 )
             except ProviderAdapterError as exc:
                 if exc.code != "unsupported_requested_execution":

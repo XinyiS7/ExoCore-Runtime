@@ -7,7 +7,12 @@ from uuid import uuid4
 
 from pydantic import ValidationError
 
-from exocore_runtime.contracts import GenerationSpec, ProcessExecutionOptions, TurnRequest
+from exocore_runtime.contracts import (
+    GenerationSpec,
+    ProcessExecutionOptions,
+    RuntimeMcpTool,
+    TurnRequest,
+)
 from exocore_runtime.errors import ConflictError, StateResetRequiredError
 from exocore_runtime.providers.antigravity.capabilities import (
     LAUNCH_ENVIRONMENT_REVISION,
@@ -29,6 +34,7 @@ def request(*, request_id=None, thinking="auto", model="gemini-3.1-pro-preview",
         user_message="hello",
         requested_model_id=model,
         requested_thinking_level=thinking,
+        runtime_mcp_tools=({"name": "memory_search", "eager": True, "max_call_seconds": None},),
         bootstrap_context=bootstrap,
     )
 
@@ -181,6 +187,37 @@ class RuntimeV2ServiceTests(unittest.IsolatedAsyncioTestCase):
             session,
         )
 
+    async def test_manifest_change_respawns_once_and_resumes_provider_session(self) -> None:
+        await self.service.ensure_generation(self.binding_id, self.spec)
+        first = request(bootstrap={"history": []})
+        await collect(self.service, self.binding_id, first)
+        session = self.store.get_generation(str(self.binding_id)).provider_session_id
+
+        changed = request().model_copy(
+            update={
+                "runtime_mcp_tools": (
+                    RuntimeMcpTool(name="memory_search", eager=True),
+                    RuntimeMcpTool(
+                        name="send_voice_msg",
+                        eager=True,
+                        max_call_seconds=45,
+                    ),
+                )
+            }
+        )
+        await collect(self.service, self.binding_id, changed)
+
+        self.assertEqual(self.provider.process_spawns[str(self.binding_id)], 2)
+        self.assertEqual(self.provider.process_disposals[str(self.binding_id)], 1)
+        self.assertEqual(
+            self.store.get_generation(str(self.binding_id)).provider_session_id,
+            session,
+        )
+        frozen = self.store.get_request(
+            str(self.binding_id), str(changed.request_id)
+        ).process_options
+        self.assertIsNotNone(frozen.mcp_manifest_sha256)
+
     async def test_frozen_resolution_survives_owner_restart_without_resolver(self) -> None:
         await self.service.ensure_generation(self.binding_id, self.spec)
         turn = request(bootstrap={"history": []})
@@ -216,6 +253,18 @@ class RuntimeV2ServiceTests(unittest.IsolatedAsyncioTestCase):
         changed_model = base.model_copy(update={"requested_model_id": "other-model"})
         self.assertNotEqual(self.service._request_hash(base), self.service._request_hash(changed_thinking))
         self.assertNotEqual(self.service._request_hash(base), self.service._request_hash(changed_model))
+
+
+class ProcessOptionsCompatibilityTests(unittest.TestCase):
+    def test_legacy_process_options_json_parses_without_migration(self) -> None:
+        legacy = (
+            '{"provider_model_slug":"gemini-3.1-pro-high","effort":"high",'
+            '"sandbox":false,"security_policy_revision":"agy-tool-perm-v5",'
+            '"profile_mode":"generation_private",'
+            '"launch_environment_revision":"agy-isolated-env-v1"}'
+        )
+        options = ProcessExecutionOptions.model_validate_json(legacy)
+        self.assertIsNone(options.mcp_manifest_sha256)
 
 
 class FreshSchemaGateTests(unittest.TestCase):

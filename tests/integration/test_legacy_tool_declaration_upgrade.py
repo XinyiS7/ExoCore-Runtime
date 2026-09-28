@@ -138,6 +138,7 @@ class LegacyDeclarationUpgradeTests(unittest.IsolatedAsyncioTestCase):
             user_message="legacy declaration upgrade turn",
             requested_model_id="gemini-3.1-pro-preview",
             requested_thinking_level=thinking,
+            runtime_mcp_tools=({"name": "memory_search", "eager": True, "max_call_seconds": None},),
             bootstrap_context={"history": []} if bootstrap else None,
         )
 

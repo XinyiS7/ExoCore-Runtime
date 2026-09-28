@@ -18,6 +18,7 @@ RUNTIME_CAPABILITIES = (
     "strict_session_resume",
     "request_journal_replay",
     "turn_attachments",
+    "runtime_mcp_tool_manifest",
 )
 
 
@@ -31,6 +32,8 @@ MAX_ATTACHMENT_COUNT = 5
 MAX_ATTACHMENT_TOTAL_BYTES = 50 * 1024 * 1024
 ATTACHMENT_ID_PATTERN = r"^att-[1-9][0-9]{0,18}$"
 SHA256_PATTERN = r"^[0-9a-f]{64}$"
+MCP_TOOL_NAME_PATTERN = r"^[a-z][a-z0-9_]{0,99}$"
+MAX_RUNTIME_MCP_TOOL_COUNT = 64
 
 
 class GenerationSpec(StrictContract):
@@ -72,6 +75,20 @@ class GenerationIdentity(StrictContract):
 
 def system_instructions_sha256(system_instructions: str) -> str:
     return hashlib.sha256(system_instructions.strip().encode("utf-8")).hexdigest()
+
+
+def runtime_mcp_manifest_sha256(
+    manifest: tuple[RuntimeMcpTool, ...],
+) -> str:
+    """Hash the exact ordered manifest using canonical cross-repository JSON."""
+
+    canonical = json.dumps(
+        [tool.model_dump(mode="json") for tool in manifest],
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
 
 
 def canonical_turn_request_hash(request: TurnRequest) -> str:
@@ -220,6 +237,14 @@ class AttachmentManifest(StrictContract):
     sha256: str = Field(pattern=SHA256_PATTERN)
 
 
+class RuntimeMcpTool(StrictContract):
+    """One exact ExoCore-owned MCP exposure entry for a Runtime turn."""
+
+    name: str = Field(min_length=1, max_length=100, pattern=MCP_TOOL_NAME_PATTERN)
+    eager: StrictBool
+    max_call_seconds: StrictInt | None = Field(default=None, gt=0)
+
+
 class TurnRequest(StrictContract):
     schema_version: Literal["v2"] = "v2"
     request_id: UUID
@@ -228,6 +253,10 @@ class TurnRequest(StrictContract):
     requested_thinking_level: ThinkingLevel
     bootstrap_context: dict[str, Any] | None = Field(default=None, repr=False)
     continuity_delta: tuple[ContinuityDeltaTurn, ...] = ()
+    runtime_mcp_tools: tuple[RuntimeMcpTool, ...] = Field(
+        min_length=1,
+        max_length=MAX_RUNTIME_MCP_TOOL_COUNT,
+    )
     attachments: tuple[AttachmentManifest, ...] = Field(
         default=(),
         max_length=MAX_ATTACHMENT_COUNT,
@@ -243,6 +272,9 @@ class TurnRequest(StrictContract):
     def validate_payload_budget(self) -> "TurnRequest":
         if not self.user_message and not self.attachments:
             raise ValueError("turn requires user text or attachments")
+        tool_names = [tool.name for tool in self.runtime_mcp_tools]
+        if len(tool_names) != len(set(tool_names)):
+            raise ValueError("runtime MCP tool names must be request-unique")
         artifact_ids = [attachment.artifact_id for attachment in self.attachments]
         if len(artifact_ids) != len(set(artifact_ids)):
             raise ValueError("attachment artifact IDs must be request-unique")
@@ -273,6 +305,9 @@ class ProcessExecutionOptions(StrictContract):
     security_policy_revision: str = Field(min_length=1, max_length=100)
     profile_mode: Literal["generation_private"] = "generation_private"
     launch_environment_revision: str = Field(min_length=1, max_length=100)
+    # Compatibility default only: persisted pre-CP-D rows parse unchanged.
+    # Every newly resolved turn receives a non-null canonical manifest digest.
+    mcp_manifest_sha256: str | None = Field(default=None, pattern=SHA256_PATTERN)
 
 
 class EffectiveResolution(StrictContract):

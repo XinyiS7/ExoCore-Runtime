@@ -63,6 +63,7 @@ class AntigravityComponentTests(unittest.TestCase):
             user_message=current,
             requested_model_id="gemini-3.1-pro-preview",
             requested_thinking_level="auto",
+            runtime_mcp_tools=({"name": "memory_search", "eager": True, "max_call_seconds": None},),
             bootstrap_context={"continuity_anchor": "prior"},
             ephemeral_current=ephemeral,
         )
@@ -161,6 +162,7 @@ class AntigravityComponentTests(unittest.TestCase):
             user_message=current,
             requested_model_id="gemini-3.1-pro-preview",
             requested_thinking_level="auto",
+            runtime_mcp_tools=({"name": "memory_search", "eager": True, "max_call_seconds": None},),
             bootstrap_context={
                 "synthetic_fake_pair": {
                     "user": "fake user\nsecond line",
@@ -203,6 +205,7 @@ class AntigravityComponentTests(unittest.TestCase):
             user_message=current,
             requested_model_id="gemini-3.1-pro-preview",
             requested_thinking_level="auto",
+            runtime_mcp_tools=({"name": "memory_search", "eager": True, "max_call_seconds": None},),
             bootstrap_context=None,
             continuity_delta=(
                 ContinuityDeltaTurn(
@@ -249,6 +252,7 @@ class AntigravityComponentTests(unittest.TestCase):
             user_message=current,
             requested_model_id="gemini-3.1-flash",
             requested_thinking_level="low",
+            runtime_mcp_tools=({"name": "memory_search", "eager": True, "max_call_seconds": None},),
             bootstrap_context=None,
             continuity_delta=(),
         )
@@ -276,6 +280,9 @@ class AntigravityComponentTests(unittest.TestCase):
             "user_message": "see the attached image",
             "requested_model_id": "gemini-3.1-pro-preview",
             "requested_thinking_level": "auto",
+            "runtime_mcp_tools": (
+                {"name": "memory_search", "eager": True, "max_call_seconds": None},
+            ),
             "attachments": (self.attachment_manifest(),),
         }
         values.update(overrides)
@@ -353,6 +360,7 @@ class AntigravityComponentTests(unittest.TestCase):
             user_message=current,
             requested_model_id="gemini-3.1-pro-preview",
             requested_thinking_level="auto",
+            runtime_mcp_tools=({"name": "memory_search", "eager": True, "max_call_seconds": None},),
             bootstrap_context={
                 "synthetic_fake_pair": {"user": "fake", "assistant": "pair"},
                 "buffer_turns": "",

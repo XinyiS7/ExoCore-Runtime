@@ -11,7 +11,11 @@ import unittest
 from unittest.mock import patch
 from uuid import uuid4
 
-from exocore_runtime.contracts import GenerationSpec, TurnRequest
+from exocore_runtime.contracts import (
+    GenerationSpec,
+    TurnRequest,
+    runtime_mcp_manifest_sha256,
+)
 from exocore_runtime.errors import ProviderAdapterError
 from exocore_runtime.providers.antigravity.adapter import AntigravityAdapter
 from exocore_runtime.providers.antigravity.ephemeral_hook import EphemeralMailbox
@@ -116,6 +120,7 @@ class AgyCancelRaceTests(unittest.IsolatedAsyncioTestCase):
             user_message="CURRENT-USER-CANARY",
             requested_model_id="gemini-3.1-pro-preview",
             requested_thinking_level="auto",
+            runtime_mcp_tools=({"name": "memory_search", "eager": True, "max_call_seconds": None},),
             bootstrap_context=bootstrap,
             ephemeral_current="EPHEMERAL-PRIVATE-CANARY",
         )
@@ -162,6 +167,17 @@ class AgyCancelRaceTests(unittest.IsolatedAsyncioTestCase):
         resolution = adapter.resolve_execution(
             request.requested_model_id,
             request.requested_thinking_level,
+        )
+        resolution = resolution.model_copy(
+            update={
+                "process_options": resolution.process_options.model_copy(
+                    update={
+                        "mcp_manifest_sha256": runtime_mcp_manifest_sha256(
+                            request.runtime_mcp_tools
+                        )
+                    }
+                )
+            }
         )
         service.store.freeze_resolution(
             binding, str(request.request_id), "test-owner", resolution

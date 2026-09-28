@@ -18,7 +18,13 @@ NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 PNG_BYTES = b"\x89PNG\r\n\x1a\nattachment-pixels"
 JPEG_BYTES = b"\xff\xd8\xffattachment-jpeg"
 
-from exocore_runtime.contracts import AttachmentManifest, GenerationSpec, TurnRequest
+from exocore_runtime.contracts import (
+    AttachmentManifest,
+    GenerationSpec,
+    RuntimeMcpTool,
+    TurnRequest,
+    runtime_mcp_manifest_sha256,
+)
 from exocore_runtime.errors import (
     AttachmentCapacityExceededError,
     ConflictError,
@@ -32,12 +38,9 @@ from exocore_runtime.providers.antigravity.control import (
     CanonicalControlStore,
     ReservedControlArtifact,
 )
-from exocore_runtime.providers.antigravity.mcp_policy import (
-    MCP_EAGER_TOOL_NAMES,
-    MCP_ENABLED_TOOL_NAMES,
-)
 from exocore_runtime.providers.antigravity.process import AgyProcessConfig, AgyProcessSupervisor
 from exocore_runtime.providers.antigravity.renderer import (
+    AGENT_TOOLS,
     ALLOW_POLICY,
     DENY_POLICY,
     MCP_SERVER_NAME,
@@ -123,6 +126,45 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.services.append(service)
         return service, adapter
 
+    def test_manifest_drives_config_and_timeout_preflight(self) -> None:
+        _service, adapter = self.build_service()
+        manifest = (
+            RuntimeMcpTool(name="memory_search", eager=False),
+            RuntimeMcpTool(name="send_voice_msg", eager=True),
+        )
+        config = adapter._expected_mcp_config(str(self.binding_id), manifest)
+        server = config["mcpServers"][MCP_SERVER_NAME]
+        self.assertEqual(
+            server["enabledTools"], ["memory_search", "send_voice_msg"]
+        )
+        self.assertEqual(
+            server["tools"], {"send_voice_msg": {"eager": True}}
+        )
+        self.assertNotIn("send_voice_msg", AGENT_TOOLS)
+
+        adapter.stage_generation(str(self.binding_id), self.spec)
+        generation_root = next(self.data_root.iterdir())
+        config_path = (
+            generation_root / "profile" / ".gemini" / "config" / "mcp_config.json"
+        )
+        adapter._atomic_write_json(config_path, config)
+        adapter.stage_generation(str(self.binding_id), self.spec)
+        self.assertEqual(json.loads(config_path.read_text(encoding="utf-8")), config)
+
+        bounded = (RuntimeMcpTool(
+            name="send_voice_msg", eager=True, max_call_seconds=1
+        ),)
+        options = adapter.resolve_execution(
+            "gemini-3.1-pro-preview", "auto"
+        ).process_options.model_copy(
+            update={
+                "mcp_manifest_sha256": runtime_mcp_manifest_sha256(bounded)
+            }
+        )
+        with self.assertRaises(ProviderAdapterError) as caught:
+            adapter._validate_mcp_manifest(bounded, options)
+        self.assertEqual(caught.exception.code, "agy_mcp_tool_timeout_invalid")
+
     def test_memory_mcp_root_requires_server_marker(self) -> None:
         bad_root = self.root / "not-exocore"
         bad_root.mkdir()
@@ -159,12 +201,17 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
                     "agy_uncontrolled_mcp_source_forbidden",
                 )
 
+    @staticmethod
+    def manifest() -> tuple[RuntimeMcpTool, ...]:
+        return (RuntimeMcpTool(name="memory_search", eager=True),)
+
     def turn(self, *, thinking="auto", bootstrap=None, ephemeral=None, request_id=None):
         return TurnRequest(
             request_id=request_id or uuid4(),
             user_message="CURRENT-USER-CANARY",
             requested_model_id="gemini-3.1-pro-preview",
             requested_thinking_level=thinking,
+            runtime_mcp_tools=self.manifest(),
             bootstrap_context=bootstrap,
             ephemeral_current=ephemeral,
         )
@@ -288,10 +335,10 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
         )
         # The model-visible enumeration and the eager subset come from the single
         # Runtime MCP fact source; the entry carries no other field.
-        self.assertEqual(server_config["enabledTools"], list(MCP_ENABLED_TOOL_NAMES))
+        self.assertEqual(server_config["enabledTools"], ["memory_search"])
         self.assertEqual(
             server_config["tools"],
-            {name: {"eager": True} for name in MCP_EAGER_TOOL_NAMES},
+            {"memory_search": {"eager": True}},
         )
         self.assertEqual(
             set(server_config),
@@ -411,6 +458,7 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
                 user_message="bad",
                 requested_model_id="gemini-3.1-pro-preview",
                 requested_thinking_level="auto",
+                runtime_mcp_tools=({"name": "memory_search", "eager": True, "max_call_seconds": None},),
                 bootstrap_context={"history": []},
                 behavior="exception",
             )
@@ -613,7 +661,9 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(settings["permissions"]["allow"], list(ALLOW_POLICY))
         self.assertEqual(
             json.loads(mcp_config_path.read_text(encoding="utf-8")),
-            restarted_adapter._expected_mcp_config(str(self.binding_id)),
+            restarted_adapter._expected_mcp_config(
+                str(self.binding_id), self.manifest()
+            ),
         )
         self.assertIn(self.system_canary, agent_path.read_text(encoding="utf-8"))
         self.assertEqual(pollution.read_text(encoding="utf-8"), "workspace canary")
@@ -757,7 +807,11 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
         options = adapter.resolve_execution(
             "gemini-3.1-pro-preview",
             "auto",
-        ).process_options
+        ).process_options.model_copy(
+            update={
+                "mcp_manifest_sha256": runtime_mcp_manifest_sha256(self.manifest())
+            }
+        )
 
         # Hooks and settings are security artifacts that the v2 adapter
         # restores before verification: tampering is silently repaired at load.
@@ -766,7 +820,7 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
             json.dumps({"modelProvider": "account_default", "permissions": {"deny": []}}),
             encoding="utf-8",
         )
-        adapter._load_layout(durable_generation, options)
+        adapter._load_layout(durable_generation, options, self.manifest())
         hooks = json.loads(hooks_path.read_text(encoding="utf-8"))
         self.assertEqual(set(hooks), {"exocore-runtime-ephemeral"})
         settings = json.loads(settings_path.read_text(encoding="utf-8"))
@@ -775,14 +829,14 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
         # Ordinary workspace files survive reserved-artifact verification at load.
         pollution = generation_root / "workspace" / "pollution.txt"
         pollution.write_text("workspace canary", encoding="utf-8")
-        adapter._load_layout(durable_generation, options)
+        adapter._load_layout(durable_generation, options, self.manifest())
         self.assertEqual(pollution.read_text(encoding="utf-8"), "workspace canary")
 
         # Canonical agent markdown is identity material: any tamper is fatal
         # before the security restore may run.
         agent_path.write_text("tampered custom agent", encoding="utf-8")
         with self.assertRaises(ProviderAdapterError) as caught:
-            adapter._load_layout(durable_generation, options)
+            adapter._load_layout(durable_generation, options, self.manifest())
         self.assertEqual(caught.exception.code, "agy_custom_agent_invalid")
         agent_path.write_bytes(original_agent)
 
@@ -792,7 +846,7 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
         metadata["bootstrap_fingerprint"] = "tampered-bootstrap"
         metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
         with self.assertRaises(ProviderAdapterError) as caught:
-            adapter._load_layout(durable_generation, options)
+            adapter._load_layout(durable_generation, options, self.manifest())
         self.assertEqual(caught.exception.code, "agy_artifact_identity_mismatch")
         metadata_path.write_bytes(original_metadata)
 
@@ -800,7 +854,7 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
         metadata["provider_session_id"] = "tampered-provider-session"
         metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
         with self.assertRaises(ProviderAdapterError) as caught:
-            adapter._load_layout(durable_generation, options)
+            adapter._load_layout(durable_generation, options, self.manifest())
         self.assertEqual(caught.exception.code, "agy_artifact_session_conflict")
         metadata_path.write_bytes(original_metadata)
 
@@ -815,7 +869,7 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
         ).hexdigest()
         metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
         with self.assertRaises(ProviderAdapterError) as caught:
-            adapter._load_layout(durable_generation, options)
+            adapter._load_layout(durable_generation, options, self.manifest())
         self.assertEqual(caught.exception.code, "agy_custom_agent_invalid")
         metadata_path.write_bytes(original_metadata)
 
@@ -844,7 +898,13 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
         current = adapter.resolve_execution(
             request.requested_model_id,
             request.requested_thinking_level,
-        ).process_options
+        ).process_options.model_copy(
+            update={
+                "mcp_manifest_sha256": runtime_mcp_manifest_sha256(
+                    request.runtime_mcp_tools
+                )
+            }
+        )
         self.assertEqual(current.security_policy_revision, SECURITY_POLICY_REVISION)
         for stale_revision in ("agy-tool-perm-v3", "agy-tool-perm-v4"):
             with self.subTest(stale_revision=stale_revision):
@@ -1069,10 +1129,17 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
             request.requested_model_id,
             request.requested_thinking_level,
         )
+        options = resolution.process_options.model_copy(
+            update={
+                "mcp_manifest_sha256": runtime_mcp_manifest_sha256(
+                    request.runtime_mcp_tools
+                )
+            }
+        )
         await adapter.prepare_turn(
             generation,
             request,
-            resolution.process_options,
+            options,
             is_first_turn=True,
         )
         mailbox = adapter._mailbox(str(self.binding_id))

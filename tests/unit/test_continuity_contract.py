@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from pathlib import Path
 import unittest
 
 from pydantic import ValidationError
@@ -25,9 +26,18 @@ EMPTY_DELTA_REQUEST_ID = "11111111-2222-3333-4444-555555555555"
 UNICODE_DELTA_REQUEST_ID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 
 # Frozen cross-repository parity vectors (computed once and committed).
-EMPTY_DELTA_SHA256 = "dc91765278c541eaa7a0d395a02ba5cea2c522d1d6ac2b8c15a18fc14ac96156"
-UNICODE_DELTA_SHA256 = "cfba36e85ccd4606ab0b24744789880242e2daec7ca5adc3495ccc918c5e7f0e"
+EMPTY_DELTA_SHA256 = "4c3f2ab7bdded3f18659d343670c9827bea2d6ddf4d3bce4b877545968cc2234"
+UNICODE_DELTA_SHA256 = "9d96b395523eae02dd92939305364a8b4a7caf3fcd9083186ada102e285bb8d1"
 DELTA_FINGERPRINT_SHA256 = "58c79aea31d3db029fbe7dd5f322f6d44f97175d50e2296f245106000812729a"
+_RUNTIME_MCP_TOOLS = tuple(
+    json.loads(
+        (
+            Path(__file__).resolve().parents[1]
+            / "fixtures"
+            / "runtime_mcp_manifest.json"
+        ).read_text(encoding="utf-8")
+    )
+)
 
 # The vectors above were computed from the canonical encoder by this
 # repository's own implementation; ExoCore's suite asserts the same
@@ -49,6 +59,7 @@ def unicode_delta_request() -> TurnRequest:
         user_message="当前消息",
         requested_model_id="gemini-3.1-pro-preview",
         requested_thinking_level="auto",
+        runtime_mcp_tools=_RUNTIME_MCP_TOOLS,
         bootstrap_context=None,
         continuity_delta=delta,
         ephemeral_current=None,
@@ -62,6 +73,7 @@ def empty_delta_request() -> TurnRequest:
         user_message="hello",
         requested_model_id="gemini-3.1-pro-preview",
         requested_thinking_level="auto",
+        runtime_mcp_tools=_RUNTIME_MCP_TOOLS,
         bootstrap_context=None,
         continuity_delta=(),
         ephemeral_current=None,

@@ -54,6 +54,7 @@ class V2HttpContractTests(unittest.TestCase):
                     "strict_session_resume",
                     "request_journal_replay",
                     "turn_attachments",
+                    "runtime_mcp_tool_manifest",
                 ],
             },
         )
@@ -279,6 +280,9 @@ class V2HttpContractTests(unittest.TestCase):
             "user_message": "journal probe",
             "requested_model_id": "gemini-3.1-pro-preview",
             "requested_thinking_level": "auto",
+            "runtime_mcp_tools": [
+                {"name": "memory_search", "eager": True, "max_call_seconds": None}
+            ],
             "bootstrap_context": {"history": []},
             "continuity_delta": [],
             "ephemeral_current": None,
@@ -290,6 +294,39 @@ class V2HttpContractTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 200)
         return binding_id, request_id
+
+    def test_pre_manifest_turn_shape_is_rejected_without_registration(self) -> None:
+        binding_id = uuid4()
+        created = self.client.put(
+            f"/v2/generations/{binding_id}",
+            headers=self.auth(),
+            json={
+                "schema_version": "v2",
+                "runtime_kind": "fake",
+                "bootstrap_fingerprint": "bootstrap",
+                "system_instructions": "system",
+            },
+        )
+        self.assertEqual(created.status_code, 200)
+        request_id = uuid4()
+        old_turn = {
+            "schema_version": "v2",
+            "request_id": str(request_id),
+            "user_message": "old client",
+            "requested_model_id": "gemini-3.1-pro-preview",
+            "requested_thinking_level": "auto",
+            "bootstrap_context": {"history": []},
+        }
+        response = self.client.post(
+            f"/v2/generations/{binding_id}/turns",
+            headers=self.auth(),
+            json=old_turn,
+        )
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(response.json(), {"error": "invalid_request"})
+        self.assertIsNone(
+            self.store.get_request(str(binding_id), str(request_id))
+        )
 
     def test_journal_replay_requires_auth_and_forbids_token_in_path(self) -> None:
         binding_id, request_id = self._completed_request()

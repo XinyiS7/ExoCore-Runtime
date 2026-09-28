@@ -8,10 +8,7 @@ from typing import Any
 
 from exocore_runtime.contracts import ProviderEvent, ProviderGeneration
 from exocore_runtime.errors import ProviderAdapterError
-from exocore_runtime.providers.antigravity.mcp_policy import (
-    MCP_ENABLED_TOOL_NAMES,
-    MCP_SERVER_NAME,
-)
+from exocore_runtime.providers.antigravity.mcp_policy import MCP_SERVER_NAME
 
 
 _LIFECYCLE_STEP_TYPES = frozenset({"user_input", "checkpoint", "system_message"})
@@ -68,13 +65,16 @@ _MCP_DISPATCH_TOOL_NAME = "call_mcp_tool"
 _MCP_EAGER_TOOL_PREFIX = f"mcp_{MCP_SERVER_NAME}_"
 
 
-def _project_display_tool_name(provider_tool_name: str, tool_info: object) -> str:
+def _project_display_tool_name(
+    provider_tool_name: str,
+    tool_info: object,
+    active_mcp_tool_names: frozenset[str],
+) -> str:
     """Project a bounded provider tool name for safe display.
 
     Native tool names pass through unchanged. Two provider shapes carry a Memory
     tool's real identity, and both resolve to a short name only when the name is
-    in ``MCP_ENABLED_TOOL_NAMES`` (``mcp_policy``, mirroring ExoCore's
-    ``RUNTIME_BINDING_TOOL_NAMES``):
+    in the manifest accepted by the active AGY process:
 
     - lazy: ``call_mcp_tool`` with ``tool_info.parameters.{ServerName,ToolName}``
       resolves when ``tool_info`` is an object, ``parameters`` is an object,
@@ -91,15 +91,21 @@ def _project_display_tool_name(provider_tool_name: str, tool_info: object) -> st
     """
 
     if provider_tool_name == _MCP_DISPATCH_TOOL_NAME:
-        return _project_lazy_mcp_tool_name(provider_tool_name, tool_info)
+        return _project_lazy_mcp_tool_name(
+            provider_tool_name, tool_info, active_mcp_tool_names
+        )
     if provider_tool_name.startswith(_MCP_EAGER_TOOL_PREFIX):
         tool_name = provider_tool_name[len(_MCP_EAGER_TOOL_PREFIX) :]
-        if tool_name in MCP_ENABLED_TOOL_NAMES:
+        if tool_name in active_mcp_tool_names:
             return tool_name
     return provider_tool_name
 
 
-def _project_lazy_mcp_tool_name(provider_tool_name: str, tool_info: object) -> str:
+def _project_lazy_mcp_tool_name(
+    provider_tool_name: str,
+    tool_info: object,
+    active_mcp_tool_names: frozenset[str],
+) -> str:
     """Resolve the lazy dispatcher shape, or keep the dispatcher name when unsure."""
 
     if not isinstance(tool_info, dict):
@@ -110,7 +116,7 @@ def _project_lazy_mcp_tool_name(provider_tool_name: str, tool_info: object) -> s
     if parameters.get("ServerName") != MCP_SERVER_NAME:
         return provider_tool_name
     tool_name = parameters.get("ToolName")
-    if not isinstance(tool_name, str) or tool_name not in MCP_ENABLED_TOOL_NAMES:
+    if not isinstance(tool_name, str) or tool_name not in active_mcp_tool_names:
         return provider_tool_name
     return tool_name
 
@@ -159,8 +165,13 @@ def parse_init(
 class AgyTurnNormalizer:
     """Consumes one turn from one ordered stdout reader."""
 
-    def __init__(self, conversation_id: str) -> None:
+    def __init__(
+        self,
+        conversation_id: str,
+        active_mcp_tool_names: tuple[str, ...] = (),
+    ) -> None:
         self.conversation_id = conversation_id
+        self.active_mcp_tool_names = frozenset(active_mcp_tool_names)
         self.result_seen = False
         self._step_usage_by_index: dict[int, dict[str, int]] = {}
 
@@ -239,7 +250,9 @@ class AgyTurnNormalizer:
                 raise ProviderAdapterError("agy_malformed_step", terminal_status="indeterminate")
             lifecycle["category"] = "provider_tool"
             lifecycle["tool_name"] = _project_display_tool_name(
-                raw_tool_name, step.get("tool_info")
+                raw_tool_name,
+                step.get("tool_info"),
+                self.active_mcp_tool_names,
             )
             duration = _finite_duration(step.get("duration_seconds"))
             if duration is not None:

@@ -35,6 +35,7 @@ V2_HEALTH = {
         "strict_session_resume",
         "request_journal_replay",
         "turn_attachments",
+        "runtime_mcp_tool_manifest",
     ],
 }
 
@@ -55,6 +56,9 @@ def v2_turn(*, request_id, bootstrap=None, thinking="auto", ephemeral=None):
         "user_message": "hello",
         "requested_model_id": "gemini-3.1-pro-preview",
         "requested_thinking_level": thinking,
+        "runtime_mcp_tools": [
+            {"name": "memory_search", "eager": True, "max_call_seconds": None}
+        ],
     }
     if bootstrap is not None:
         turn["bootstrap_context"] = bootstrap
@@ -294,6 +298,13 @@ class RuntimeHttpTests(unittest.TestCase):
                     "user_message": self.token,
                     "requested_model_id": "gemini-3.1-pro-preview",
                     "requested_thinking_level": "auto",
+                    "runtime_mcp_tools": [
+                        {
+                            "name": "memory_search",
+                            "eager": True,
+                            "max_call_seconds": None,
+                        }
+                    ],
                 },
                 token=self.token,
             )

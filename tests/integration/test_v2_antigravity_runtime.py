@@ -5,7 +5,11 @@ import tempfile
 import unittest
 from uuid import uuid4
 
-from exocore_runtime.contracts import GenerationSpec, TurnRequest
+from exocore_runtime.contracts import (
+    GenerationSpec,
+    TurnRequest,
+    runtime_mcp_manifest_sha256,
+)
 from exocore_runtime.errors import ProviderAdapterError
 from exocore_runtime.providers.antigravity.adapter import AntigravityAdapter
 from exocore_runtime.providers.antigravity.process import AgyProcessConfig, AgyProcessSupervisor
@@ -78,6 +82,7 @@ class V2AntigravityRuntimeTests(unittest.IsolatedAsyncioTestCase):
             user_message="CURRENT-USER-CANARY",
             requested_model_id="gemini-3.1-pro-preview",
             requested_thinking_level=thinking,
+            runtime_mcp_tools=({"name": "memory_search", "eager": True, "max_call_seconds": None},),
             bootstrap_context=bootstrap,
             ephemeral_current="EPHEMERAL-CANARY",
         )
@@ -150,7 +155,20 @@ class V2AntigravityRuntimeTests(unittest.IsolatedAsyncioTestCase):
             turn.requested_thinking_level,
             service.instance_id,
         )
-        resolution = adapter.resolve_execution(turn.requested_model_id, turn.requested_thinking_level)
+        resolution = adapter.resolve_execution(
+            turn.requested_model_id, turn.requested_thinking_level
+        )
+        resolution = resolution.model_copy(
+            update={
+                "process_options": resolution.process_options.model_copy(
+                    update={
+                        "mcp_manifest_sha256": runtime_mcp_manifest_sha256(
+                            turn.runtime_mcp_tools
+                        )
+                    }
+                )
+            }
+        )
         service.store.freeze_resolution(
             str(self.binding_id), str(turn.request_id), service.instance_id, resolution
         )

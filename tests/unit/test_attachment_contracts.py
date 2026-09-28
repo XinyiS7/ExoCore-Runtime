@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
 import unittest
 from uuid import uuid4
 
@@ -8,8 +10,10 @@ from pydantic import ValidationError
 from exocore_runtime.contracts import (
     AttachmentManifest,
     RUNTIME_CAPABILITIES,
+    RuntimeMcpTool,
     TurnRequest,
     canonical_turn_request_hash,
+    runtime_mcp_manifest_sha256,
 )
 
 
@@ -31,6 +35,9 @@ class AttachmentContractTests(unittest.TestCase):
             "user_message": "look",
             "requested_model_id": "gemini-3.1-pro-preview",
             "requested_thinking_level": "auto",
+            "runtime_mcp_tools": (
+                {"name": "memory_search", "eager": True, "max_call_seconds": None},
+            ),
         }
         values.update(overrides)
         return TurnRequest(**values)
@@ -121,9 +128,86 @@ class AttachmentContractTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             self.request(attachments=(attachment, attachment))
 
-    def test_capability_revision_includes_turn_attachments(self):
-        self.assertEqual(RUNTIME_CAPABILITIES[-1], "turn_attachments")
-        self.assertEqual(RUNTIME_CAPABILITIES.count("turn_attachments"), 1)
+    def test_capability_revision_includes_manifest_after_turn_attachments(self):
+        self.assertEqual(
+            RUNTIME_CAPABILITIES[-2:],
+            ("turn_attachments", "runtime_mcp_tool_manifest"),
+        )
+        self.assertEqual(RUNTIME_CAPABILITIES.count("runtime_mcp_tool_manifest"), 1)
+
+    def test_runtime_mcp_manifest_is_exact_strict_unique_and_bounded(self):
+        tool = RuntimeMcpTool(
+            name="send_voice_msg", eager=True, max_call_seconds=45
+        )
+        self.assertEqual(
+            tuple(tool.model_dump(mode="json")),
+            ("name", "eager", "max_call_seconds"),
+        )
+        for mutation in (
+            {"name": "SendVoice"},
+            {"name": "x" * 101},
+            {"eager": 1},
+            {"max_call_seconds": 0},
+            {"description": "forbidden"},
+        ):
+            with self.subTest(mutation=mutation), self.assertRaises(ValidationError):
+                RuntimeMcpTool.model_validate(
+                    {**tool.model_dump(mode="json"), **mutation}
+                )
+        with self.assertRaises(ValidationError):
+            self.request(runtime_mcp_tools=(tool, tool))
+        with self.assertRaises(ValidationError):
+            self.request(runtime_mcp_tools=())
+        with self.assertRaises(ValidationError):
+            self.request(
+                runtime_mcp_tools=tuple(
+                    RuntimeMcpTool(name=f"tool_{index}", eager=False)
+                    for index in range(65)
+                )
+            )
+
+    def test_runtime_mcp_manifest_order_and_fields_determine_digest(self):
+        first = RuntimeMcpTool(name="memory_search", eager=False)
+        second = RuntimeMcpTool(
+            name="send_voice_msg", eager=True, max_call_seconds=45
+        )
+        manifest = (first, second)
+        self.assertEqual(
+            runtime_mcp_manifest_sha256(manifest),
+            runtime_mcp_manifest_sha256(manifest),
+        )
+        self.assertNotEqual(
+            runtime_mcp_manifest_sha256(manifest),
+            runtime_mcp_manifest_sha256(tuple(reversed(manifest))),
+        )
+        self.assertNotEqual(
+            runtime_mcp_manifest_sha256(manifest),
+            runtime_mcp_manifest_sha256(
+                (first, second.model_copy(update={"eager": False}))
+            ),
+        )
+        request_id = uuid4()
+        ordered = self.request(request_id=request_id, runtime_mcp_tools=manifest)
+        reversed_request = self.request(
+            request_id=request_id,
+            runtime_mcp_tools=tuple(reversed(manifest)),
+        )
+        self.assertNotEqual(
+            canonical_turn_request_hash(ordered),
+            canonical_turn_request_hash(reversed_request),
+        )
+
+    def test_cross_repository_manifest_fixture_has_pinned_order_and_digest(self):
+        fixture = Path(__file__).resolve().parents[1] / "fixtures" / "runtime_mcp_manifest.json"
+        payload = json.loads(fixture.read_text(encoding="utf-8"))
+        manifest = tuple(RuntimeMcpTool.model_validate(item) for item in payload)
+        self.assertEqual(manifest[-1].name, "send_voice_msg")
+        self.assertIs(manifest[-1].eager, True)
+        self.assertEqual(manifest[-1].max_call_seconds, 45)
+        self.assertEqual(
+            runtime_mcp_manifest_sha256(manifest),
+            "b143a9804b800a53f8bf56738562e8f3317583f5fe454283de4282c1b8397336",
+        )
 
     def test_manifest_is_identity_metadata_only(self):
         self.assertEqual(

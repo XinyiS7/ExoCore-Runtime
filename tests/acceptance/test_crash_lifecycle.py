@@ -54,6 +54,7 @@ class CrashLifecycleTests(unittest.TestCase):
                 user_message="crash",
                 requested_model_id="gemini-3.1-pro-preview",
                 requested_thinking_level="auto",
+                runtime_mcp_tools=({{"name": "memory_search", "eager": True, "max_call_seconds": None}},),
                 bootstrap_context={{"history": []}},
             )
             payload_hash = service._request_hash(request)
@@ -117,6 +118,7 @@ class CrashLifecycleTests(unittest.TestCase):
                 user_message="crash",
                 requested_model_id="gemini-3.1-pro-preview",
                 requested_thinking_level="auto",
+                runtime_mcp_tools=({"name": "memory_search", "eager": True, "max_call_seconds": None},),
                 bootstrap_context={"history": []},
             )
             events = asyncio.run(self._collect(service, binding_id, request))
@@ -137,6 +139,7 @@ class CrashLifecycleTests(unittest.TestCase):
                     user_message="crash",
                     requested_model_id="gemini-3.1-pro-preview",
                     requested_thinking_level="auto",
+                    runtime_mcp_tools=({"name": "memory_search", "eager": True, "max_call_seconds": None},),
                     bootstrap_context={"history": []},
                 )
                 events = asyncio.run(self._collect(service, binding_id, request))

@@ -124,6 +124,7 @@ class GenerationLayout:
     agent_name: str
     provider_session_id: str | None
     execution_options: ProcessExecutionOptions
+    mcp_tool_names: tuple[str, ...] = ()
 
 
 @dataclass
@@ -219,7 +220,10 @@ class AgyProcessSupervisor:
         stdin_line: bytes,
     ) -> AsyncIterator[ProviderEvent]:
         session, stdin = await self._begin_request(binding_id, request_id, stdin_line)
-        normalizer = AgyTurnNormalizer(session.provider_session_id)
+        normalizer = AgyTurnNormalizer(
+            session.provider_session_id,
+            session.layout.mcp_tool_names,
+        )
         try:
             try:
                 await stdin.drain()

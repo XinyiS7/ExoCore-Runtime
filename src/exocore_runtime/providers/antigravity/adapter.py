@@ -30,12 +30,14 @@ from exocore_runtime.contracts import (
     GenerationSpec,
     ProcessExecutionOptions,
     ProviderEvent,
+    RuntimeMcpTool,
     ProviderGeneration,
     TurnRequest,
     generation_identity,
     generation_identity_parts,
     project_rules_absent_digest,
     project_rules_identity_digest,
+    runtime_mcp_manifest_sha256,
     system_instructions_sha256,
 )
 from exocore_runtime.errors import ProviderAdapterError
@@ -52,10 +54,6 @@ from exocore_runtime.providers.antigravity.control import (
     ReservedControlArtifact,
 )
 from exocore_runtime.providers.antigravity.ephemeral_hook import EphemeralMailbox
-from exocore_runtime.providers.antigravity.mcp_policy import (
-    MCP_EAGER_TOOL_NAMES,
-    MCP_ENABLED_TOOL_NAMES,
-)
 from exocore_runtime.providers.antigravity.process import (
     AgyProcessSupervisor,
     GenerationLayout,
@@ -208,7 +206,12 @@ class AntigravityAdapter:
             async with lock:
                 if self._shutting_down:
                     raise ProviderAdapterError("agy_adapter_shutting_down", fatal_generation=True)
-                layout = self._load_layout(generation, options)
+                self._validate_mcp_manifest(request.runtime_mcp_tools, options)
+                layout = self._load_layout(
+                    generation,
+                    options,
+                    request.runtime_mcp_tools,
+                )
                 attachment_paths = AttachmentStore(
                     self._generation_root(binding_id)
                 ).materialize(request_id, request.attachments)
@@ -599,7 +602,7 @@ class AntigravityAdapter:
         else:
             metadata = {**expected, "provider_session_id": None}
             upgrade = None
-        self._restore_security_artifacts(root, metadata, agent_markdown)
+        self._restore_security_artifacts(root, metadata, agent_markdown, None)
         if spec.project_rules is not None:
             # The canonical body is the only durable store of the rules; the
             # workspace mirror is healed from it on every prepare.
@@ -617,6 +620,7 @@ class AntigravityAdapter:
         self,
         generation: GenerationRecord,
         options: ProcessExecutionOptions,
+        mcp_manifest: tuple[RuntimeMcpTool, ...],
     ) -> GenerationLayout:
         """Authenticate the generation's artifacts, then commit its upgrades.
 
@@ -630,6 +634,7 @@ class AntigravityAdapter:
         """
 
         self._validate_process_options(options)
+        self._validate_mcp_manifest(mcp_manifest, options)
         root = self._generation_root(generation.binding_id)
         metadata_path = root / "generation.json"
         if metadata_path.exists():
@@ -666,15 +671,15 @@ class AntigravityAdapter:
             metadata["agent_markdown_sha256"] = upgrade.current_hash
         if rules_normalized or backfill_session or upgrade is not None:
             self._atomic_write_json(metadata_path, metadata)
-        self._restore_security_artifacts(root, metadata, agent_markdown)
+        self._restore_security_artifacts(root, metadata, agent_markdown, mcp_manifest)
         self._restore_reserved_control_artifacts(root, metadata)
-        self._verify_security_artifacts(root, generation, metadata)
+        self._verify_security_artifacts(root, generation, metadata, mcp_manifest)
         if upgrade is not None:
             # Only after the declaration, its recorded hash and the final
             # security-artifact verification have all converged is the upgrade
             # allowed to be reported as successful.
             self._log_declaration_upgrade(generation.binding_id, upgrade)
-        return self._layout_from_metadata(root, metadata, options)
+        return self._layout_from_metadata(root, metadata, options, mcp_manifest)
 
     def _rebuild_missing_metadata(
         self,
@@ -1073,11 +1078,32 @@ class AntigravityAdapter:
         ):
             raise ProviderAdapterError("agy_process_options_unsupported")
 
+    def _validate_mcp_manifest(
+        self,
+        mcp_manifest: tuple[RuntimeMcpTool, ...],
+        options: ProcessExecutionOptions,
+    ) -> None:
+        if (
+            options.mcp_manifest_sha256 is None
+            or options.mcp_manifest_sha256
+            != runtime_mcp_manifest_sha256(mcp_manifest)
+        ):
+            raise ProviderAdapterError("agy_mcp_manifest_mismatch")
+        idle = self.supervisor.config.idle_timeout_seconds
+        hard = self.supervisor.config.hard_timeout_seconds
+        if idle > hard or any(
+            tool.max_call_seconds is not None
+            and tool.max_call_seconds >= idle
+            for tool in mcp_manifest
+        ):
+            raise ProviderAdapterError("agy_mcp_tool_timeout_invalid")
+
     def _restore_security_artifacts(
         self,
         root: Path,
         metadata: dict[str, object],
         agent_markdown: str,
+        mcp_manifest: tuple[RuntimeMcpTool, ...] | None,
     ) -> None:
         binding_id = str(metadata["binding_id"])
         generation_id = str(metadata["generation_id"])
@@ -1131,10 +1157,15 @@ class AntigravityAdapter:
             profile / ".gemini" / "antigravity-cli" / "settings.json",
             self._expected_settings(),
         )
-        self._atomic_write_json(
-            profile / ".gemini" / "config" / "mcp_config.json",
-            self._expected_mcp_config(binding_id),
-        )
+        mcp_config_path = profile / ".gemini" / "config" / "mcp_config.json"
+        # Generation ensure has no per-turn manifest. It must not erase the
+        # config accepted by a live process; first-turn prepare supplies and
+        # verifies the authoritative manifest before spawn.
+        if mcp_manifest is not None or not mcp_config_path.exists():
+            self._atomic_write_json(
+                mcp_config_path,
+                self._expected_mcp_config(binding_id, mcp_manifest or ()),
+            )
         self._atomic_write_text(
             profile / ".gemini" / "config" / "agents" / agent_name / "agent.md",
             agent_markdown,
@@ -1190,6 +1221,7 @@ class AntigravityAdapter:
         root: Path,
         generation: GenerationRecord,
         metadata: dict[str, object],
+        mcp_manifest: tuple[RuntimeMcpTool, ...],
     ) -> None:
         generation_id = metadata.get("generation_id")
         agent_hash = metadata.get("agent_markdown_sha256")
@@ -1268,7 +1300,9 @@ class AntigravityAdapter:
             raise ProviderAdapterError("agy_hook_policy_invalid", fatal_generation=True)
         if self._read_json(settings_path) != self._expected_settings():
             raise ProviderAdapterError("agy_deny_policy_invalid", fatal_generation=True)
-        if self._read_json(mcp_config_path) != self._expected_mcp_config(generation.binding_id):
+        if self._read_json(mcp_config_path) != self._expected_mcp_config(
+            generation.binding_id, mcp_manifest
+        ):
             raise ProviderAdapterError("agy_mcp_config_invalid", fatal_generation=True)
         try:
             agent_bytes = agent_path.read_bytes()
@@ -1358,10 +1392,13 @@ class AntigravityAdapter:
             },
         }
 
-    def _expected_mcp_config(self, binding_id: str) -> dict[str, object]:
-        # ``enabledTools`` / ``tools`` come from the single Runtime MCP fact
-        # source (``mcp_policy``): the model-visible enumeration and the eager
-        # (schema-in-context) subset. No tool-name list is duplicated here.
+    def _expected_mcp_config(
+        self,
+        binding_id: str,
+        mcp_manifest: tuple[RuntimeMcpTool, ...],
+    ) -> dict[str, object]:
+        # ExoCore owns the ordered visible surface and eager policy. Runtime
+        # materializes exactly the received manifest without a local name list.
         return {
             "mcpServers": {
                 MCP_SERVER_NAME: {
@@ -1374,9 +1411,11 @@ class AntigravityAdapter:
                     ],
                     "cwd": str(self.memory_mcp_root),
                     "env": {"PYTHONPATH": str(self.memory_mcp_root)},
-                    "enabledTools": list(MCP_ENABLED_TOOL_NAMES),
+                    "enabledTools": [tool.name for tool in mcp_manifest],
                     "tools": {
-                        name: {"eager": True} for name in MCP_EAGER_TOOL_NAMES
+                        tool.name: {"eager": True}
+                        for tool in mcp_manifest
+                        if tool.eager
                     },
                 }
             }
@@ -1387,6 +1426,7 @@ class AntigravityAdapter:
         root: Path,
         metadata: dict[str, object],
         options: ProcessExecutionOptions,
+        mcp_manifest: tuple[RuntimeMcpTool, ...],
     ) -> GenerationLayout:
         required = (
             "binding_id",
@@ -1406,6 +1446,7 @@ class AntigravityAdapter:
             agent_name=str(metadata["agent_name"]),
             provider_session_id=provider_session_id,
             execution_options=options,
+            mcp_tool_names=tuple(tool.name for tool in mcp_manifest),
         )
 
     def _update_provider_session(self, binding_id: str, provider_session_id: str) -> None:

@@ -10,15 +10,31 @@ import unittest
 
 from exocore_runtime.errors import ProviderAdapterError
 from exocore_runtime.providers.antigravity import ndjson as ndjson_parser
-from exocore_runtime.providers.antigravity.mcp_policy import (
-    MCP_EAGER_TOOL_NAMES,
-    MCP_ENABLED_TOOL_NAMES,
-)
 from exocore_runtime.providers.antigravity.ndjson import AgyTurnNormalizer, parse_init
 
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
 _SYNTHETIC_CONVERSATION = "33333333-3333-4333-8333-333333333333"
+_ACTIVE_MCP_TOOL_NAMES = (
+    "register",
+    "memory_plasmid",
+    "chronicle",
+    "memory_search",
+    "private_log",
+    "schedule_wakeup",
+    "heartbeat_policy",
+    "use_skill",
+    "trace_self",
+    "send_voice_msg",
+)
+_EAGER_MCP_TOOL_NAMES = (
+    "register",
+    "memory_plasmid",
+    "chronicle",
+    "memory_search",
+    "private_log",
+    "send_voice_msg",
+)
 
 
 def load_fixture(name: str) -> list[dict]:
@@ -132,7 +148,9 @@ class ToolLifecycleFixtureTests(unittest.TestCase):
     def test_captured_1_2_7_mcp_fixture_projects_whitelisted_memory_short_name(self) -> None:
         payloads = load_fixture("agy_1_2_7_mcp_success.jsonl")
         generation = parse_init(payloads[0], "gemini-3.1-pro-low", "low")
-        normalizer = AgyTurnNormalizer(generation.provider_session_id)
+        normalizer = AgyTurnNormalizer(
+            generation.provider_session_id, _ACTIVE_MCP_TOOL_NAMES
+        )
         events = []
         for payload in payloads[1:]:
             events.extend(normalizer.consume(payload))
@@ -335,11 +353,13 @@ class McpToolIdentityProjectionTests(unittest.TestCase):
     """Frozen R-C1 projection: only exact whitelisted Memory MCP calls get a short name."""
 
     def normalize(self, payload: dict):
-        normalizer = AgyTurnNormalizer(_SYNTHETIC_CONVERSATION)
+        normalizer = AgyTurnNormalizer(
+            _SYNTHETIC_CONVERSATION, _ACTIVE_MCP_TOOL_NAMES
+        )
         return normalizer.consume(payload)
 
-    def test_every_enabled_memory_tool_projects_its_short_name(self) -> None:
-        for tool_name in MCP_ENABLED_TOOL_NAMES:
+    def test_every_active_manifest_tool_projects_its_short_name(self) -> None:
+        for tool_name in _ACTIVE_MCP_TOOL_NAMES:
             with self.subTest(tool_name=tool_name):
                 event = self.normalize(
                     tool_step(
@@ -358,36 +378,18 @@ class McpToolIdentityProjectionTests(unittest.TestCase):
                 self.assertEqual(event.payload["category"], "provider_tool")
                 self.assertNotIn("tool_info", event.payload)
 
-    def test_enabled_tool_names_are_the_frozen_memory_nine(self) -> None:
-        # The Runtime MCP fact source mirrors ExoCore's
-        # RUNTIME_BINDING_TOOL_NAMES; widening it takes a deliberate edit here.
-        self.assertEqual(
-            MCP_ENABLED_TOOL_NAMES,
-            (
-                "register",
-                "memory_plasmid",
-                "chronicle",
-                "memory_search",
-                "private_log",
-                "schedule_wakeup",
-                "heartbeat_policy",
-                "use_skill",
-                "trace_self",
-            ),
-        )
-
-    def test_eager_tool_names_are_the_frozen_five_subset(self) -> None:
-        self.assertEqual(
-            MCP_EAGER_TOOL_NAMES,
-            ("register", "memory_plasmid", "chronicle", "memory_search", "private_log"),
-        )
-        self.assertLessEqual(
-            set(MCP_EAGER_TOOL_NAMES), set(MCP_ENABLED_TOOL_NAMES)
-        )
+    def test_eager_manifest_tools_include_direct_send_voice_msg(self) -> None:
+        event = self.normalize(
+            tool_step(
+                tool_name="mcp_exocore-memory_send_voice_msg",
+                tool_info=object(),
+            )
+        )[0]
+        self.assertEqual(event.payload["tool_name"], "send_voice_msg")
 
     def test_eager_tool_names_project_their_short_name(self) -> None:
         """eager 调用名是 ``mcp_<server>_<tool>``，身份直接就是短名（无需 tool_info）。"""
-        for tool_name in MCP_EAGER_TOOL_NAMES:
+        for tool_name in _EAGER_MCP_TOOL_NAMES:
             with self.subTest(tool_name=tool_name):
                 event = self.normalize(
                     tool_step(
@@ -494,7 +496,9 @@ class McpToolIdentityProjectionTests(unittest.TestCase):
                     self.assertNotIn(residue, rendered)
 
     def test_degraded_projection_still_terminalizes_the_turn(self) -> None:
-        normalizer = AgyTurnNormalizer(_SYNTHETIC_CONVERSATION)
+        normalizer = AgyTurnNormalizer(
+            _SYNTHETIC_CONVERSATION, _ACTIVE_MCP_TOOL_NAMES
+        )
         active = normalizer.consume(
             tool_step(tool_name="call_mcp_tool", tool_info={"parameters": "not-an-object"})
         )[0]
@@ -518,7 +522,9 @@ class McpToolIdentityProjectionTests(unittest.TestCase):
         self.assertEqual([event.event_type for event in result], ["done"])
 
     def test_wellformed_mcp_projection_keeps_tool_info_arguments_and_output_out(self) -> None:
-        normalizer = AgyTurnNormalizer(_SYNTHETIC_CONVERSATION)
+        normalizer = AgyTurnNormalizer(
+            _SYNTHETIC_CONVERSATION, _ACTIVE_MCP_TOOL_NAMES
+        )
         event = normalizer.consume(
             tool_step(
                 tool_name="call_mcp_tool",

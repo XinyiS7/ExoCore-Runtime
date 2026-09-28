@@ -64,6 +64,7 @@ class ProcessLifecycleTests(unittest.TestCase):
                             "strict_session_resume",
                             "request_journal_replay",
                             "turn_attachments",
+                            "runtime_mcp_tool_manifest",
                         ],
                     },
                 )
