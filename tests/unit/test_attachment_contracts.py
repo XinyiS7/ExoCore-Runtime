@@ -201,12 +201,41 @@ class AttachmentContractTests(unittest.TestCase):
         fixture = Path(__file__).resolve().parents[1] / "fixtures" / "runtime_mcp_manifest.json"
         payload = json.loads(fixture.read_text(encoding="utf-8"))
         manifest = tuple(RuntimeMcpTool.model_validate(item) for item in payload)
-        self.assertEqual(manifest[-1].name, "send_voice_msg")
-        self.assertIs(manifest[-1].eager, True)
-        self.assertEqual(manifest[-1].max_call_seconds, 45)
+        self.assertEqual(
+            tuple(tool.name for tool in manifest),
+            (
+                "register",
+                "memory_plasmid",
+                "chronicle",
+                "memory_search",
+                "private_log",
+                "schedule_wakeup",
+                "heartbeat_policy",
+                "use_skill",
+                "trace_self",
+                "send_voice_msg",
+                "wezterm_bridge",
+            ),
+        )
+        self.assertEqual(len(manifest), 11)
+        self.assertEqual(
+            tuple(tool.name for tool in manifest if tool.eager),
+            (
+                "register",
+                "memory_plasmid",
+                "chronicle",
+                "memory_search",
+                "private_log",
+                "send_voice_msg",
+            ),
+        )
+        self.assertEqual(
+            manifest[-1].model_dump(mode="json"),
+            {"name": "wezterm_bridge", "eager": False, "max_call_seconds": 30},
+        )
         self.assertEqual(
             runtime_mcp_manifest_sha256(manifest),
-            "b143a9804b800a53f8bf56738562e8f3317583f5fe454283de4282c1b8397336",
+            "614fd687933333d884b55887f14c9923259d28a0889d84fe871a313cd36048ef",
         )
 
     def test_manifest_is_identity_metadata_only(self):

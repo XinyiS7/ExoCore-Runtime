@@ -8,5 +8,6 @@
   {"name": "heartbeat_policy", "eager": false, "max_call_seconds": null},
   {"name": "use_skill", "eager": false, "max_call_seconds": null},
   {"name": "trace_self", "eager": false, "max_call_seconds": null},
-  {"name": "send_voice_msg", "eager": true, "max_call_seconds": 45}
+  {"name": "send_voice_msg", "eager": true, "max_call_seconds": 45},
+  {"name": "wezterm_bridge", "eager": false, "max_call_seconds": 30}
 ]
