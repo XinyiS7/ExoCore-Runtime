@@ -19,16 +19,17 @@ from exocore_runtime.providers.antigravity.mcp_policy import MCP_SERVER_NAME
 # Subscription_Runtime_AGY_CP2_Checkpoint_Report.md section 5). These are
 # AGY-native tool ids and stay deliberately separate from the permission action
 # namespaces (``read_file``/``write_file``/``command``) used by DENY_POLICY.
-# ``search_web`` is AGY's own first-party web search: the accepted 1.2.7 probe
-# shows it stays callable while ``read_url(*)``/``execute_url(*)`` remain
-# denied, so direct URL reading and the browser surfaces stay undeclared and
-# closed. Capture evidence:
-# tests/fixtures/agy_1_2_7_search_web_success.jsonl.
+# ``search_web`` is AGY's own first-party web search; the accepted 1.2.7 probe
+# is captured in tests/fixtures/agy_1_2_7_search_web_success.jsonl. Direct URL
+# reading is separately exposed through ``read_url_content`` while browser
+# execution surfaces stay undeclared and denied.
 AGENT_TOOLS = (
     "view_file",
     "write_to_file",
     "run_command",
     "search_web",
+    "read_url_content",
+    "generate_image",
 )
 
 # Declaration history: every tool set this runtime has ever materialized into a
@@ -46,6 +47,14 @@ AGENT_TOOLSET_HISTORY: tuple[tuple[str, ...] | None, ...] = (
     None,
     ("view_file", "write_to_file", "run_command"),
     ("view_file", "write_to_file", "run_command", "search_web"),
+    (
+        "view_file",
+        "write_to_file",
+        "run_command",
+        "search_web",
+        "read_url_content",
+        "generate_image",
+    ),
 )
 LEGACY_AGENT_TOOLSETS: tuple[tuple[str, ...] | None, ...] = AGENT_TOOLSET_HISTORY[:-1]
 
@@ -53,9 +62,8 @@ LEGACY_AGENT_TOOLSETS: tuple[tuple[str, ...] | None, ...] = AGENT_TOOLSET_HISTOR
 # deny list (not the tool declaration) decides what an exposed tool may do.
 # Captured 1.2.5 evidence: keeping ``unsandboxed(*)`` denies every ``command``
 # while ``sandbox=False``, so the first unlock drops it together with the
-# ``read_file``/``write_file``/``command`` namespaces. Direct URL access stays
-# denied even though the native ``search_web`` tool is declared: search does not
-# travel through the URL permission families.
+# ``read_file``/``write_file``/``command`` namespaces. Direct URL reading is
+# now declared explicitly; URL execution remains denied.
 # CP5 exposes exactly one generation-private MCP server; Deny > Allow means the
 # old global `mcp(*)` deny must be removed before a server-scoped allow can work.
 # The server name itself lives in ``mcp_policy`` so this renderer and the NDJSON
@@ -70,7 +78,6 @@ CHROME_DEVTOOLS_MCP_DENIES = (
     "mcp(chrome-devtools/*)",
 )
 DENY_POLICY = (
-    "read_url(*)",
     "execute_url(*)",
     *CHROME_DEVTOOLS_MCP_DENIES,
 )

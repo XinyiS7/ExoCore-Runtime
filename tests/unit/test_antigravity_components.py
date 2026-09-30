@@ -82,7 +82,6 @@ class AntigravityComponentTests(unittest.TestCase):
         self.assertEqual(
             set(DENY_POLICY),
             {
-                "read_url(*)",
                 "execute_url(*)",
                 "mcp(chrome_devtools/*)",
                 "mcp(chrome-devtools/*)",
@@ -91,9 +90,9 @@ class AntigravityComponentTests(unittest.TestCase):
 
     def test_rendered_agent_declares_only_the_intended_native_tools(self) -> None:
         # Production rendering must expose exactly the declared workload tool
-        # set: the CP2 trio plus the accepted native ``search_web`` unlock. The
-        # boundary is the explicit declaration itself, never the CLI's
-        # no-declaration default surface (1.2.5 evidence: that default is
+        # set: the CP2 trio plus the accepted web, URL-read, and image-generation
+        # unlocks. The boundary is the explicit declaration itself, never the
+        # CLI's no-declaration default surface (1.2.5 evidence: that default is
         # neither small nor stable).
         agent_name = f"exocore-runtime-{self.binding_id.replace('-', '')}"
         markdown = render_agent_markdown(agent_name, "system instructions body")
@@ -107,19 +106,27 @@ class AntigravityComponentTests(unittest.TestCase):
                 "  - write_to_file",
                 "  - run_command",
                 "  - search_web",
+                "  - read_url_content",
+                "  - generate_image",
             ],
         )
         self.assertEqual(
             AGENT_TOOLS,
-            ("view_file", "write_to_file", "run_command", "search_web"),
+            (
+                "view_file",
+                "write_to_file",
+                "run_command",
+                "search_web",
+                "read_url_content",
+                "generate_image",
+            ),
         )
         # No implicit expansion: every other AGY-advertised native tool family
-        # stays out of our custom-agent declaration, including the URL and
+        # stays out of our custom-agent declaration, including URL execution and
         # browser surfaces that remain denied in the profile policy. AGY 1.2.7
         # may inject its generic call_mcp_tool dispatcher independently; scoped
         # MCP authorization is owned by profile permissions, not this frontmatter.
         for closed_tool in (
-            "read_url_content",
             "execute_url",
             "mcp",
             "open_browser_url",
@@ -134,7 +141,6 @@ class AntigravityComponentTests(unittest.TestCase):
             "define_subagent",
             "manage_subagents",
             "schedule",
-            "generate_image",
             "send_message",
             "manage_inbox",
             "list_dir",

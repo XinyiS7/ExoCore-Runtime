@@ -60,6 +60,8 @@ CURRENT_FRONTMATTER = [
     "  - write_to_file",
     "  - run_command",
     "  - search_web",
+    "  - read_url_content",
+    "  - generate_image",
 ]
 L3_SHAPE_LABEL = "tools:view_file,write_to_file,run_command"
 

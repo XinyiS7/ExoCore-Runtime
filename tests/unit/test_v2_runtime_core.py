@@ -62,7 +62,7 @@ class CapabilityPolicyTests(unittest.TestCase):
         options = resolve_execution("gemini-3.1-pro-preview", "auto").process_options
         self.assertIs(options.sandbox, False)
         self.assertEqual(options.security_policy_revision, SECURITY_POLICY_REVISION)
-        self.assertEqual(SECURITY_POLICY_REVISION, "agy-tool-perm-v5")
+        self.assertEqual(SECURITY_POLICY_REVISION, "agy-tool-perm-v6")
         # The provider-neutral default itself stays untouched.
         neutral = ProcessExecutionOptions(
             provider_model_slug="gemini-3.1-pro-high",
@@ -259,7 +259,7 @@ class ProcessOptionsCompatibilityTests(unittest.TestCase):
     def test_legacy_process_options_json_parses_without_migration(self) -> None:
         legacy = (
             '{"provider_model_slug":"gemini-3.1-pro-high","effort":"high",'
-            '"sandbox":false,"security_policy_revision":"agy-tool-perm-v5",'
+            '"sandbox":false,"security_policy_revision":"agy-tool-perm-v6",'
             '"profile_mode":"generation_private",'
             '"launch_environment_revision":"agy-isolated-env-v1"}'
         )

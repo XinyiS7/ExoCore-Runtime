@@ -386,9 +386,9 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
             set(server_config),
             {"command", "args", "cwd", "env", "enabledTools", "tools"},
         )
-        # CP2/CP5 + native search unlock: the declared workload tools stay in
-        # the custom-agent declaration; MCP is exposed through its isolated
-        # profile server config + scoped allow.
+        # CP2/CP5 plus native web, URL-read, and image-generation unlocks: the
+        # declared workload tools stay in the custom-agent declaration; MCP is
+        # exposed through its isolated profile server config + scoped allow.
         agent_markdown = (
             generation_root
             / "profile"
@@ -408,6 +408,8 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
                 "  - write_to_file",
                 "  - run_command",
                 "  - search_web",
+                "  - read_url_content",
+                "  - generate_image",
             ],
         )
         hooks = json.loads(
@@ -932,7 +934,8 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
         # Frozen earlier policies are no longer current: a request whose frozen
         # resolution still carries them must fail closed instead of reacquiring
         # a process under the old policy. ``v3`` is the 3-tool unlock; ``v4``
-        # predates the widened Memory MCP surface (enabledTools + eager).
+        # predates the widened Memory MCP surface (enabledTools + eager), and
+        # ``v5`` predates URL-read and image-generation exposure.
         service, adapter = self.build_service()
         await service.ensure_generation(self.binding_id, self.spec)
         request = self.turn(bootstrap={"history": []})
@@ -948,7 +951,11 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
             }
         )
         self.assertEqual(current.security_policy_revision, SECURITY_POLICY_REVISION)
-        for stale_revision in ("agy-tool-perm-v3", "agy-tool-perm-v4"):
+        for stale_revision in (
+            "agy-tool-perm-v3",
+            "agy-tool-perm-v4",
+            "agy-tool-perm-v5",
+        ):
             with self.subTest(stale_revision=stale_revision):
                 stale = current.model_copy(
                     update={"security_policy_revision": stale_revision}

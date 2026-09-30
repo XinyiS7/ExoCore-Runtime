@@ -40,6 +40,17 @@ L0_FRONTMATTER = (
     f"{DESCRIPTION_LINE}\n"
     "---\n"
 )
+SEARCH_FRONTMATTER = (
+    "---\n"
+    f"name: {AGENT_NAME}\n"
+    f"{DESCRIPTION_LINE}\n"
+    "tools:\n"
+    "  - view_file\n"
+    "  - write_to_file\n"
+    "  - run_command\n"
+    "  - search_web\n"
+    "---\n"
+)
 
 # Frozen policy revision -> declared tool set. Every shipped policy is listed in
 # order; the last entry must match the live policy, and a tool-set change must
@@ -52,9 +63,21 @@ FROZEN_POLICY_HISTORY = (
     # v5 widens the Runtime-bound Memory MCP tool surface (enabledTools + eager)
     # without touching the declared AGY toolset, so the tool tuple repeats.
     ("agy-tool-perm-v5", ("view_file", "write_to_file", "run_command", "search_web")),
+    (
+        "agy-tool-perm-v6",
+        (
+            "view_file",
+            "write_to_file",
+            "run_command",
+            "search_web",
+            "read_url_content",
+            "generate_image",
+        ),
+    ),
 )
 
 L3_TOOLSET = ("view_file", "write_to_file", "run_command")
+SEARCH_TOOLSET = ("view_file", "write_to_file", "run_command", "search_web")
 
 
 def body_of(rendered_markdown: str) -> str:
@@ -65,7 +88,7 @@ class DeclarationHistoryTests(unittest.TestCase):
     def test_history_tail_is_the_live_declaration(self) -> None:
         self.assertEqual(AGENT_TOOLSET_HISTORY[-1], AGENT_TOOLS)
         self.assertEqual(LEGACY_AGENT_TOOLSETS, AGENT_TOOLSET_HISTORY[:-1])
-        self.assertEqual(LEGACY_AGENT_TOOLSETS[-1], L3_TOOLSET)
+        self.assertEqual(LEGACY_AGENT_TOOLSETS[-1], SEARCH_TOOLSET)
 
     def test_toolset_changes_always_carry_a_new_policy_revision(self) -> None:
         self.assertEqual(FROZEN_POLICY_HISTORY[-1], (SECURITY_POLICY_REVISION, AGENT_TOOLS))
@@ -92,6 +115,8 @@ class DeclarationHistoryTests(unittest.TestCase):
 
     def test_recognizer_accepts_every_historical_shape_literally(self) -> None:
         cases = (
+            (SEARCH_FRONTMATTER, SEARCH_TOOLSET, None, BODY),
+            (SEARCH_FRONTMATTER, SEARCH_TOOLSET, RULES, BODY),
             (L3_FRONTMATTER, L3_TOOLSET, None, BODY),
             (L3_FRONTMATTER, L3_TOOLSET, RULES, BODY),
             (L0_FRONTMATTER, None, None, BODY),
@@ -157,7 +182,7 @@ class DeclarationHistoryTests(unittest.TestCase):
         for label, frontmatter in near_misses.items():
             with self.subTest(shape=label):
                 markdown = frontmatter + body
-                for tools in (None, L3_TOOLSET):
+                for tools in (None, L3_TOOLSET, SEARCH_TOOLSET):
                     with self.assertRaises(ValueError):
                         extract_rendered_system_instructions(
                             AGENT_NAME,
