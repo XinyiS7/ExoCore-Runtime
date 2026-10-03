@@ -65,6 +65,13 @@ class AttachmentStagingError(RuntimeGatewayError):
     status_code = 500
 
 
+class GeneratedArtifactUnavailableError(RuntimeGatewayError):
+    """No exportable snapshot exists for this binding and reference."""
+
+    code = "generated_artifact_unavailable"
+    status_code = 404
+
+
 class StateResetRequiredError(RuntimeGatewayError):
     code = "v2_state_reset_required"
     status_code = 409

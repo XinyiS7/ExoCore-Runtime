@@ -10,19 +10,23 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import stat
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath, PurePosixPath
 from uuid import UUID, uuid4, uuid5
 
+from exocore_runtime.contracts import MAX_GENERATED_ARTIFACT_BYTES
 
-MAX_GENERATED_IMAGE_BYTES = 20 * 1024 * 1024
+
+MAX_GENERATED_IMAGE_BYTES = MAX_GENERATED_ARTIFACT_BYTES
 MAX_GENERATED_IMAGE_COUNT = 5
 MAX_GENERATED_IMAGE_TOTAL_BYTES = 50 * 1024 * 1024
 MAX_GENERATED_OUTPUT_BYTES = 64 * 1024
 _IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp"})
 _SAVED_AT_PREFIX = "Generated image is saved at "
+_LOGGER = logging.getLogger(__name__)
 
 
 class ArtifactIngestionError(Exception):
@@ -293,3 +297,50 @@ class GeneratedArtifactStore:
             os.replace(temporary, target)
         finally:
             temporary.unlink(missing_ok=True)
+
+
+def capture_step_payload(generation_root: Path, request_id: str, step: object) -> dict | None:
+    """Capture one correlated AGY tool step into a bounded artifact payload.
+
+    ``None`` means this step is not a finished ``generate_image`` result.
+    A capture failure becomes a bounded ``failed`` payload: a bridge-side
+    problem must never rewrite provider terminal truth, fail the turn, or
+    (worst of all) rerun a generation.
+    """
+
+    if not isinstance(step, dict) or step.get("state") != "DONE":
+        return None
+    tool_info = step.get("tool_info")
+    names = {step.get("tool_name")}
+    if isinstance(tool_info, dict):
+        names.add(tool_info.get("name"))
+    if "generate_image" not in names:
+        return None
+    step_index = step.get("step_index")
+    if type(step_index) is not int or step_index < 0:
+        return None
+    output = tool_info.get("output") if isinstance(tool_info, dict) else None
+    try:
+        descriptor = GeneratedArtifactStore(generation_root).capture(
+            request_id, step_index, output
+        )
+    except ArtifactIngestionError as exc:
+        return {"outcome": "failed", "step_index": step_index, "error_code": exc.code}
+    except Exception:
+        _LOGGER.warning("generated image capture failed unexpectedly", exc_info=True)
+        return {
+            "outcome": "failed",
+            "step_index": step_index,
+            "error_code": "artifact_capture_failed",
+        }
+    return {
+        "outcome": "ready",
+        "artifact_ref": descriptor["artifact_ref"],
+        "step_index": descriptor["step_index"],
+        "index": descriptor["index"],
+        "kind": descriptor["kind"],
+        "display_name": descriptor["display_name"],
+        "mime_type": descriptor["mime_type"],
+        "size": descriptor["size"],
+        "sha256": descriptor["sha256"],
+    }

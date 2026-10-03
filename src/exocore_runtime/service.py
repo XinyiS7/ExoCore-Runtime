@@ -38,7 +38,9 @@ from exocore_runtime.providers.base import (
 from exocore_runtime.state_store import RequestRecord, RuntimeStateStore
 
 
-_NONTERMINAL_TYPES = frozenset({"thinking_delta", "content_delta", "lifecycle", "usage"})
+_NONTERMINAL_TYPES = frozenset(
+    {"thinking_delta", "content_delta", "lifecycle", "artifact", "usage"}
+)
 _TERMINAL_TYPES = frozenset({"done", "error"})
 _LOGGER = logging.getLogger(__name__)
 
@@ -184,6 +186,20 @@ class RuntimeService:
                 request_key,
                 guard=self._attachment_mutation_guard(binding, request_key),
             )
+
+    async def read_generated_artifact(
+        self,
+        binding_id: UUID,
+        artifact_ref: str,
+    ) -> tuple[dict, bytes]:
+        """Serve one registered snapshot; the caller never supplies a path."""
+
+        if self._shutting_down:
+            raise ConflictError("runtime is shutting down")
+        binding = str(binding_id)
+        generation = self.store.get_generation(binding)
+        provider = self._provider_for_kind(generation.runtime_kind)
+        return await provider.read_generated_artifact(binding, artifact_ref)
 
     async def stream_turn(
         self,

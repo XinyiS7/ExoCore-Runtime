@@ -89,6 +89,12 @@ class RuntimeProviderAdapter(Protocol):
         guard: Callable[[], None],
     ) -> None: ...
 
+    async def read_generated_artifact(
+        self,
+        binding_id: str,
+        artifact_ref: str,
+    ) -> tuple[dict, bytes]: ...
+
     async def prepare_turn(
         self,
         generation: GenerationRecord,

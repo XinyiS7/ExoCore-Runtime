@@ -7,10 +7,14 @@ import unittest
 from unittest.mock import patch
 from uuid import uuid4
 
+from pydantic import ValidationError
+
+from exocore_runtime.contracts import RuntimeEvent
 from exocore_runtime.providers.antigravity.generated_artifacts import (
     ArtifactIngestionError,
     GeneratedArtifactStore,
     MAX_GENERATED_OUTPUT_BYTES,
+    capture_step_payload,
     parse_generated_image_output,
 )
 
@@ -183,3 +187,188 @@ class GeneratedArtifactStoreTests(unittest.TestCase):
             self.store.capture(self.request, 13, self.output())
         self.assertEqual(caught.exception.code, "artifact_capture_failed")
         self.assertFalse(self.root.exists())
+
+
+class CaptureStepPayloadTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name) / "generation"
+        self.root.mkdir()
+        self.source = self.root / "sun.jpg"
+        self.data = b"\xff\xd8\xff\xe0" + b"synthetic-jpeg-signature-test"
+        self.source.write_bytes(self.data)
+        self.request = str(uuid4())
+
+    def step(self, **updates):
+        step = {
+            "step_type": "tool",
+            "state": "DONE",
+            "step_index": 13,
+            "tool_name": "generate_image",
+            "tool_info": {
+                "name": "generate_image",
+                "output": f"Generated image is saved at {self.source}.",
+            },
+        }
+        step.update(updates)
+        return step
+
+    def test_non_results_are_ignored_by_the_capture(self):
+        for step in (
+            None,
+            "not-a-step",
+            self.step(state="ACTIVE"),
+            self.step(state="ERROR"),
+            self.step(
+                tool_name="view_file",
+                tool_info={"name": "view_file", "output": "plain tool output"},
+            ),
+        ):
+            with self.subTest(step=step):
+                self.assertIsNone(capture_step_payload(self.root, self.request, step))
+
+    def test_ready_payload_is_exact_and_carries_no_path(self):
+        payload = capture_step_payload(self.root, self.request, self.step())
+        self.assertEqual(
+            set(payload),
+            {
+                "outcome",
+                "artifact_ref",
+                "step_index",
+                "index",
+                "kind",
+                "display_name",
+                "mime_type",
+                "size",
+                "sha256",
+            },
+        )
+        self.assertEqual(payload["outcome"], "ready")
+        self.assertEqual(payload["step_index"], 13)
+        self.assertEqual(payload["mime_type"], "image/jpeg")
+        self.assertEqual(payload["size"], len(self.data))
+        serialized = json.dumps(payload)
+        self.assertNotIn("sun.jpg", serialized)
+        self.assertNotIn(self.temporary.name, serialized)
+        RuntimeEvent(
+            binding_id=uuid4(),
+            request_id=uuid4(),
+            sequence=1,
+            event_type="artifact",
+            payload=payload,
+        )
+
+    def test_missing_output_and_unsafe_paths_fail_closed(self):
+        cases = (
+            (
+                self.step(tool_info={"name": "generate_image"}),
+                "artifact_output_missing",
+            ),
+            (
+                self.step(
+                    tool_info={
+                        "name": "generate_image",
+                        "output": "no saved-at line",
+                    }
+                ),
+                "artifact_output_invalid",
+            ),
+            (
+                self.step(
+                    tool_info={
+                        "name": "generate_image",
+                        "output": "Generated image is saved at C:\\outside\\image.jpg.",
+                    }
+                ),
+                "artifact_path_outside_generation",
+            ),
+        )
+        for step, code in cases:
+            with self.subTest(code=code):
+                payload = capture_step_payload(self.root, self.request, step)
+                self.assertEqual(
+                    payload,
+                    {"outcome": "failed", "step_index": 13, "error_code": code},
+                )
+
+    def test_unexpected_failure_becomes_a_bounded_failed_payload(self):
+        with patch.object(
+            GeneratedArtifactStore, "capture", side_effect=RuntimeError("boom")
+        ):
+            payload = capture_step_payload(self.root, self.request, self.step())
+        self.assertEqual(
+            payload,
+            {
+                "outcome": "failed",
+                "step_index": 13,
+                "error_code": "artifact_capture_failed",
+            },
+        )
+
+    def test_replay_of_the_same_step_reuses_one_snapshot(self):
+        first = capture_step_payload(self.root, self.request, self.step())
+        second = capture_step_payload(self.root, self.request, self.step())
+        self.assertEqual(first, second)
+        self.assertEqual(
+            len(list((self.root / "generated_artifacts").glob("*.json"))), 1
+        )
+
+
+class ArtifactEventPayloadTests(unittest.TestCase):
+    def event(self, payload):
+        return RuntimeEvent(
+            binding_id=uuid4(),
+            request_id=uuid4(),
+            sequence=1,
+            event_type="artifact",
+            payload=payload,
+        )
+
+    def ready(self):
+        return {
+            "outcome": "ready",
+            "artifact_ref": "0" * 32,
+            "step_index": 3,
+            "index": 0,
+            "kind": "image",
+            "display_name": "image-3.png",
+            "mime_type": "image/png",
+            "size": 4,
+            "sha256": "1" * 64,
+        }
+
+    def test_ready_and_failed_shapes_are_accepted(self):
+        self.assertEqual(self.event(self.ready()).payload["outcome"], "ready")
+        failed = {
+            "outcome": "failed",
+            "step_index": 3,
+            "error_code": "artifact_capture_failed",
+        }
+        self.assertEqual(self.event(failed).payload["outcome"], "failed")
+
+    def test_mutations_are_rejected(self):
+        mutations = (
+            {"outcome": "result"},
+            {"artifact_ref": "Z" * 32},
+            {"artifact_ref": "0" * 31},
+            {"index": 1},
+            {"kind": "file"},
+            {"display_name": "../image.png"},
+            {"display_name": "image-3.svg"},
+            {"mime_type": "image/svg+xml"},
+            {"size": 0},
+            {"sha256": "1" * 63},
+            {"path": "C:\\outside\\image.png"},
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                with self.assertRaises(ValidationError):
+                    self.event({**self.ready(), **mutation})
+        for payload in (
+            {"outcome": "failed", "step_index": -1, "error_code": "bad"},
+            {"outcome": "failed", "step_index": 3, "error_code": "BadCode"},
+        ):
+            with self.subTest(payload=payload):
+                with self.assertRaises(ValidationError):
+                    self.event(payload)

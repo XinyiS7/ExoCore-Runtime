@@ -45,7 +45,7 @@ Runtime correctness depends on:
 2. **Bearer alignment** - Django `SUBSCRIPTION_RUNTIME_TOKEN` against Runtime `EXOCORE_RUNTIME_TOKEN`.
 3. **Django authorizes the intended Runtime preset** in `SUBSCRIPTION_RUNTIME_PRESET_ALLOWLIST` (the current local setup authorizes presets 1 and 8).
 4. **Migrations current** - `python.exe manage.py migrate --check --noinput`.
-5. **Exact health contract** - `GET /v2/health` returns `status=ok`, `schema_version=v2`, `protocol=subscription-runtime-v2` and all seven capabilities, in order: `generation_state_only`, `durable_control_events`, `requested_effective_execution`, `strict_session_resume`, `request_journal_replay`, `turn_attachments`, `runtime_mcp_tool_manifest`.
+5. **Exact health contract** - `GET /v2/health` returns `status=ok`, `schema_version=v2`, `protocol=subscription-runtime-v2` and all eight capabilities, in order: `generation_state_only`, `durable_control_events`, `requested_effective_execution`, `strict_session_resume`, `request_journal_replay`, `turn_attachments`, `runtime_mcp_tool_manifest`, `generated_artifacts`.
 
 Startup check: `8000` and `8766` free -> migrate check -> start the Runtime -> `curl http://127.0.0.1:8766/v2/health` -> start Django with the matching URL and bearer.
 
@@ -74,11 +74,15 @@ Django and Runtime must deploy this capability together. With no active turn, st
 
 Current-turn image attachments are staged before send and rendered into the provider's `CurrentUserMessage`; earlier turns are never replayed.
 
-- Capability is declared by the handshake: `turn_attachments` is part of the exact seven-item `RUNTIME_CAPABILITIES` / `GET /v2/health` list; clients must gate on that exact list instead of any static endpoint table.
+- Capability is declared by the handshake: `turn_attachments` is part of the exact eight-item `RUNTIME_CAPABILITIES` / `GET /v2/health` list; clients must gate on that exact list instead of any static endpoint table.
 - Staging uses an authenticated raw `PUT /v2/generations/{binding_id}/turns/{request_id}/attachments/{artifact_id}`, writing request-scoped opaque `.blob` artifacts under the generation workspace with atomic writes; a request accepts up to 5 files, 20 MiB each and 50 MiB total.
 - Before provider spawn, size, SHA256 and MIME are verified; staged artifacts materialize crash-idempotently into the request's attachment directory, and only Runtime-owned absolute paths are projected into the rendered input.
 - `DELETE /v2/generations/{binding_id}/turns/{request_id}/attachments` prunes pre-send staging idempotently; once the request is durably registered, both PUT and DELETE refuse with `request_registered` and leave bytes unchanged.
 - Retire deletes only the generation-owned provider root, which holds every staging and materialized attachment artifact.
+
+### Generated artifacts
+
+Provider-generated images are captured from the correlated `generate_image` tool result, verified against the managed generation root, and snapshotted immutably under it as opaque `artifact_ref` entries (bounded metadata only; no paths or raw tool bodies on the wire). Authenticated clients read one snapshot with a single bounded `GET /v2/generations/{binding_id}/artifacts/{artifact_ref}/content`. A capture failure is exported as a bounded failed artifact event; provider tool errors stay provider tool errors, and the bridge never reruns a generation. Retire deletes every snapshot with the generation root, so any client-owned copy must be taken before retire.
 
 ## Scope limits
 

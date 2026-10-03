@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from typing import Any, Literal
 from uuid import UUID
 
@@ -19,6 +20,7 @@ RUNTIME_CAPABILITIES = (
     "request_journal_replay",
     "turn_attachments",
     "runtime_mcp_tool_manifest",
+    "generated_artifacts",
 )
 
 
@@ -34,6 +36,17 @@ ATTACHMENT_ID_PATTERN = r"^att-[1-9][0-9]{0,18}$"
 SHA256_PATTERN = r"^[0-9a-f]{64}$"
 MCP_TOOL_NAME_PATTERN = r"^[a-z][a-z0-9_]{0,99}$"
 MAX_RUNTIME_MCP_TOOL_COUNT = 64
+
+# One generated artifact outcome projection: an opaque reference plus bounded
+# metadata for ``ready``, or a bounded error code for ``failed``. The raw
+# provider tool body and every filesystem path stay Runtime-private.
+ARTIFACT_REF_PATTERN = r"^[0-9a-f]{32}$"
+MAX_GENERATED_ARTIFACT_BYTES = 20 * 1024 * 1024
+GENERATED_ARTIFACT_DISPLAY_NAME_PATTERN = r"^image-[0-9]{1,12}\.(png|jpg|jpeg|gif|webp)$"
+GENERATED_ARTIFACT_MIME_TYPES = frozenset(
+    {"image/png", "image/jpeg", "image/gif", "image/webp"}
+)
+GENERATED_ARTIFACT_ERROR_CODE_PATTERN = r"^[a-z][a-z0-9_]{0,49}$"
 
 
 class GenerationSpec(StrictContract):
@@ -317,6 +330,61 @@ class EffectiveResolution(StrictContract):
     process_options: ProcessExecutionOptions
 
 
+def _validate_artifact_payload(payload: dict[str, Any]) -> None:
+    """Strict bounded projection for one generated-artifact event."""
+
+    outcome = payload.get("outcome")
+    step_index = payload.get("step_index")
+    if type(step_index) is not int or step_index < 0:
+        raise ValueError("artifact step_index is invalid")
+    if outcome == "failed":
+        if set(payload) != {"outcome", "step_index", "error_code"}:
+            raise ValueError("failed artifact payload is invalid")
+        error_code = payload["error_code"]
+        if (
+            type(error_code) is not str
+            or re.fullmatch(GENERATED_ARTIFACT_ERROR_CODE_PATTERN, error_code) is None
+        ):
+            raise ValueError("artifact error code is invalid")
+        return
+    if outcome != "ready":
+        raise ValueError("artifact outcome is invalid")
+    if set(payload) != {
+        "outcome",
+        "artifact_ref",
+        "step_index",
+        "index",
+        "kind",
+        "display_name",
+        "mime_type",
+        "size",
+        "sha256",
+    }:
+        raise ValueError("ready artifact payload is invalid")
+    artifact_ref = payload["artifact_ref"]
+    index = payload["index"]
+    display_name = payload["display_name"]
+    mime_type = payload["mime_type"]
+    size = payload["size"]
+    sha256 = payload["sha256"]
+    if (
+        type(artifact_ref) is not str
+        or re.fullmatch(ARTIFACT_REF_PATTERN, artifact_ref) is None
+        or type(index) is not int
+        or index != 0
+        or payload["kind"] != "image"
+        or type(display_name) is not str
+        or re.fullmatch(GENERATED_ARTIFACT_DISPLAY_NAME_PATTERN, display_name) is None
+        or type(mime_type) is not str
+        or mime_type not in GENERATED_ARTIFACT_MIME_TYPES
+        or type(size) is not int
+        or not 0 < size <= MAX_GENERATED_ARTIFACT_BYTES
+        or type(sha256) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", sha256) is None
+    ):
+        raise ValueError("ready artifact payload is invalid")
+
+
 class RuntimeEvent(StrictContract):
     schema_version: Literal["v2"] = "v2"
     binding_id: UUID
@@ -328,6 +396,7 @@ class RuntimeEvent(StrictContract):
         "thinking_delta",
         "content_delta",
         "lifecycle",
+        "artifact",
         "usage",
         "done",
         "error",
@@ -385,6 +454,8 @@ class RuntimeEvent(StrictContract):
                 for key in required
             ):
                 raise ValueError("execution_resolved payload is invalid")
+        elif self.event_type == "artifact":
+            _validate_artifact_payload(self.payload)
         return self
 
 
@@ -419,6 +490,7 @@ class ProviderEvent(StrictContract):
         "thinking_delta",
         "content_delta",
         "lifecycle",
+        "artifact",
         "usage",
         "done",
         "error",

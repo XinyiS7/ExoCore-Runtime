@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 import ctypes
 from ctypes import wintypes
 from dataclasses import dataclass, field
@@ -58,6 +58,17 @@ _GATEWAY_CRASH_JOB_LOCK = threading.Lock()
 # a real outage still fails closed with the same error code.
 QUOTA_PREFLIGHT_ATTEMPTS = 3
 QUOTA_PREFLIGHT_BACKOFF_SECONDS = 2.0
+
+
+def _tool_step(parsed: object) -> dict | None:
+    """One parsed AGY tool step, or None for any other NDJSON record."""
+
+    if not isinstance(parsed, dict) or parsed.get("event") != "step_update":
+        return None
+    step = parsed.get("step_update")
+    if not isinstance(step, dict) or step.get("step_type") != "tool":
+        return None
+    return step
 
 
 class _JobObjectBasicLimitInformation(ctypes.Structure):
@@ -218,6 +229,9 @@ class AgyProcessSupervisor:
         binding_id: str,
         request_id: str,
         stdin_line: bytes,
+        capture_tool_result: (
+            Callable[[str, str, dict], Awaitable[dict | None]] | None
+        ) = None,
     ) -> AsyncIterator[ProviderEvent]:
         session, stdin = await self._begin_request(binding_id, request_id, stdin_line)
         normalizer = AgyTurnNormalizer(
@@ -244,7 +258,17 @@ class AgyProcessSupervisor:
                     raise ProviderAdapterError("agy_stderr", terminal_status="indeterminate")
                 if line is None:
                     raise ProviderAdapterError("agy_unexpected_eof", terminal_status="indeterminate")
-                events = normalizer.consume(parse_line(line))
+                parsed = parse_line(line)
+                events = normalizer.consume(parsed)
+                if capture_tool_result is not None:
+                    step = _tool_step(parsed)
+                    if step is not None:
+                        payload = await capture_tool_result(binding_id, request_id, step)
+                        if payload is not None:
+                            # The snapshot exists before this event can be
+                            # journaled: a consumer never chases a reference
+                            # that was not durably captured first.
+                            yield ProviderEvent(event_type="artifact", payload=payload)
                 if normalizer.result_seen:
                     await self._assert_quiet_after_result(session)
                     terminals = [

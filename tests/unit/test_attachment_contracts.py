@@ -130,10 +130,15 @@ class AttachmentContractTests(unittest.TestCase):
 
     def test_capability_revision_includes_manifest_after_turn_attachments(self):
         self.assertEqual(
-            RUNTIME_CAPABILITIES[-2:],
-            ("turn_attachments", "runtime_mcp_tool_manifest"),
+            RUNTIME_CAPABILITIES[-3:],
+            (
+                "turn_attachments",
+                "runtime_mcp_tool_manifest",
+                "generated_artifacts",
+            ),
         )
         self.assertEqual(RUNTIME_CAPABILITIES.count("runtime_mcp_tool_manifest"), 1)
+        self.assertEqual(RUNTIME_CAPABILITIES.count("generated_artifacts"), 1)
 
     def test_runtime_mcp_manifest_is_exact_strict_unique_and_bounded(self):
         tool = RuntimeMcpTool(

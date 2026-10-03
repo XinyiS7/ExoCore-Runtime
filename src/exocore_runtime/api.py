@@ -14,6 +14,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from exocore_runtime.config import RuntimeConfig
 from exocore_runtime.contracts import (
+    ARTIFACT_REF_PATTERN,
     ATTACHMENT_ID_PATTERN,
     MAX_ATTACHMENT_BYTES,
     PROTOCOL_VERSION,
@@ -202,6 +203,20 @@ def create_app(
     ) -> Response:
         await service.discard_attachments(binding_id, request_id)
         return Response(status_code=200)
+
+    @app.get("/v2/generations/{binding_id}/artifacts/{artifact_ref}/content")
+    async def generated_artifact_content(
+        binding_id: UUID,
+        artifact_ref: str,
+    ) -> Response:
+        """Authenticated single bounded read of one registered snapshot."""
+
+        if re.fullmatch(ARTIFACT_REF_PATTERN, artifact_ref) is None:
+            raise InvalidRequestError("invalid artifact reference")
+        descriptor, data = await service.read_generated_artifact(
+            binding_id, artifact_ref
+        )
+        return Response(content=data, media_type=descriptor["mime_type"])
 
     @app.post("/v2/generations/{binding_id}/turns/{request_id}/cancel")
     async def cancel(binding_id: UUID, request_id: UUID):

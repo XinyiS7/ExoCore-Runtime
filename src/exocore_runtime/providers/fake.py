@@ -226,6 +226,21 @@ class DeterministicFakeAdapter:
             yield ProviderEvent(event_type="done", payload={"finish_reason": "late"})
             return
 
+        if behavior == "artifact":
+            yield ProviderEvent(
+                event_type="artifact",
+                payload={
+                    "outcome": "ready",
+                    "artifact_ref": "0" * 32,
+                    "step_index": 3,
+                    "index": 0,
+                    "kind": "image",
+                    "display_name": "image-3.png",
+                    "mime_type": "image/png",
+                    "size": 4,
+                    "sha256": "1" * 64,
+                },
+            )
         yield ProviderEvent(event_type="content_delta", payload={"text": "fake-content"})
         if behavior == "unexpected_eof":
             return

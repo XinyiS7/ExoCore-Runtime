@@ -2,6 +2,7 @@
 
 改动指南（Change Guide）
 
+- 产物导出：AGY `generate_image` 的原始 tool step 经 `generated_artifacts.capture_step_payload` 校验并快照化（artifact 锁内），仅以不透明 ref 经 `artifact` 事件与 `GET /v2/generations/{binding_id}/artifacts/{artifact_ref}/content` 出口；捕获失败只记有界 `failed` payload，绝不改写 provider terminal truth。
 - 扩展点：provider 侧附件行为分布在三处——`attachments.AttachmentStore`（stage/materialize/discard 与上限）、本模块的 `stage_attachment` / `discard_attachments` / `prepare_turn`（materialize + 渲染注入）、`renderer.render_stdin_line(..., attachment_paths=...)`；HTTP 面在 `api.py` 的 PUT/DELETE turn-attachments 路由；契约与上限常量在 `contracts.py`（`turn_attachments` capability、AttachmentManifest、MAX_ATTACHMENT_*）。
 - 语义口径：staging 为 request 作用域，`request_registered` 之后 PUT/DELETE 必须拒绝且不动 bytes；materialize 崩溃幂等且只投影 Runtime 私有绝对路径（canonical 路径/文件名不得进入 envelope）；discard 幂等；共享 artifact lock 串行化 stage/discard/materialize。监督进程 env 拒绝七个 Google/Gemini auth 名（real 值 fail-closed，空值放行；见 `process.py::_isolated_environment` 的预检）。
 - 测试注意：合约/store 单测 `tests/unit/test_attachment_contracts.py`、`test_attachment_store.py`；claim 竞态与中断上传证据 `tests/integration/test_antigravity_adapter.py`、`test_http_api.py`；HTTP 语义 `tests/integration/test_v2_http_api.py`。
@@ -40,8 +41,16 @@ from exocore_runtime.contracts import (
     runtime_mcp_manifest_sha256,
     system_instructions_sha256,
 )
-from exocore_runtime.errors import ProviderAdapterError
+from exocore_runtime.errors import (
+    GeneratedArtifactUnavailableError,
+    ProviderAdapterError,
+)
 from exocore_runtime.providers.antigravity.attachments import AttachmentStore
+from exocore_runtime.providers.antigravity.generated_artifacts import (
+    ArtifactIngestionError,
+    GeneratedArtifactStore,
+    capture_step_payload,
+)
 from exocore_runtime.providers.antigravity.capabilities import (
     LAUNCH_ENVIRONMENT_REVISION,
     SECURITY_POLICY_REVISION,
@@ -297,7 +306,10 @@ class AntigravityAdapter:
         original_failure: BaseException | None = None
         try:
             async for event in self.supervisor.stream_turn(
-                binding_id, request_id, state.stdin_line
+                binding_id,
+                request_id,
+                state.stdin_line,
+                capture_tool_result=self._capture_generated_artifact,
             ):
                 if event.event_type == "usage":
                     deferred_usage.append(event)
@@ -528,6 +540,40 @@ class AntigravityAdapter:
     async def _artifact_lock(self, binding_id: str) -> asyncio.Lock:
         async with self._artifact_locks_guard:
             return self._artifact_locks.setdefault(binding_id, asyncio.Lock())
+
+    async def _capture_generated_artifact(
+        self,
+        binding_id: str,
+        request_id: str,
+        step: dict,
+    ) -> dict | None:
+        """Snapshot one provider tool step under the generation artifact lock.
+
+        Serialized with retire and export reads: a snapshot can neither race
+        the generation-root deletion nor observe a half-removed root.
+        """
+
+        lock = await self._artifact_lock(binding_id)
+        async with lock:
+            return capture_step_payload(
+                self._generation_root(binding_id), request_id, step
+            )
+
+    async def read_generated_artifact(
+        self,
+        binding_id: str,
+        artifact_ref: str,
+    ) -> tuple[dict, bytes]:
+        """Read one registered snapshot by opaque reference; never by path."""
+
+        lock = await self._artifact_lock(binding_id)
+        async with lock:
+            try:
+                return GeneratedArtifactStore(
+                    self._generation_root(binding_id)
+                ).read(artifact_ref)
+            except ArtifactIngestionError as exc:
+                raise GeneratedArtifactUnavailableError() from exc
 
     def _cleanup_presend_payloads(
         self,

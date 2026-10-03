@@ -55,6 +55,7 @@ class V2HttpContractTests(unittest.TestCase):
                     "request_journal_replay",
                     "turn_attachments",
                     "runtime_mcp_tool_manifest",
+                    "generated_artifacts",
                 ],
             },
         )

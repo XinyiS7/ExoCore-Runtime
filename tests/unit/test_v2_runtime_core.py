@@ -135,6 +135,23 @@ class RuntimeV2ServiceTests(unittest.IsolatedAsyncioTestCase):
         durable = self.store.read_events(str(self.binding_id), str(turn.request_id))
         self.assertEqual(events, durable)
 
+    async def test_generated_artifact_event_is_streamed_and_journaled(self) -> None:
+        await self.service.ensure_generation(self.binding_id, self.spec)
+        turn = request(bootstrap={"history": []})
+        self.provider.set_behavior(str(turn.request_id), "artifact")
+        events = await collect(self.service, self.binding_id, turn)
+        artifact_events = [
+            event for event in events if event.event_type == "artifact"
+        ]
+        self.assertEqual(len(artifact_events), 1)
+        self.assertEqual(artifact_events[0].payload["outcome"], "ready")
+        self.assertEqual(artifact_events[0].payload["artifact_ref"], "0" * 32)
+        self.assertEqual(events[-1].terminal_status, "completed")
+        self.assertEqual(
+            events,
+            self.store.read_events(str(self.binding_id), str(turn.request_id)),
+        )
+
     async def test_completed_replay_and_observer_do_not_resolve_or_touch_process(self) -> None:
         await self.service.ensure_generation(self.binding_id, self.spec)
         turn = request(bootstrap={"history": []})
