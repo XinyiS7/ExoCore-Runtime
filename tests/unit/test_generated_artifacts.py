@@ -15,6 +15,7 @@ from exocore_runtime.providers.antigravity.generated_artifacts import (
     GeneratedArtifactStore,
     MAX_GENERATED_OUTPUT_BYTES,
     capture_step_payload,
+    is_deferrable_capture_failure,
     parse_generated_image_output,
 )
 
@@ -372,3 +373,127 @@ class ArtifactEventPayloadTests(unittest.TestCase):
             with self.subTest(payload=payload):
                 with self.assertRaises(ValidationError):
                     self.event(payload)
+
+class StepOutputFallbackTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name) / "generation"
+        self.root.mkdir()
+        self.session = "7b8467dc-aa7c-4491-a2b7-9973cb326d99"
+        self.brain = (
+            self.root
+            / "profile"
+            / ".gemini"
+            / "antigravity-cli"
+            / "brain"
+            / self.session
+        )
+        self.image = self.brain / "sun.jpg"
+        self.image.parent.mkdir(parents=True)
+        self.data = b"\xff\xd8\xff\xe0" + b"synthetic-jpeg-signature-test"
+        self.image.write_bytes(self.data)
+        self.request = str(uuid4())
+
+    def step(self, **updates):
+        step = {
+            "step_type": "tool",
+            "state": "DONE",
+            "step_index": 3,
+            "tool_name": "generate_image",
+            "tool_info": {"name": "generate_image"},
+        }
+        step.update(updates)
+        return step
+
+    def write_step_output(self, text=None):
+        if text is None:
+            text = (
+                "Using prompt: fixture\n\n"
+                f"Generated image is saved at {self.image}.\n\n"
+                " Do not output the path of this image to show to the user."
+            )
+        path = self.brain / ".system_generated" / "steps" / "3" / "output.txt"
+        path.parent.mkdir(parents=True)
+        path.write_text(text, encoding="utf-8")
+
+    def test_missing_stream_output_reads_the_step_output_file(self):
+        self.write_step_output()
+        payload = capture_step_payload(
+            self.root, self.request, self.step(), self.session
+        )
+        self.assertEqual(payload["outcome"], "ready")
+        self.assertEqual(payload["mime_type"], "image/jpeg")
+        self.assertEqual(payload["size"], len(self.data))
+
+    def test_stream_and_file_absent_stays_a_typed_failure(self):
+        payload = capture_step_payload(
+            self.root, self.request, self.step(), self.session
+        )
+        self.assertEqual(
+            payload,
+            {
+                "outcome": "failed",
+                "step_index": 3,
+                "error_code": "artifact_output_missing",
+            },
+        )
+
+    def test_invalid_stream_output_falls_back_to_the_step_file(self):
+        self.write_step_output()
+        payload = capture_step_payload(
+            self.root,
+            self.request,
+            self.step(tool_info={"name": "generate_image", "output": "garbage"}),
+            self.session,
+        )
+        self.assertEqual(payload["outcome"], "ready")
+        self.assertEqual(payload["size"], len(self.data))
+
+    def test_unsafe_session_identifier_is_never_used_as_a_path(self):
+        outside = Path(self.temporary.name) / "outside.txt"
+        outside.write_text(
+            f"Generated image is saved at {self.image}.\n", encoding="utf-8"
+        )
+        for session in ("../../outside", "a/b", "..", "", None, 42):
+            with self.subTest(session=session):
+                payload = capture_step_payload(
+                    self.root, self.request, self.step(), session
+                )
+                self.assertEqual(payload["outcome"], "failed")
+                self.assertEqual(payload["error_code"], "artifact_output_missing")
+
+    def test_deferrable_policy_only_covers_output_availability(self):
+        self.assertTrue(
+            is_deferrable_capture_failure(
+                {
+                    "outcome": "failed",
+                    "step_index": 3,
+                    "error_code": "artifact_output_missing",
+                }
+            )
+        )
+        self.assertTrue(
+            is_deferrable_capture_failure(
+                {
+                    "outcome": "failed",
+                    "step_index": 3,
+                    "error_code": "artifact_output_invalid",
+                }
+            )
+        )
+        self.assertFalse(
+            is_deferrable_capture_failure(
+                {
+                    "outcome": "failed",
+                    "step_index": 3,
+                    "error_code": "artifact_capture_failed",
+                }
+            )
+        )
+        self.assertFalse(
+            is_deferrable_capture_failure(
+                {"outcome": "ready", "artifact_ref": "0" * 32}
+            )
+        )
+        self.assertFalse(is_deferrable_capture_failure(None))

@@ -546,6 +546,7 @@ class AntigravityAdapter:
         binding_id: str,
         request_id: str,
         step: dict,
+        provider_session_id: str,
     ) -> dict | None:
         """Snapshot one provider tool step under the generation artifact lock.
 
@@ -556,7 +557,10 @@ class AntigravityAdapter:
         lock = await self._artifact_lock(binding_id)
         async with lock:
             return capture_step_payload(
-                self._generation_root(binding_id), request_id, step
+                self._generation_root(binding_id),
+                request_id,
+                step,
+                provider_session_id,
             )
 
     async def read_generated_artifact(

@@ -12,6 +12,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import stat
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath, PurePosixPath
@@ -26,6 +27,10 @@ MAX_GENERATED_IMAGE_TOTAL_BYTES = 50 * 1024 * 1024
 MAX_GENERATED_OUTPUT_BYTES = 64 * 1024
 _IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp"})
 _SAVED_AT_PREFIX = "Generated image is saved at "
+_SESSION_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+_DEFERRABLE_CAPTURE_CODES = frozenset(
+    {"artifact_output_missing", "artifact_output_invalid"}
+)
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -299,7 +304,64 @@ class GeneratedArtifactStore:
             temporary.unlink(missing_ok=True)
 
 
-def capture_step_payload(generation_root: Path, request_id: str, step: object) -> dict | None:
+def is_deferrable_capture_failure(payload: object) -> bool:
+    """One retry is worth it only when the failure may be a write-timing race."""
+
+    return (
+        isinstance(payload, dict)
+        and payload.get("outcome") == "failed"
+        and payload.get("error_code") in _DEFERRABLE_CAPTURE_CODES
+    )
+
+
+def _read_step_output_text(
+    generation_root: Path,
+    provider_session_id: object,
+    step_index: int,
+) -> str | None:
+    """Best-effort bounded read of one provider step-output file.
+
+    The AGY CLI persists a native tool's output under the generation-private
+    profile brain directory (``.system_generated/steps/<n>/output.txt``) even
+    when the streamed DONE frame carries no ``tool_info.output``. Only this
+    exact provider-managed path shape is read; anything unsafe, oversized or
+    missing returns ``None`` and the caller keeps its typed failure.
+    """
+
+    if (
+        type(provider_session_id) is not str
+        or _SESSION_ID_PATTERN.fullmatch(provider_session_id) is None
+    ):
+        return None
+    root = Path(generation_root)
+    path = (
+        root
+        / "profile"
+        / ".gemini"
+        / "antigravity-cli"
+        / "brain"
+        / provider_session_id
+        / ".system_generated"
+        / "steps"
+        / str(step_index)
+        / "output.txt"
+    )
+    try:
+        data = _read_scoped_bytes(path, root, MAX_GENERATED_OUTPUT_BYTES)
+    except (ArtifactIngestionError, OSError, UnicodeError):
+        return None
+    try:
+        return data.decode("utf-8")
+    except UnicodeError:
+        return None
+
+
+def capture_step_payload(
+    generation_root: Path,
+    request_id: str,
+    step: object,
+    provider_session_id: object = None,
+) -> dict | None:
     """Capture one correlated AGY tool step into a bounded artifact payload.
 
     ``None`` means this step is not a finished ``generate_image`` result.
@@ -320,9 +382,32 @@ def capture_step_payload(generation_root: Path, request_id: str, step: object) -
     if type(step_index) is not int or step_index < 0:
         return None
     output = tool_info.get("output") if isinstance(tool_info, dict) else None
+    candidates = []
+    if isinstance(output, str) and output:
+        candidates.append(output)
+    fallback = _read_step_output_text(
+        generation_root, provider_session_id, step_index
+    )
+    if fallback is not None:
+        candidates.append(fallback)
     try:
+        chosen = None
+        last_error: ArtifactIngestionError | None = None
+        for candidate in candidates:
+            try:
+                parse_generated_image_output(candidate)
+                chosen = candidate
+                break
+            except ArtifactIngestionError as exc:
+                last_error = exc
+        if chosen is None:
+            raise (
+                last_error
+                if last_error is not None
+                else ArtifactIngestionError("artifact_output_missing")
+            )
         descriptor = GeneratedArtifactStore(generation_root).capture(
-            request_id, step_index, output
+            request_id, step_index, chosen
         )
     except ArtifactIngestionError as exc:
         return {"outcome": "failed", "step_index": step_index, "error_code": exc.code}

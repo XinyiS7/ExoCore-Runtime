@@ -25,6 +25,9 @@ from exocore_runtime.contracts import (
     ProviderGeneration,
 )
 from exocore_runtime.errors import ProviderAdapterError
+from exocore_runtime.providers.antigravity.generated_artifacts import (
+    is_deferrable_capture_failure,
+)
 from exocore_runtime.providers.antigravity.ndjson import (
     AgyTurnNormalizer,
     parse_init,
@@ -230,7 +233,7 @@ class AgyProcessSupervisor:
         request_id: str,
         stdin_line: bytes,
         capture_tool_result: (
-            Callable[[str, str, dict], Awaitable[dict | None]] | None
+            Callable[[str, str, dict, str], Awaitable[dict | None]] | None
         ) = None,
     ) -> AsyncIterator[ProviderEvent]:
         session, stdin = await self._begin_request(binding_id, request_id, stdin_line)
@@ -238,6 +241,7 @@ class AgyProcessSupervisor:
             session.provider_session_id,
             session.layout.mcp_tool_names,
         )
+        deferred_captures: list[dict] = []
         try:
             try:
                 await stdin.drain()
@@ -263,14 +267,41 @@ class AgyProcessSupervisor:
                 if capture_tool_result is not None:
                     step = _tool_step(parsed)
                     if step is not None:
-                        payload = await capture_tool_result(binding_id, request_id, step)
+                        payload = await capture_tool_result(
+                            binding_id,
+                            request_id,
+                            step,
+                            session.provider_session_id,
+                        )
                         if payload is not None:
-                            # The snapshot exists before this event can be
-                            # journaled: a consumer never chases a reference
-                            # that was not durably captured first.
-                            yield ProviderEvent(event_type="artifact", payload=payload)
+                            if is_deferrable_capture_failure(payload):
+                                # A native tool may persist its output file a
+                                # moment after the DONE frame; retry once the
+                                # turn stopped producing frames so a slower
+                                # write is still captured.
+                                deferred_captures.append(step)
+                            else:
+                                # The snapshot exists before this event can
+                                # be journaled: a consumer never chases a
+                                # reference that was not durably captured.
+                                yield ProviderEvent(
+                                    event_type="artifact", payload=payload
+                                )
                 if normalizer.result_seen:
                     await self._assert_quiet_after_result(session)
+                    if capture_tool_result is not None and deferred_captures:
+                        for deferred_step in deferred_captures:
+                            payload = await capture_tool_result(
+                                binding_id,
+                                request_id,
+                                deferred_step,
+                                session.provider_session_id,
+                            )
+                            if payload is not None:
+                                yield ProviderEvent(
+                                    event_type="artifact", payload=payload
+                                )
+                        deferred_captures.clear()
                     terminals = [
                         event for event in events if event.event_type in {"done", "error"}
                     ]
