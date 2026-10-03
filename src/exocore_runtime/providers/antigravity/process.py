@@ -25,9 +25,6 @@ from exocore_runtime.contracts import (
     ProviderGeneration,
 )
 from exocore_runtime.errors import ProviderAdapterError
-from exocore_runtime.providers.antigravity.generated_artifacts import (
-    is_deferrable_capture_failure,
-)
 from exocore_runtime.providers.antigravity.ndjson import (
     AgyTurnNormalizer,
     parse_init,
@@ -241,7 +238,7 @@ class AgyProcessSupervisor:
             session.provider_session_id,
             session.layout.mcp_tool_names,
         )
-        deferred_captures: list[dict] = []
+        pending_captures: dict[int, dict] = {}
         try:
             try:
                 await stdin.drain()
@@ -267,41 +264,31 @@ class AgyProcessSupervisor:
                 if capture_tool_result is not None:
                     step = _tool_step(parsed)
                     if step is not None:
-                        payload = await capture_tool_result(
-                            binding_id,
-                            request_id,
-                            step,
-                            session.provider_session_id,
-                        )
-                        if payload is not None:
-                            if is_deferrable_capture_failure(payload):
-                                # A native tool may persist its output file a
-                                # moment after the DONE frame; retry once the
-                                # turn stopped producing frames so a slower
-                                # write is still captured.
-                                deferred_captures.append(step)
-                            else:
-                                # The snapshot exists before this event can
-                                # be journaled: a consumer never chases a
-                                # reference that was not durably captured.
-                                yield ProviderEvent(
-                                    event_type="artifact", payload=payload
-                                )
+                        # Mid-turn only the tool call itself is remembered;
+                        # the capture runs once at the end of the turn, when
+                        # every step output file is complete (no mid-turn
+                        # write race and no partial reads).
+                        step_index = step.get("step_index")
+                        if isinstance(step_index, int) and step_index >= 0:
+                            pending_captures[step_index] = step
                 if normalizer.result_seen:
                     await self._assert_quiet_after_result(session)
-                    if capture_tool_result is not None and deferred_captures:
-                        for deferred_step in deferred_captures:
+                    if capture_tool_result is not None and pending_captures:
+                        for pending_step in pending_captures.values():
                             payload = await capture_tool_result(
                                 binding_id,
                                 request_id,
-                                deferred_step,
+                                pending_step,
                                 session.provider_session_id,
                             )
                             if payload is not None:
+                                # The snapshot exists before this event can
+                                # be journaled, and every artifact event is
+                                # emitted before the terminal frame.
                                 yield ProviderEvent(
                                     event_type="artifact", payload=payload
                                 )
-                        deferred_captures.clear()
+                        pending_captures.clear()
                     terminals = [
                         event for event in events if event.event_type in {"done", "error"}
                     ]

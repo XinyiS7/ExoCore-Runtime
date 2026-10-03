@@ -28,9 +28,6 @@ MAX_GENERATED_OUTPUT_BYTES = 64 * 1024
 _IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp"})
 _SAVED_AT_PREFIX = "Generated image is saved at "
 _SESSION_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
-_DEFERRABLE_CAPTURE_CODES = frozenset(
-    {"artifact_output_missing", "artifact_output_invalid"}
-)
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -302,16 +299,6 @@ class GeneratedArtifactStore:
             os.replace(temporary, target)
         finally:
             temporary.unlink(missing_ok=True)
-
-
-def is_deferrable_capture_failure(payload: object) -> bool:
-    """One retry is worth it only when the failure may be a write-timing race."""
-
-    return (
-        isinstance(payload, dict)
-        and payload.get("outcome") == "failed"
-        and payload.get("error_code") in _DEFERRABLE_CAPTURE_CODES
-    )
 
 
 def _read_step_output_text(

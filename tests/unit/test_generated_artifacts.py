@@ -15,7 +15,6 @@ from exocore_runtime.providers.antigravity.generated_artifacts import (
     GeneratedArtifactStore,
     MAX_GENERATED_OUTPUT_BYTES,
     capture_step_payload,
-    is_deferrable_capture_failure,
     parse_generated_image_output,
 )
 
@@ -463,37 +462,3 @@ class StepOutputFallbackTests(unittest.TestCase):
                 self.assertEqual(payload["outcome"], "failed")
                 self.assertEqual(payload["error_code"], "artifact_output_missing")
 
-    def test_deferrable_policy_only_covers_output_availability(self):
-        self.assertTrue(
-            is_deferrable_capture_failure(
-                {
-                    "outcome": "failed",
-                    "step_index": 3,
-                    "error_code": "artifact_output_missing",
-                }
-            )
-        )
-        self.assertTrue(
-            is_deferrable_capture_failure(
-                {
-                    "outcome": "failed",
-                    "step_index": 3,
-                    "error_code": "artifact_output_invalid",
-                }
-            )
-        )
-        self.assertFalse(
-            is_deferrable_capture_failure(
-                {
-                    "outcome": "failed",
-                    "step_index": 3,
-                    "error_code": "artifact_capture_failed",
-                }
-            )
-        )
-        self.assertFalse(
-            is_deferrable_capture_failure(
-                {"outcome": "ready", "artifact_ref": "0" * 32}
-            )
-        )
-        self.assertFalse(is_deferrable_capture_failure(None))
