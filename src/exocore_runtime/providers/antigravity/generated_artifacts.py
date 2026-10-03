@@ -1,7 +1,10 @@
-"""Provider artifact result parsing; no filesystem access or raw-output logging.
+"""Provider artifact parsing, bounded reads, and immutable snapshot capture.
 
-The caller supplies the output of a request-correlated generate_image step,
-not assistant prose. Capturing bytes, validating scope and publishing references
+The caller supplies one request-correlated generate_image tool step, never
+assistant prose; the result text comes from the streamed tool output when
+present and otherwise from the generation-private step output file with the
+same scope and size checks, and capture runs once at turn end when every
+step output is complete. Capturing bytes, validating scope and publishing references
 are separate operations. A provider tool error must never reach this parser as
 successful output or trigger another generation.
 """
