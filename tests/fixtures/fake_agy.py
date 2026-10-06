@@ -126,7 +126,19 @@ def main():
         if scenario == "version_1_2_4":
             print("1.2.4")
             return 0
-        print("1.3.0" if scenario == "bad_version" else "1.1.20")
+        if scenario == "version_1_3_0":
+            print("1.3.0")
+            return 0
+        if scenario == "version_1_3_9":
+            print("1.3.9")
+            return 0
+        if scenario == "bad_version":
+            # Stamps the first version outside the accepted envelope. The gate
+            # is an exclusive minor bound, so this must stay one minor above
+            # the newest captured line (1.3.0 -> 1.4.0).
+            print("1.4.0")
+            return 0
+        print("1.1.20")
         return 0
     if "models" in sys.argv:
         evidence("models", argv=sys.argv[1:])

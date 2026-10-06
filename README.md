@@ -56,7 +56,7 @@ Token hygiene (not correctness): the bearer is process-scoped. The umbrella's `.
 ## Runtime providers
 
 - `fake`: deterministic protocol and lifecycle fixture retained from Milestone A.
-- `antigravity`: official AGY `>=1.1.20,<1.3` using consumer `account_default` authentication and the pinned `gemini-3.1-pro-high` model. The verified envelope is 1.1.20 - 1.2.4 (1.2.4 NDJSON capture lives in `tests/fixtures/agy_1_2_4_success.jsonl`); a new minor boundary needs a fresh capture before the gate is widened.
+- `antigravity`: official AGY `>=1.1.20,<1.4` using consumer `account_default` authentication and the pinned `gemini-3.1-pro-high` model. Fixture versions are capture stamps rather than the compatibility ceiling: the repository retains a 1.2.4 baseline, 1.2.5 tool success/failure, 1.2.7 MCP evidence, and a 1.3.0 turn under `tests/fixtures/`. AGY may auto-update within the accepted minor line; the next minor still fails closed until fresh compatibility evidence widens the gate.
 
 The AGY adapter has no API-key, Vertex, Python SDK, shell, or unofficial executable fallback. Each generation receives an isolated profile, custom agent, deny-all tool policy, a generation-private workspace (request-scoped attachment staging only), a one-shot PreInvocation mailbox, and a supervised process tree. SQLite remains the durable source for bootstrap, send, replay, cancellation, and terminal status.
 

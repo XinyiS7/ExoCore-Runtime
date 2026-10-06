@@ -694,6 +694,53 @@ class AntigravityComponentTests(unittest.TestCase):
         })
         self.assertEqual(events[5].payload, {"finish_reason": "stop"})
 
+    def test_captured_1_3_0_transcript_normalizes_to_the_recorded_events(self) -> None:
+        """Sanitized transcript captured from the official AGY 1.3.0 CLI."""
+
+        fixture = (
+            Path(__file__).resolve().parents[1]
+            / "fixtures"
+            / "agy_1_3_0_success.jsonl"
+        )
+        payloads = [
+            json.loads(line)
+            for line in fixture.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+
+        generation = parse_init(payloads[0], "gemini-3.1-pro-high", "high")
+        self.assertEqual(
+            generation.provider_session_id,
+            "11111111-2222-3333-4444-555555555555",
+        )
+        # The captured CLI must still accept every tool this runtime declares.
+        declared = set(payloads[0]["init"]["tools"])
+        self.assertEqual(set(AGENT_TOOLS) - declared, set())
+
+        normalizer = AgyTurnNormalizer(generation.provider_session_id)
+        events = [
+            event
+            for payload in payloads[1:]
+            for event in normalizer.consume(payload)
+        ]
+
+        self.assertEqual(
+            [event.event_type for event in events],
+            ["lifecycle", "content_delta", "content_delta", "usage", "done"],
+        )
+        self.assertEqual(events[0].payload["step_type"], "user_input")
+        self.assertEqual(events[0].payload["state"], "DONE")
+        self.assertEqual(events[1].payload, {"text": "probe-ok"})
+        self.assertEqual(events[2].payload, {"text": "\n"})
+        self.assertEqual(events[3].payload, {
+            "input_tokens": 5404,
+            "output_tokens": 300,
+            "thinking_tokens": 297,
+            "cache_read_tokens": 0,
+            "total_tokens": 5704,
+        })
+        self.assertEqual(events[4].payload, {"finish_reason": "stop"})
+
     def test_multi_step_usage_aggregation_within_turn(self) -> None:
         """AC-01: Multiple distinct steps with usage are aggregated per-field."""
         normalizer = AgyTurnNormalizer("sess-multi-step")

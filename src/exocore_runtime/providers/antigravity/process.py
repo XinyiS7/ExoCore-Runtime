@@ -596,12 +596,16 @@ class AgyProcessSupervisor:
             if match is None:
                 raise ProviderAdapterError("agy_version_invalid", fatal_generation=True)
             major, minor, patch = (int(part) for part in match.groups())
-            # Compatibility envelope: >=1.1.20,<1.3. Production fixtures cover
+            # Compatibility envelope: >=1.1.20,<1.4. Production fixtures cover
             # 1.2.4 plus 1.2.5 tool success/failure; CP5 additionally captured
             # 1.2.7 isolated-profile MCP/quota preflight evidence with zero model
-            # turns. Minor boundaries stay fail-closed: a 1.3.x CLI needs a
-            # fresh compatibility capture before the gate is widened.
-            if (major, minor, patch) < (1, 1, 20) or (major, minor) >= (1, 3):
+            # turns. 1.3.0 carries its own capture
+            # (tests/fixtures/agy_1_3_0_success.jsonl) plus a recorded
+            # preflight, text-turn, tool-turn, tool-failure and resume-identity
+            # replay against the official CLI. Minor boundaries stay
+            # fail-closed: the next minor (1.4.x) needs a fresh compatibility
+            # capture before the gate is widened again.
+            if (major, minor, patch) < (1, 1, 20) or (major, minor) >= (1, 4):
                 raise ProviderAdapterError("agy_version_unsupported", fatal_generation=True)
             models_stdout = await self._run_bounded(
                 (*self.config.command_prefix, "models"),
