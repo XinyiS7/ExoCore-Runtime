@@ -35,4 +35,6 @@ python.exe -m exocore_runtime
 
 Use Python 3.12 and ASCII double quotes in Python source.
 
+⚠️ Probing the AGY CLI from Git Bash: MSYS rewrites arguments that start with `/`, so `agy -p /quota --output-format json` reaches the CLI as `C:/Program Files/Git/quota` and still exits 0 with the wrong semantics (same trap for REST paths and container paths). Prefix `MSYS_NO_PATHCONV=1`, or pass an argv list through `python.exe -c "import subprocess; subprocess.run([...])"`. Details: `ExoCore/AGENTS.md` §5.
+
 Daily local launch (Alicia): `run-runtime` for this service (:8766) alongside `run-exocore` for Django — both are bash aliases in `~/.bashrc`; nginx runs as a persistent Docker container and is not part of the startup steps. The umbrella's `../start_backend_with_runtime.ps1` is an optional convenience wrapper only; do not present it as the normal startup path.
