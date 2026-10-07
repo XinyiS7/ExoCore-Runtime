@@ -269,9 +269,10 @@ class AttachmentContractTests(unittest.TestCase):
                 "trace_self",
                 "send_voice_msg",
                 "wezterm_bridge",
+                "add_to_collection",
             ),
         )
-        self.assertEqual(len(manifest), 11)
+        self.assertEqual(len(manifest), 12)
         self.assertEqual(
             tuple(tool.name for tool in manifest if tool.eager),
             (
@@ -284,12 +285,16 @@ class AttachmentContractTests(unittest.TestCase):
             ),
         )
         self.assertEqual(
-            manifest[-1].model_dump(mode="json"),
+            manifest[-2].model_dump(mode="json"),
             {"name": "wezterm_bridge", "eager": False, "max_call_seconds": 30},
         )
         self.assertEqual(
+            manifest[-1].model_dump(mode="json"),
+            {"name": "add_to_collection", "eager": False, "max_call_seconds": None},
+        )
+        self.assertEqual(
             runtime_mcp_manifest_sha256(manifest),
-            "614fd687933333d884b55887f14c9923259d28a0889d84fe871a313cd36048ef",
+            "92341eddc9d814fb315d1122337a9ff8761fb31a784f797dc16a4f1a522a33d2",
         )
 
     def test_manifest_is_identity_metadata_only(self):
