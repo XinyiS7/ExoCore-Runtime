@@ -323,6 +323,24 @@ class AntigravityComponentTests(unittest.TestCase):
         )
         self.assertIn(json.dumps(path), content)
 
+    def test_non_image_attachment_path_uses_the_same_current_user_envelope(self) -> None:
+        path = str(self.root / "workspace" / "request-7" / "attachments" / "att-7.txt")
+        request = self.attachment_request(
+            attachments=(self.attachment_manifest(
+                display_name="notes.txt",
+                mime_type="text/plain",
+            ),),
+        )
+        rendered = render_stdin_line(
+            request,
+            is_first_turn=False,
+            attachment_paths={"att-7": path},
+        )
+        content = json.loads(rendered)["message"]["content"]
+        self.assertIn("mime=text/plain", content)
+        self.assertIn(json.dumps(path), content)
+        self.assertEqual(content.count("\n1. name="), 1)
+
     def test_attachments_disable_the_bare_shortcut_and_keep_bootstrap_order(self) -> None:
         path = str(self.root / "workspace" / "request-7" / "attachments" / "att-7.png")
         request = self.attachment_request()

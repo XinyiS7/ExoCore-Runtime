@@ -72,11 +72,11 @@ Django and Runtime must deploy this capability together. With no active turn, st
 
 ### Turn attachments
 
-Current-turn image attachments are staged before send and rendered into the provider's `CurrentUserMessage`; earlier turns are never replayed.
+Current-turn image, plain-text, WAV, and WebM attachments are staged before send and rendered into the provider's `CurrentUserMessage`; earlier turns are never replayed.
 
 - Capability is declared by the handshake: `turn_attachments` is part of the exact eight-item `RUNTIME_CAPABILITIES` / `GET /v2/health` list; clients must gate on that exact list instead of any static endpoint table.
 - Staging uses an authenticated raw `PUT /v2/generations/{binding_id}/turns/{request_id}/attachments/{artifact_id}`, writing request-scoped opaque `.blob` artifacts under the generation workspace with atomic writes; a request accepts up to 5 files, 20 MiB each and 50 MiB total.
-- Before provider spawn, size, SHA256 and MIME are verified; staged artifacts materialize crash-idempotently into the request's attachment directory, and only Runtime-owned absolute paths are projected into the rendered input.
+- Before provider spawn, size and SHA256 are verified for every attachment; PNG, JPEG, and WebP additionally require matching file signatures. Staged artifacts materialize crash-idempotently into the request's attachment directory, and only Runtime-owned absolute paths are projected into the rendered input.
 - `DELETE /v2/generations/{binding_id}/turns/{request_id}/attachments` prunes pre-send staging idempotently; once the request is durably registered, both PUT and DELETE refuse with `request_registered` and leave bytes unchanged.
 - Retire deletes only the generation-owned provider root, which holds every staging and materialized attachment artifact.
 

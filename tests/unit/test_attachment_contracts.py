@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 import unittest
@@ -8,6 +9,7 @@ from uuid import uuid4
 from pydantic import ValidationError
 
 from exocore_runtime.contracts import (
+    ATTACHMENT_EXTENSIONS,
     AttachmentManifest,
     RUNTIME_CAPABILITIES,
     RuntimeMcpTool,
@@ -70,6 +72,53 @@ class AttachmentContractTests(unittest.TestCase):
                 + "a" * 64
                 + '","extra":1}'
             )
+
+    def test_phase_one_mime_table_is_strict_and_fixture_pinned(self):
+        for mime_type in ATTACHMENT_EXTENSIONS:
+            with self.subTest(mime_type=mime_type):
+                self.assertEqual(self.manifest(mime_type=mime_type).mime_type, mime_type)
+        for invalid in (
+            "audio/x-wav",
+            "audio/webm;codecs=opus",
+            "text/markdown",
+            "video/webm",
+            7,
+            b"image/png",
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(ValidationError):
+                self.manifest(mime_type=invalid)
+
+        fixture = (
+            Path(__file__).resolve().parents[1]
+            / "fixtures"
+            / "runtime_attachment_mime_table.json"
+        )
+        payload = json.loads(fixture.read_text(encoding="utf-8"))
+        canonical = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        self.assertEqual(
+            hashlib.sha256(canonical).hexdigest(),
+            "74cf4189edc0ebdace5cea1b2cd1810e5a24122014f2901ddbd71c6c882ef82a",
+        )
+        self.assertEqual(payload["extensions"], ATTACHMENT_EXTENSIONS)
+        from exocore_runtime.providers.antigravity.attachments import (
+            _SIGNATURE_CHECKERS,
+        )
+
+        self.assertEqual(
+            payload["signature_checked"],
+            sorted(_SIGNATURE_CHECKERS),
+        )
+        self.assertTrue(
+            all(
+                not mime.startswith("image/") or mime in _SIGNATURE_CHECKERS
+                for mime in ATTACHMENT_EXTENSIONS
+            )
+        )
 
     def test_attachment_order_and_every_manifest_field_enter_request_hash(self):
         first = self.manifest(artifact_id="att-7", sha256="a" * 64)

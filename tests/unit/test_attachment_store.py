@@ -21,6 +21,7 @@ from exocore_runtime.providers.antigravity.attachments import AttachmentStore
 
 PNG = b"\x89PNG\r\n\x1a\ncanonical-pixels"
 JPEG = b"\xff\xd8\xffcanonical-jpeg"
+WEBP = b"RIFF\x00\x00\x00\x00WEBPcanonical-webp"
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
@@ -129,6 +130,55 @@ class AttachmentStoreTests(unittest.TestCase):
         self.assertEqual(replaced.read_bytes(), JPEG)
         self.assertFalse(final.exists())
 
+    def test_materialize_phase_one_non_image_types_without_signature_check(self):
+        cases = (
+            ("text/plain", ".txt", b"plain text"),
+            ("audio/wav", ".wav", b"wav fixture bytes"),
+            ("audio/webm", ".webm", b"webm fixture bytes"),
+        )
+        for index, (mime_type, suffix, data) in enumerate(cases, start=1):
+            artifact_id = f"att-{index}"
+            self.store.stage(self.request_id, artifact_id, data)
+            manifest = self.manifest(
+                data,
+                artifact_id=artifact_id,
+                display_name=f"fixture{suffix}",
+                mime_type=mime_type,
+            )
+            with self.subTest(mime_type=mime_type):
+                path = self.store.materialize(self.request_id, (manifest,))[artifact_id]
+                self.assertEqual(path.suffix, suffix)
+                self.assertEqual(path.read_bytes(), data)
+
+    def test_webp_signature_is_checked_explicitly(self):
+        self.store.stage(self.request_id, "att-7", WEBP)
+        valid = self.manifest(WEBP, mime_type="image/webp")
+        self.assertEqual(
+            self.store.materialize(self.request_id, (valid,))["att-7"].suffix,
+            ".webp",
+        )
+
+        wrong = b"not-webp-data"
+        self.store.stage(self.request_id, "att-7", wrong)
+        with self.assertRaises(ProviderAdapterError) as caught:
+            self.store.materialize(
+                self.request_id,
+                (self.manifest(wrong, mime_type="image/webp"),),
+            )
+        self.assertEqual(caught.exception.code, "attachment_mime_mismatch")
+
+    def test_non_image_digest_mismatch_still_fails(self):
+        data = b"plain text"
+        self.store.stage(self.request_id, "att-7", data)
+        manifest = self.manifest(
+            data,
+            mime_type="text/plain",
+            sha256="0" * 64,
+        )
+        with self.assertRaises(ProviderAdapterError) as caught:
+            self.store.materialize(self.request_id, (manifest,))
+        self.assertEqual(caught.exception.code, "attachment_digest_mismatch")
+
     def test_stage_enforces_the_single_file_cap_before_writing(self) -> None:
         from exocore_runtime.contracts import MAX_ATTACHMENT_BYTES
 
@@ -161,6 +211,23 @@ class AttachmentStoreTests(unittest.TestCase):
                 (self.manifest(size=len(PNG) + 1),),
             )
         self.assertEqual(caught.exception.code, "attachment_digest_mismatch")
+
+    def test_materialize_removes_stale_non_image_sibling(self) -> None:
+        text = b"plain text"
+        self.store.stage(self.request_id, "att-7", text)
+        old_path = self.store.materialize(
+            self.request_id,
+            (self.manifest(text, mime_type="text/plain"),),
+        )["att-7"]
+        self.assertEqual(old_path.suffix, ".txt")
+
+        self.store.stage(self.request_id, "att-7", PNG)
+        new_path = self.store.materialize(
+            self.request_id,
+            (self.manifest(PNG, mime_type="image/png"),),
+        )["att-7"]
+        self.assertFalse(old_path.exists())
+        self.assertTrue(new_path.exists())
 
     def test_materialize_cleans_stale_finals_only_for_the_same_artifact(self) -> None:
         self.store.stage(self.request_id, "att-7", PNG)

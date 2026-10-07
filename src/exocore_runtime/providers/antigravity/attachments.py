@@ -7,9 +7,11 @@ import os
 from pathlib import Path
 import shutil
 import stat
+from typing import Callable
 from uuid import UUID, uuid4
 
 from exocore_runtime.contracts import (
+    ATTACHMENT_EXTENSIONS,
     ATTACHMENT_ID_PATTERN,
     MAX_ATTACHMENT_BYTES,
     MAX_ATTACHMENT_COUNT,
@@ -24,10 +26,14 @@ from exocore_runtime.errors import (
 )
 
 
-_MIME_EXTENSIONS = {
-    "image/png": ".png",
-    "image/jpeg": ".jpg",
-    "image/webp": ".webp",
+_SIGNATURE_CHECKERS: dict[str, Callable[[bytes], bool]] = {
+    "image/png": lambda data: data.startswith(b"\x89PNG\r\n\x1a\n"),
+    "image/jpeg": lambda data: data.startswith(b"\xff\xd8\xff"),
+    "image/webp": lambda data: (
+        len(data) >= 12
+        and data.startswith(b"RIFF")
+        and data[8:12] == b"WEBP"
+    ),
 }
 
 
@@ -98,7 +104,7 @@ class AttachmentStore:
 
         materialized: dict[str, Path] = {}
         for manifest in manifests:
-            extension = _MIME_EXTENSIONS[manifest.mime_type]
+            extension = ATTACHMENT_EXTENSIONS[manifest.mime_type]
             blob = attachment_dir / f"{manifest.artifact_id}.blob"
             final = attachment_dir / f"{manifest.artifact_id}{extension}"
             source = blob if blob.exists() else final
@@ -198,7 +204,7 @@ class AttachmentStore:
     ) -> None:
         """Remove only the controlled final variants, never a broad sweep."""
 
-        for extension in _MIME_EXTENSIONS.values():
+        for extension in set(ATTACHMENT_EXTENSIONS.values()):
             candidate = attachment_dir / f"{artifact_id}{extension}"
             if candidate == keep or not candidate.exists():
                 continue
@@ -230,15 +236,6 @@ class AttachmentStore:
             or hashlib.sha256(data).hexdigest() != manifest.sha256
         ):
             raise ProviderAdapterError("attachment_digest_mismatch")
-        if manifest.mime_type == "image/png":
-            valid = data.startswith(b"\x89PNG\r\n\x1a\n")
-        elif manifest.mime_type == "image/jpeg":
-            valid = data.startswith(b"\xff\xd8\xff")
-        else:
-            valid = (
-                len(data) >= 12
-                and data.startswith(b"RIFF")
-                and data[8:12] == b"WEBP"
-            )
-        if not valid:
+        checker = _SIGNATURE_CHECKERS.get(manifest.mime_type)
+        if checker is not None and not checker(data):
             raise ProviderAdapterError("attachment_mime_mismatch")

@@ -8,7 +8,16 @@ import re
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    StrictStr,
+    field_validator,
+    model_validator,
+)
 
 
 PROTOCOL_VERSION = "v2"
@@ -33,6 +42,14 @@ MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
 MAX_ATTACHMENT_COUNT = 5
 MAX_ATTACHMENT_TOTAL_BYTES = 50 * 1024 * 1024
 ATTACHMENT_ID_PATTERN = r"^att-[1-9][0-9]{0,18}$"
+ATTACHMENT_EXTENSIONS = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/webp": ".webp",
+    "text/plain": ".txt",
+    "audio/wav": ".wav",
+    "audio/webm": ".webm",
+}
 SHA256_PATTERN = r"^[0-9a-f]{64}$"
 MCP_TOOL_NAME_PATTERN = r"^[a-z][a-z0-9_]{0,99}$"
 MAX_RUNTIME_MCP_TOOL_COUNT = 64
@@ -245,9 +262,16 @@ class ContinuityDeltaTurn(StrictContract):
 class AttachmentManifest(StrictContract):
     artifact_id: str = Field(pattern=ATTACHMENT_ID_PATTERN)
     display_name: str = Field(min_length=1, max_length=255)
-    mime_type: Literal["image/png", "image/jpeg", "image/webp"]
+    mime_type: StrictStr
     size: StrictInt = Field(gt=0, le=MAX_ATTACHMENT_BYTES)
     sha256: str = Field(pattern=SHA256_PATTERN)
+
+    @field_validator("mime_type")
+    @classmethod
+    def validate_mime_type(cls, value: str) -> str:
+        if value not in ATTACHMENT_EXTENSIONS:
+            raise ValueError("unsupported runtime attachment MIME type")
+        return value
 
 
 class RuntimeMcpTool(StrictContract):
