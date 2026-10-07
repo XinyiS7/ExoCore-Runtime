@@ -7,6 +7,7 @@ This service is an outbound provider runtime. It must remain independent from Dj
 - Independent repository: `git@github.com:XinyiS7/ExoCore-Runtime.git`, branch `main`.
 - Extracted 2026-09-26 from the umbrella `ExoCore_Project` repository with full history preserved. The umbrella no longer tracks this directory; it now only holds cross-repo docs/scripts, nginx config and local data.
 - The live worktree normally sits at `ExoCore_Project/ExoCore-Runtime/` as a nested independent checkout, so sibling paths such as `../ExoCore` or `../start_backend_with_runtime.ps1` belong to the umbrella and are local conveniences, not part of this repository.
+- Pending work lives in `XinyiS7/ExoCore` GitHub issues (`gh issue list -R XinyiS7/ExoCore -l area:runtime`). Commits reference `refs XinyiS7/ExoCore#N`, never `fixes`/`closes`. Rules: `../ExoCore/AGENTS.md` §2 「待办」.
 - Cross-repo plans that cover this service together with Django live in `ExoCore/Plan/` of the sibling `ExoCore` repository.
 
 ## Boundaries
