@@ -15,7 +15,9 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from exocore_runtime.config import RuntimeConfig
 from exocore_runtime.contracts import (
     ARTIFACT_REF_PATTERN,
+    ATTACHMENT_EXTENSIONS,
     ATTACHMENT_ID_PATTERN,
+    INSPECTION_ID_PATTERN,
     MAX_ATTACHMENT_BYTES,
     PROTOCOL_VERSION,
     RUNTIME_CAPABILITIES,
@@ -195,6 +197,50 @@ def create_app(
             bytes(body),
         )
         return Response(status_code=200)
+
+    @app.put(
+        "/v2/generations/{binding_id}/turns/{request_id}/inspections/{inspection_id}"
+    )
+    async def stage_inspection(
+        binding_id: UUID,
+        request_id: UUID,
+        inspection_id: str,
+        request: Request,
+    ) -> JSONResponse:
+        """Mid-turn Collection original for AGY ``view_file`` (#43)."""
+
+        if re.fullmatch(INSPECTION_ID_PATTERN, inspection_id) is None:
+            raise InvalidRequestError("invalid inspection id")
+        if request.headers.get("transfer-encoding") is not None:
+            raise InvalidRequestError("chunked inspection uploads are not accepted")
+        mime_type = (
+            request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        )
+        if mime_type not in ATTACHMENT_EXTENSIONS:
+            raise InvalidRequestError("inspection MIME type is unsupported")
+        declared_text = request.headers.get("content-length")
+        if declared_text is None or not declared_text.isdigit():
+            raise InvalidRequestError("inspection content length is required")
+        declared_size = int(declared_text)
+        if declared_size <= 0:
+            raise InvalidRequestError("inspection body cannot be empty")
+        if declared_size > MAX_ATTACHMENT_BYTES:
+            raise AttachmentSizeExceededError()
+        body = bytearray()
+        async for chunk in request.stream():
+            body.extend(chunk)
+            if len(body) > MAX_ATTACHMENT_BYTES:
+                raise AttachmentSizeExceededError()
+        if len(body) != declared_size:
+            raise InvalidRequestError("inspection content length does not match body")
+        path = await service.stage_inspection(
+            binding_id,
+            request_id,
+            inspection_id,
+            mime_type,
+            bytes(body),
+        )
+        return JSONResponse({"path": path})
 
     @app.delete("/v2/generations/{binding_id}/turns/{request_id}/attachments")
     async def discard_attachments(

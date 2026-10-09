@@ -187,6 +187,38 @@ class RuntimeService:
                 guard=self._attachment_mutation_guard(binding, request_key),
             )
 
+    async def stage_inspection(
+        self,
+        binding_id: UUID,
+        request_id: UUID,
+        inspection_id: str,
+        mime_type: str,
+        data: bytes,
+    ) -> str:
+        """Stage one Collection original mid-turn (#43); return its absolute path.
+
+        Takes the request claim lock and, inside the provider, the artifact
+        lock; never the generation turn lock, which the running turn holds.
+        """
+
+        if self._shutting_down:
+            raise ConflictError("runtime is shutting down")
+        binding = str(binding_id)
+        request_key = str(request_id)
+        generation = self.store.get_generation(binding)
+        provider = self._provider_for_kind(generation.runtime_kind)
+        request_lock = await self._get_claim_lock(binding, request_key)
+        async with request_lock:
+            path = await provider.stage_inspection(
+                binding,
+                request_key,
+                inspection_id,
+                mime_type,
+                data,
+                guard=self._inspection_guard(binding, request_key),
+            )
+        return str(path)
+
     async def read_generated_artifact(
         self,
         binding_id: UUID,
@@ -516,6 +548,7 @@ class RuntimeService:
                     yield event
                 return
             await self._cleanup_unsent_request(binding, request_id, provider)
+            await self._discard_inspections_safely(binding, request_id, provider)
             self._reclaim_request_safely(binding, request_id, provider)
             if terminal.sequence > yielded_sequence:
                 yield terminal
@@ -761,6 +794,7 @@ class RuntimeService:
             raise
         finally:
             self._conclude_arbiter(arbiter, failure=failure)
+            await self._discard_inspections_safely(binding, request_id, provider)
             self._reclaim_request_safely(binding, request_id, provider)
         return changed
 
@@ -840,6 +874,7 @@ class RuntimeService:
 
         terminal = self._claim_natural_terminal(arbiter, writer)
         if terminal is not None:
+            await self._discard_inspections_safely(binding, request_id, provider)
             self._reclaim_request_safely(binding, request_id, provider)
             if terminal.sequence > yielded_sequence:
                 yield terminal
@@ -931,6 +966,19 @@ class RuntimeService:
         except Exception:
             _LOGGER.warning("runtime provider request reclaim failed", exc_info=False)
 
+    async def _discard_inspections_safely(
+        self,
+        binding: str,
+        request_id: str,
+        provider: RuntimeProviderAdapter,
+    ) -> None:
+        """Post-terminal inspection cleanup; never rewrites terminal truth."""
+
+        try:
+            await provider.discard_inspections(binding, request_id)
+        except Exception:
+            _LOGGER.warning("runtime inspection cleanup failed", exc_info=False)
+
     async def _cleanup_unsent_request(
         self,
         binding: str,
@@ -985,6 +1033,25 @@ class RuntimeService:
                 raise ConflictError("generation does not accept attachments")
             if self.store.get_request(binding_id, request_id) is not None:
                 raise RequestRegisteredError("request is already registered")
+
+        return guard
+
+    def _inspection_guard(
+        self,
+        binding_id: str,
+        request_id: str,
+    ) -> Callable[[], None]:
+        """Inspections are accepted only while the exact request is ``sent``."""
+
+        def guard() -> None:
+            generation = self.store.get_generation(binding_id)
+            if generation.status == "retired":
+                raise RetiredError("generation is retired")
+            if generation.status != "active":
+                raise ConflictError("generation is not active")
+            record = self.store.get_request(binding_id, request_id)
+            if record is None or record.status != "sent":
+                raise ConflictError("request is not sent")
 
         return guard
 

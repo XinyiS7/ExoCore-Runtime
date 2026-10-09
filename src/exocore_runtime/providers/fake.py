@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections import Counter
 from collections.abc import AsyncIterator, Callable
+from pathlib import Path
 
 from exocore_runtime.contracts import (
     EffectiveResolution,
@@ -34,6 +35,8 @@ class DeterministicFakeAdapter:
         self.reclaims: Counter[tuple[str, str]] = Counter()
         self.staged_attachments: dict[tuple[str, str, str], bytes] = {}
         self.attachment_discards: Counter[tuple[str, str]] = Counter()
+        self.staged_inspections: dict[tuple[str, str, str], tuple[str, bytes]] = {}
+        self.inspection_discards: Counter[tuple[str, str]] = Counter()
         self.resolver_calls: Counter[tuple[str, str]] = Counter()
         self._cancel_signals: dict[tuple[str, str], asyncio.Event] = {}
         self._behaviors: dict[str, str] = {}
@@ -148,6 +151,32 @@ class DeterministicFakeAdapter:
             if key[:2] == (binding_id, request_id)
         ]:
             self.staged_attachments.pop(key, None)
+
+    async def stage_inspection(
+        self,
+        binding_id: str,
+        request_id: str,
+        inspection_id: str,
+        mime_type: str,
+        data: bytes,
+        *,
+        guard: Callable[[], None],
+    ) -> Path:
+        guard()
+        self.staged_inspections[(binding_id, request_id, inspection_id)] = (
+            mime_type,
+            data,
+        )
+        return Path.cwd().resolve() / "fake-inspections" / request_id / inspection_id
+
+    async def discard_inspections(self, binding_id: str, request_id: str) -> None:
+        self.inspection_discards[(binding_id, request_id)] += 1
+        for key in [
+            key
+            for key in self.staged_inspections
+            if key[:2] == (binding_id, request_id)
+        ]:
+            self.staged_inspections.pop(key, None)
 
     async def prepare_turn(
         self,

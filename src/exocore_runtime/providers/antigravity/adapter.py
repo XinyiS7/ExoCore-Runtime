@@ -5,6 +5,7 @@
 - 产物导出：AGY `generate_image` 的原始 tool step 经 `generated_artifacts.capture_step_payload` 校验并快照化（artifact 锁内），仅以不透明 ref 经 `artifact` 事件与 `GET /v2/generations/{binding_id}/artifacts/{artifact_ref}/content` 出口；捕获失败只记有界 `failed` payload，绝不改写 provider terminal truth。
 - 扩展点：provider 侧附件行为分布在三处——`attachments.AttachmentStore`（stage/materialize/discard 与上限）、本模块的 `stage_attachment` / `discard_attachments` / `prepare_turn`（materialize + 渲染注入）、`renderer.render_stdin_line(..., attachment_paths=...)`；HTTP 面在 `api.py` 的 PUT/DELETE turn-attachments 路由；契约与上限常量在 `contracts.py`（`turn_attachments` capability、AttachmentManifest、MAX_ATTACHMENT_*）。
 - 语义口径：staging 为 request 作用域，`request_registered` 之后 PUT/DELETE 必须拒绝且不动 bytes；materialize 崩溃幂等且只投影 Runtime 私有绝对路径（canonical 路径/文件名不得进入 envelope）；discard 幂等；共享 artifact lock 串行化 stage/discard/materialize。监督进程 env 拒绝七个 Google/Gemini auth 名（real 值 fail-closed，空值放行；见 `process.py::_isolated_environment` 的预检）。
+- Inspections（#43）：`stage_inspection` 只在请求 `sent` 期间由 service 经 claim lock + 本模块 artifact lock 调用（绝不取 generation turn lock），写入 `workspace/<request>/inspections/item-<id><ext>` 并返回绝对路径供 AGY `view_file`；只有单文件大小上限，无同轮 count/total cap；同一件藏品原子覆盖。`discard_inspections` 是独立 async 能力，service 在三条终态路径于 `reclaim_request` 之前 await；`reclaim_request` 仍是同步、无 I/O 的冻结契约。
 - 测试注意：合约/store 单测 `tests/unit/test_attachment_contracts.py`、`test_attachment_store.py`；claim 竞态与中断上传证据 `tests/integration/test_antigravity_adapter.py`、`test_http_api.py`；HTTP 语义 `tests/integration/test_v2_http_api.py`。
 - 落盘/边界：所有 staging/final/temp 产物只存在于该 generation 的 provider data root 内；retire 只删除 generation 根；不触碰官方 keyring 与 ExoCore canonical 数据。
 - 关联：ExoCore 编排 Plan（已归档）`../ExoCore/Plan/Archived/AGY_Runtime_Current_Turn_Attachments_Plan.md`；X1 真实证据见 `../ExoCore/Plan/AGY_Runtime_Current_Turn_Attachments_acceptance_report.md`。
@@ -197,6 +198,33 @@ class AntigravityAdapter:
         async with lock:
             guard()
             AttachmentStore(self._generation_root(binding_id)).discard(request_id)
+
+    async def stage_inspection(
+        self,
+        binding_id: str,
+        request_id: str,
+        inspection_id: str,
+        mime_type: str,
+        data: bytes,
+        *,
+        guard: Callable[[], None],
+    ) -> Path:
+        lock = await self._artifact_lock(binding_id)
+        async with lock:
+            guard()
+            return AttachmentStore(self._generation_root(binding_id)).stage_inspection(
+                request_id,
+                inspection_id,
+                mime_type,
+                data,
+            )
+
+    async def discard_inspections(self, binding_id: str, request_id: str) -> None:
+        lock = await self._artifact_lock(binding_id)
+        async with lock:
+            AttachmentStore(self._generation_root(binding_id)).discard_inspections(
+                request_id
+            )
 
     async def prepare_turn(
         self,

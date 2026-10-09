@@ -1716,6 +1716,49 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsInstance(stage_result, RetiredError)
         self.assertFalse(generation_root.exists())
 
+    async def test_inspection_is_staged_mid_turn_and_discarded_after_cancel(self) -> None:
+        # #43: a sent request accepts an inspection file in its own workspace
+        # without the turn lock; the cancel terminal removes the directory.
+        service, _ = self.build_service("slow_tree")
+        await service.ensure_generation(self.binding_id, self.spec)
+        request = self.turn(bootstrap={"history": []})
+        owner = asyncio.create_task(collect(service, self.binding_id, request))
+        for _ in range(200):
+            record = service.store.get_request(str(self.binding_id), str(request.request_id))
+            if record is not None and record.status == "sent":
+                break
+            await asyncio.sleep(0.01)
+        else:
+            self.fail("request did not cross the durable send boundary")
+
+        path = Path(
+            await service.stage_inspection(
+                self.binding_id,
+                request.request_id,
+                "item-7",
+                "image/png",
+                PNG_BYTES,
+            )
+        )
+        inspections = (
+            self.generation_root() / "workspace" / str(request.request_id) / "inspections"
+        )
+        self.assertEqual(path, (inspections / "item-7.png").resolve())
+        self.assertEqual(path.read_bytes(), PNG_BYTES)
+
+        await service.cancel(self.binding_id, request.request_id)
+        events = await asyncio.wait_for(owner, timeout=3)
+        self.assertEqual(events[-1].payload, {"code": "cancelled"})
+        self.assertFalse(inspections.exists())
+        with self.assertRaises(ConflictError):
+            await service.stage_inspection(
+                self.binding_id,
+                request.request_id,
+                "item-7",
+                "image/png",
+                PNG_BYTES,
+            )
+
     async def test_materialize_recovers_blob_only_and_final_only_windows(self) -> None:
         service, _adapter = self.build_service()
         await service.ensure_generation(self.binding_id, self.spec)

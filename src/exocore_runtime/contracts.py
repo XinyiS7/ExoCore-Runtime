@@ -42,6 +42,8 @@ MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
 MAX_ATTACHMENT_COUNT = 5
 MAX_ATTACHMENT_TOTAL_BYTES = 50 * 1024 * 1024
 ATTACHMENT_ID_PATTERN = r"^att-[1-9][0-9]{0,18}$"
+# Mid-turn Collection inspections (#43): one file per collection item id.
+INSPECTION_ID_PATTERN = r"^item-[1-9][0-9]{0,18}$"
 ATTACHMENT_EXTENSIONS = {
     "image/png": ".png",
     "image/jpeg": ".jpg",

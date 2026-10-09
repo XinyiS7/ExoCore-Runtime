@@ -1,4 +1,12 @@
-"""Generation-private attachment staging, verification, and materialization."""
+"""Generation-private attachment staging, verification, and materialization.
+
+Inspections (#43) are a separate, narrower lane: ExoCore stages one Collection
+original into ``workspace/<request>/inspections/`` while that request is
+``sent`` so AGY can ``view_file`` it in the same turn. They are not manifests,
+are never materialized into a stdin line, have only the per-file size limit
+(no per-request count/total cap), and are removed by ``discard_inspections``
+once the request is terminal.
+"""
 
 from __future__ import annotations
 
@@ -13,6 +21,7 @@ from uuid import UUID, uuid4
 from exocore_runtime.contracts import (
     ATTACHMENT_EXTENSIONS,
     ATTACHMENT_ID_PATTERN,
+    INSPECTION_ID_PATTERN,
     MAX_ATTACHMENT_BYTES,
     MAX_ATTACHMENT_COUNT,
     MAX_ATTACHMENT_TOTAL_BYTES,
@@ -22,6 +31,7 @@ from exocore_runtime.errors import (
     AttachmentCapacityExceededError,
     AttachmentSizeExceededError,
     AttachmentStagingError,
+    InvalidRequestError,
     ProviderAdapterError,
 )
 
@@ -69,6 +79,62 @@ class AttachmentStore:
             return target
         except (AttachmentCapacityExceededError, AttachmentSizeExceededError):
             raise
+        except (OSError, ValueError) as exc:
+            raise AttachmentStagingError() from exc
+
+    def stage_inspection(
+        self,
+        request_id: str,
+        inspection_id: str,
+        mime_type: str,
+        data: bytes,
+    ) -> Path:
+        """Atomically write one inspection file and return its absolute path."""
+
+        import re
+
+        self._validate_request_id(request_id)
+        if type(inspection_id) is not str or re.fullmatch(
+            INSPECTION_ID_PATTERN,
+            inspection_id,
+        ) is None:
+            raise ValueError("invalid inspection id")
+        if type(data) is not bytes:
+            raise TypeError("inspection data must be bytes")
+        extension = ATTACHMENT_EXTENSIONS.get(mime_type)
+        if extension is None:
+            raise InvalidRequestError("inspection MIME type is unsupported")
+        if len(data) > MAX_ATTACHMENT_BYTES:
+            raise AttachmentSizeExceededError()
+        if not data:
+            raise InvalidRequestError("inspection body cannot be empty")
+        checker = _SIGNATURE_CHECKERS.get(mime_type)
+        if checker is not None and not checker(data):
+            raise InvalidRequestError("inspection bytes do not match the MIME type")
+        try:
+            target = self._ensure_request_subdir(request_id, "inspections") / (
+                f"{inspection_id}{extension}"
+            )
+            if target.exists():
+                self._require_regular_file(target)
+            self._atomic_write(target, data)
+            return target.resolve(strict=True)
+        except (OSError, ValueError) as exc:
+            raise AttachmentStagingError() from exc
+
+    def discard_inspections(self, request_id: str) -> None:
+        """Idempotently remove the request's inspections directory only."""
+
+        self._validate_request_id(request_id)
+        inspection_dir = self.workspace / request_id / "inspections"
+        if not inspection_dir.exists():
+            return
+        try:
+            self._require_real_directory(self.generation_root)
+            self._require_real_directory(self.workspace)
+            self._require_real_directory(self.workspace / request_id)
+            self._require_real_directory(inspection_dir)
+            shutil.rmtree(inspection_dir)
         except (OSError, ValueError) as exc:
             raise AttachmentStagingError() from exc
 
@@ -125,13 +191,16 @@ class AttachmentStore:
         self.discard(request_id)
 
     def _ensure_attachment_dir(self, request_id: str) -> Path:
+        return self._ensure_request_subdir(request_id, "attachments")
+
+    def _ensure_request_subdir(self, request_id: str, name: str) -> Path:
         self._require_real_directory(self.generation_root)
         self._require_real_directory(self.workspace)
         request_root = self.workspace / request_id
-        attachment_dir = request_root / "attachments"
+        subdir = request_root / name
         self._mkdir_real(request_root)
-        self._mkdir_real(attachment_dir)
-        return attachment_dir
+        self._mkdir_real(subdir)
+        return subdir
 
     def _attachment_dir(self, request_id: str) -> Path:
         return self.workspace / request_id / "attachments"

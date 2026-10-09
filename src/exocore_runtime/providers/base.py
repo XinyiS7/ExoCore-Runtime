@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from typing import Protocol
 
 from exocore_runtime.contracts import (
@@ -88,6 +89,28 @@ class RuntimeProviderAdapter(Protocol):
         *,
         guard: Callable[[], None],
     ) -> None: ...
+
+    async def stage_inspection(
+        self,
+        binding_id: str,
+        request_id: str,
+        inspection_id: str,
+        mime_type: str,
+        data: bytes,
+        *,
+        guard: Callable[[], None],
+    ) -> Path:
+        """Stage one mid-turn inspection file; return its absolute path."""
+        ...
+
+    async def discard_inspections(self, binding_id: str, request_id: str) -> None:
+        """Idempotently remove the request's inspections after its terminal.
+
+        Awaited by the service before ``reclaim_request`` on every terminal
+        path; it may take the provider artifact lock and touch the filesystem,
+        which ``reclaim_request`` must not.
+        """
+        ...
 
     async def read_generated_artifact(
         self,

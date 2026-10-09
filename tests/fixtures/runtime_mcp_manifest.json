@@ -11,5 +11,6 @@
   {"name": "send_voice_msg", "eager": true, "max_call_seconds": 45},
   {"name": "wezterm_bridge", "eager": false, "max_call_seconds": 30},
   {"name": "add_to_collection", "eager": false, "max_call_seconds": null},
-  {"name": "browse_collection", "eager": false, "max_call_seconds": null}
+  {"name": "browse_collection", "eager": false, "max_call_seconds": null},
+  {"name": "use_collection_item", "eager": false, "max_call_seconds": null}
 ]
