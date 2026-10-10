@@ -40,23 +40,38 @@ def request(*, request_id=None, thinking="auto", model="gemini-3.1-pro-preview",
 
 
 class CapabilityPolicyTests(unittest.TestCase):
-    def test_current_product_slice_is_explicit(self) -> None:
-        cases = {
-            "auto": ("gemini-3.1-pro-high", "high"),
-            "low": ("gemini-3.1-pro-low", "low"),
-            "high": ("gemini-3.1-pro-high", "high"),
-        }
-        for thinking, expected in cases.items():
+    def test_every_thinking_level_resolves_to_the_high_tier(self) -> None:
+        for thinking in ("off", "auto", "low", "medium", "high", "max"):
             with self.subTest(thinking=thinking):
                 resolution = resolve_execution("gemini-3.1-pro-preview", thinking)
-                self.assertEqual((resolution.provider_model_slug, resolution.effort), expected)
-        for thinking in ("off", "medium", "max"):
-            with self.subTest(thinking=thinking), self.assertRaisesRegex(
+                self.assertEqual(
+                    (resolution.provider_model_slug, resolution.effort),
+                    ("gemini-3.1-pro-high", "high"),
+                )
+                self.assertEqual(resolution.resolver_policy_revision, "agy-gemini-high-v2")
+
+    def test_gemini_model_names_map_by_rule(self) -> None:
+        cases = {
+            "gemini-3.1-pro-preview": "gemini-3.1-pro-high",
+            "gemini-3.8-flash": "gemini-3.8-flash-high",
+            "gemini-3.6-flash": "gemini-3.6-flash-high",
+            # Only a terminal ``-preview`` is a release-channel suffix.
+            "gemini-3-flash-preview": "gemini-3-flash-high",
+            "gemini-3.7-flash-preview-x": "gemini-3.7-flash-preview-x-high",
+        }
+        for requested, slug in cases.items():
+            with self.subTest(requested=requested):
+                self.assertEqual(
+                    resolve_execution(requested, "auto").provider_model_slug,
+                    slug,
+                )
+
+    def test_non_gemini_models_are_unsupported(self) -> None:
+        for requested in ("claude-sonnet-4-6", "gpt-oss-120b", "deepseek-v4-flash", "gemini"):
+            with self.subTest(requested=requested), self.assertRaisesRegex(
                 Exception, "unsupported_requested_execution"
             ):
-                resolve_execution("gemini-3.1-pro-preview", thinking)
-        with self.assertRaisesRegex(Exception, "unsupported_requested_execution"):
-            resolve_execution("gemini-3.7-flash-preview", "high")
+                resolve_execution(requested, "high")
 
     def test_agy_resolver_opts_out_of_the_neutral_sandbox_default(self) -> None:
         options = resolve_execution("gemini-3.1-pro-preview", "auto").process_options

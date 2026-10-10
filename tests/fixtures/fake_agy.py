@@ -149,6 +149,8 @@ def main():
         if scenario == "models_invalid_stdout":
             print("INVALID MODEL OUTPUT")
             return 0
+        print("gemini-3.8-flash-high   Gemini 3.8 Flash (High)")
+        print("gemini-3.6-flash-high   Gemini 3.6 Flash (High)")
         print("gemini-3.1-pro-high     Gemini 3.1 Pro (High)")
         print("gemini-3.1-pro-low      Gemini 3.1 Pro (Low)")
         return 0

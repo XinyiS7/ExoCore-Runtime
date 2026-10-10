@@ -6,25 +6,28 @@ from exocore_runtime.contracts import EffectiveResolution, ProcessExecutionOptio
 from exocore_runtime.errors import ProviderAdapterError
 
 
-RESOLVER_POLICY_REVISION = "agy-gemini-3.1-pro-v1"
+RESOLVER_POLICY_REVISION = "agy-gemini-high-v2"
 SECURITY_POLICY_REVISION = "agy-tool-perm-v6"
 LAUNCH_ENVIRONMENT_REVISION = "agy-isolated-env-v1"
 
-_POLICY: dict[tuple[str, str], tuple[str, str]] = {
-    ("gemini-3.1-pro-preview", "auto"): ("gemini-3.1-pro-high", "high"),
-    ("gemini-3.1-pro-preview", "low"): ("gemini-3.1-pro-low", "low"),
-    ("gemini-3.1-pro-preview", "high"): ("gemini-3.1-pro-high", "high"),
-}
+# AGY runs every Gemini model at its high tier whatever thinking level was
+# requested. Which models may reach AGY at all is ExoCore's exact Endpoint
+# policy; whether the derived slug exists is the ``agy models`` gate in
+# ``process.ensure()`` (``frozen_execution_unavailable``).
+_EFFORT = "high"
+_MODEL_PREFIX = "gemini-"
+_RELEASE_CHANNEL_SUFFIX = "-preview"
 
 
 def resolve_execution(requested_model_id: str, requested_thinking_level: str) -> EffectiveResolution:
-    pair = _POLICY.get((requested_model_id, requested_thinking_level))
-    if pair is None:
+    del requested_thinking_level  # every level maps to the high tier
+    if not requested_model_id.startswith(_MODEL_PREFIX):
         raise ProviderAdapterError(
             "unsupported_requested_execution",
             status_code=422,
         )
-    model_slug, effort = pair
+    base = requested_model_id.removesuffix(_RELEASE_CHANNEL_SUFFIX)
+    model_slug, effort = f"{base}-{_EFFORT}", _EFFORT
     # Provider-neutral ``ProcessExecutionOptions`` keeps ``sandbox=True`` as its
     # default; this provider deliberately opts out. The verified 1.2.5 tool
     # unlock runs the CLI directly on the host with the deny policy as the

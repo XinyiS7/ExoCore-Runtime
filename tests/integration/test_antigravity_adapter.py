@@ -247,11 +247,11 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
     def manifest() -> tuple[RuntimeMcpTool, ...]:
         return (RuntimeMcpTool(name="memory_search", eager=True),)
 
-    def turn(self, *, thinking="auto", bootstrap=None, ephemeral=None, request_id=None):
+    def turn(self, *, thinking="auto", model="gemini-3.1-pro-preview", bootstrap=None, ephemeral=None, request_id=None):
         return TurnRequest(
             request_id=request_id or uuid4(),
             user_message="CURRENT-USER-CANARY",
-            requested_model_id="gemini-3.1-pro-preview",
+            requested_model_id=model,
             requested_thinking_level=thinking,
             runtime_mcp_tools=self.manifest(),
             bootstrap_context=bootstrap,
@@ -438,7 +438,7 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
         resumed = await restarted.ensure_generation(self.binding_id, self.spec)
         self.assertEqual(resumed.status, "active")
         self.assertEqual(resumed.provider_session_id, first_session)
-        third = self.turn(thinking="low")
+        third = self.turn(model="gemini-3.8-flash")
         third_events = await collect(restarted, self.binding_id, third)
         self.assertEqual(third_events[-1].event_type, "done")
         self.assertEqual(self.session_id(restarted), first_session)
@@ -451,9 +451,9 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
                 "--agent",
                 f"exocore-runtime-{str(self.binding_id).replace('-', '')}",
                 "--model",
-                "gemini-3.1-pro-low",
+                "gemini-3.8-flash-high",
                 "--effort",
-                "low",
+                "high",
                 "--input-format",
                 "stream-json",
                 "--output-format",

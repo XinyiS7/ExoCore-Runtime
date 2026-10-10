@@ -76,11 +76,11 @@ class V2AntigravityRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.services.append(service)
         return service, adapter
 
-    def turn(self, *, thinking="auto", bootstrap=None, request_id=None):
+    def turn(self, *, thinking="auto", model="gemini-3.1-pro-preview", bootstrap=None, request_id=None):
         return TurnRequest(
             request_id=request_id or uuid4(),
             user_message="CURRENT-USER-CANARY",
-            requested_model_id="gemini-3.1-pro-preview",
+            requested_model_id=model,
             requested_thinking_level=thinking,
             runtime_mcp_tools=({"name": "memory_search", "eager": True, "max_call_seconds": None},),
             bootstrap_context=bootstrap,
@@ -92,10 +92,34 @@ class V2AntigravityRuntimeTests(unittest.IsolatedAsyncioTestCase):
             return []
         return [json.loads(line) for line in self.evidence_path.read_text(encoding="utf-8").splitlines()]
 
+    async def test_medium_thinking_runs_at_the_high_tier(self) -> None:
+        service, _ = self.build_service()
+        await service.ensure_generation(self.binding_id, self.spec)
+        events = await collect(
+            service, self.binding_id, self.turn(thinking="medium", bootstrap={"history": []})
+        )
+        self.assertEqual(events[-1].event_type, "done")
+        resolved = next(event for event in events if event.event_type == "execution_resolved")
+        self.assertEqual(resolved.payload["effective_provider_model_slug"], "gemini-3.1-pro-high")
+        self.assertEqual(resolved.payload["effective_effort"], "high")
+        argv = next(item for item in self.evidence() if item["kind"] == "spawn")["argv"]
+        self.assertEqual(argv[argv.index("--effort") + 1], "high")
+
+    async def test_slug_missing_from_agy_models_fails_closed_before_spawn(self) -> None:
+        service, _ = self.build_service()
+        await service.ensure_generation(self.binding_id, self.spec)
+        events = await collect(
+            service,
+            self.binding_id,
+            self.turn(model="gemini-3.7-flash", bootstrap={"history": []}),
+        )
+        self.assertEqual(events[-1].payload, {"code": "frozen_execution_unavailable"})
+        self.assertFalse(any(item["kind"] == "spawn" for item in self.evidence()))
+
     async def test_unsupported_resolution_is_durable_and_precedes_any_spawn(self) -> None:
         service, _ = self.build_service()
         await service.ensure_generation(self.binding_id, self.spec)
-        unsupported = self.turn(thinking="medium", bootstrap={"history": []})
+        unsupported = self.turn(model="claude-sonnet-4-6", bootstrap={"history": []})
         events = await collect(service, self.binding_id, unsupported)
         self.assertEqual(events[-1].payload, {"code": "unsupported_requested_execution"})
         record = service.store.get_request(str(self.binding_id), str(unsupported.request_id))
@@ -128,12 +152,20 @@ class V2AntigravityRuntimeTests(unittest.IsolatedAsyncioTestCase):
         spawns = [item for item in self.evidence() if item["kind"] == "spawn"]
         self.assertEqual(len(spawns), 1)
 
-        third = self.turn(thinking="low")
+        # Every thinking level runs at the high tier, so a level change alone
+        # leaves the frozen execution untouched and reuses the process.
+        same_tier = self.turn(thinking="low")
+        await collect(service, self.binding_id, same_tier)
+        spawns = [item for item in self.evidence() if item["kind"] == "spawn"]
+        self.assertEqual(len(spawns), 1)
+
+        third = self.turn(model="gemini-3.8-flash")
         await collect(service, self.binding_id, third)
         spawns = [item for item in self.evidence() if item["kind"] == "spawn"]
         self.assertEqual(len(spawns), 2)
-        self.assertIn("--effort", spawns[-1]["argv"])
-        self.assertIn("low", spawns[-1]["argv"])
+        argv = spawns[-1]["argv"]
+        self.assertEqual(argv[argv.index("--model") + 1], "gemini-3.8-flash-high")
+        self.assertEqual(argv[argv.index("--effort") + 1], "high")
         self.assertIn("--conversation", spawns[-1]["argv"])
         index = spawns[-1]["argv"].index("--conversation")
         self.assertEqual(spawns[-1]["argv"][index + 1], generation.provider_session_id)

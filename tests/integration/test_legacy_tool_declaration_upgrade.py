@@ -134,11 +134,16 @@ class LegacyDeclarationUpgradeTests(unittest.IsolatedAsyncioTestCase):
 
     # --- helpers -----------------------------------------------------------
 
-    def turn(self, thinking: str = "auto", bootstrap: bool = False) -> TurnRequest:
+    def turn(
+        self,
+        thinking: str = "auto",
+        bootstrap: bool = False,
+        model: str = "gemini-3.1-pro-preview",
+    ) -> TurnRequest:
         return TurnRequest(
             request_id=uuid4(),
             user_message="legacy declaration upgrade turn",
-            requested_model_id="gemini-3.1-pro-preview",
+            requested_model_id=model,
             requested_thinking_level=thinking,
             runtime_mcp_tools=({"name": "memory_search", "eager": True, "max_call_seconds": None},),
             bootstrap_context={"history": []} if bootstrap else None,
@@ -231,7 +236,7 @@ class LegacyDeclarationUpgradeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.frontmatter(root)[2:], ["tools:", "  - view_file", "  - write_to_file", "  - run_command"])
 
         with self.assertLogs(ADAPTER_LOGGER, level="INFO") as captured:
-            events = await collect(service, self.binding_id, self.turn(thinking="low"))
+            events = await collect(service, self.binding_id, self.turn(model="gemini-3.8-flash"))
 
         self.assertEqual(events[-1].event_type, "done")
         frontmatter = self.frontmatter(root)
