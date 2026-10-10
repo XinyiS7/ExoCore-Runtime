@@ -66,6 +66,7 @@ def create_app(
                 AgyProcessSupervisor(process_config),
                 memory_mcp_root=config.effective_memory_mcp_root,
                 mailbox_ttl_seconds=config.agy_mailbox_ttl,
+                work_dir=config.agy_work_dir,
             ),
         }
     else:

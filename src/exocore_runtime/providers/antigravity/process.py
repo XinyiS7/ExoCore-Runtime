@@ -131,7 +131,9 @@ class GenerationLayout:
     binding_id: str
     root: Path
     profile: Path
-    workspace: Path
+    # AGY process cwd: the generation-private staging workspace by default, or
+    # a configured external directory outside the generation root.
+    work_dir: Path
     agent_name: str
     provider_session_id: str | None
     execution_options: ProcessExecutionOptions
@@ -204,7 +206,7 @@ class AgyProcessSupervisor:
             elif current is not None:
                 await self._dispose_session(current, force=True)
                 self._sessions.pop(layout.binding_id, None)
-            await self._preflight(layout.profile, layout.workspace)
+            await self._preflight(layout.profile, layout.work_dir)
             if layout.execution_options.provider_model_slug not in self.available_model_slugs:
                 raise ProviderAdapterError("frozen_execution_unavailable")
             try:
@@ -576,7 +578,7 @@ class AgyProcessSupervisor:
         async with self._binding_locks_guard:
             return self._binding_locks.setdefault(binding_id, asyncio.Lock())
 
-    async def _preflight(self, profile: Path, workspace: Path) -> None:
+    async def _preflight(self, profile: Path, work_dir: Path) -> None:
         async with self._preflight_lock:
             if self._preflight_complete:
                 return
@@ -585,7 +587,7 @@ class AgyProcessSupervisor:
             version_stdout = await self._run_bounded(
                 (*self.config.command_prefix, "--version"),
                 environment,
-                workspace,
+                work_dir,
                 "agy_version_failed",
             )
             try:
@@ -610,16 +612,16 @@ class AgyProcessSupervisor:
             models_stdout = await self._run_bounded(
                 (*self.config.command_prefix, "models"),
                 environment,
-                workspace,
+                work_dir,
                 "agy_models_unavailable",
                 allow_stderr=True,
             )
             self.available_model_slugs = self._parse_models(models_stdout)
-            self.quota_snapshot = await self._probe_quota_snapshot(environment, workspace)
+            self.quota_snapshot = await self._probe_quota_snapshot(environment, work_dir)
             self._preflight_complete = True
 
     async def _probe_quota_snapshot(
-        self, environment: dict[str, str], workspace: Path
+        self, environment: dict[str, str], work_dir: Path
     ) -> dict[str, int]:
         """Run the ``/quota`` probe and parse it, with bounded retries.
 
@@ -646,7 +648,7 @@ class AgyProcessSupervisor:
                         "json",
                     ),
                     environment,
-                    workspace,
+                    work_dir,
                     "agy_auth_unavailable",
                 )
                 return self._parse_quota(quota_stdout)
@@ -717,7 +719,7 @@ class AgyProcessSupervisor:
         try:
             process = await asyncio.create_subprocess_exec(
                 *argv,
-                cwd=layout.workspace,
+                cwd=layout.work_dir,
                 env=environment,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,

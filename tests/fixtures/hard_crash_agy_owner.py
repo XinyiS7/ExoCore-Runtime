@@ -47,7 +47,7 @@ async def run() -> None:
             binding_id="hard-crash-binding",
             root=root,
             profile=profile,
-            workspace=workspace,
+            work_dir=workspace,
             agent_name="exocore-runtime-hardcrashbinding",
             provider_session_id=None,
             execution_options=ProcessExecutionOptions(

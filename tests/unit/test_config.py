@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -53,6 +54,46 @@ class RuntimeConfigTests(unittest.TestCase):
             config = RuntimeConfig.from_env()
 
         self.assertEqual(config.effective_memory_mcp_root, Path(temp_dir).resolve())
+
+    def test_agy_work_dir_is_read_from_env_and_kept_out_of_repr(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(
+            "os.environ",
+            {
+                "EXOCORE_RUNTIME_TOKEN": "canary-token",
+                "EXOCORE_RUNTIME_AGY_WORK_DIR": temp_dir,
+            },
+            clear=False,
+        ):
+            config = RuntimeConfig.from_env()
+
+        self.assertEqual(config.agy_work_dir, Path(temp_dir))
+        self.assertIn("agy_work_dir='[PRIVATE]'", repr(config))
+        self.assertNotIn(Path(temp_dir).name, repr(config))
+        with patch.dict("os.environ", {"EXOCORE_RUNTIME_TOKEN": "canary-token"}):
+            os.environ.pop("EXOCORE_RUNTIME_AGY_WORK_DIR", None)
+            unset = RuntimeConfig.from_env()
+        self.assertIsNone(unset.agy_work_dir)
+
+    def test_agy_work_dir_must_be_an_existing_absolute_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            existing_file = Path(temp_dir) / "not-a-directory.txt"
+            existing_file.write_text("x", encoding="utf-8")
+            cases = {
+                "relative": Path("relative-work-dir"),
+                "missing": Path(temp_dir) / "missing",
+                "file": existing_file,
+            }
+            for label, work_dir in cases.items():
+                with self.subTest(case=label), self.assertRaisesRegex(
+                    ValueError, "existing absolute directory"
+                ):
+                    RuntimeConfig(
+                        "127.0.0.1",
+                        8766,
+                        "canary-token",
+                        Path("state.db"),
+                        agy_work_dir=work_dir,
+                    )
 
 
 if __name__ == "__main__":

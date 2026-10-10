@@ -117,7 +117,7 @@ def quota_retry_marker() -> Path:
 def main():
     scenario = os.environ.get("FAKE_AGY_SCENARIO", "normal")
     if "--version" in sys.argv:
-        evidence("version", argv=sys.argv[1:])
+        evidence("version", argv=sys.argv[1:], cwd=os.getcwd())
         if scenario == "version_timeout":
             time.sleep(60)
             return 0
@@ -141,7 +141,7 @@ def main():
         print("1.1.20")
         return 0
     if "models" in sys.argv:
-        evidence("models", argv=sys.argv[1:])
+        evidence("models", argv=sys.argv[1:], cwd=os.getcwd())
         if scenario == "models_missing":
             return 7
         if scenario == "models_progress_stderr":
@@ -155,7 +155,7 @@ def main():
         print("gemini-3.1-pro-low      Gemini 3.1 Pro (Low)")
         return 0
     if argument_value("-p") == "/quota":
-        evidence("quota", argv=sys.argv[1:])
+        evidence("quota", argv=sys.argv[1:], cwd=os.getcwd())
         if scenario == "auth_missing":
             return 7
         if scenario == "quota_stderr":

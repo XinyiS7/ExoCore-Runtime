@@ -7,7 +7,7 @@
 - 语义口径：staging 为 request 作用域，`request_registered` 之后 PUT/DELETE 必须拒绝且不动 bytes；materialize 崩溃幂等且只投影 Runtime 私有绝对路径（canonical 路径/文件名不得进入 envelope）；discard 幂等；共享 artifact lock 串行化 stage/discard/materialize。监督进程 env 拒绝七个 Google/Gemini auth 名（real 值 fail-closed，空值放行；见 `process.py::_isolated_environment` 的预检）。
 - Inspections（#43）：`stage_inspection` 只在请求 `sent` 期间由 service 经 claim lock + 本模块 artifact lock 调用（绝不取 generation turn lock），写入 `workspace/<request>/inspections/item-<id><ext>` 并返回绝对路径供 AGY `view_file`；只有单文件大小上限，无同轮 count/total cap；同一件藏品原子覆盖。`discard_inspections` 是独立 async 能力，service 在三条终态路径于 `reclaim_request` 之前 await；`reclaim_request` 仍是同步、无 I/O 的冻结契约。
 - 测试注意：合约/store 单测 `tests/unit/test_attachment_contracts.py`、`test_attachment_store.py`；claim 竞态与中断上传证据 `tests/integration/test_antigravity_adapter.py`、`test_http_api.py`；HTTP 语义 `tests/integration/test_v2_http_api.py`。
-- 落盘/边界：所有 staging/final/temp 产物只存在于该 generation 的 provider data root 内；retire 只删除 generation 根；不触碰官方 keyring 与 ExoCore canonical 数据。
+- 落盘/边界：所有 staging/final/temp 产物只存在于该 generation 的 provider data root 内（staging workspace = generation 根下 `workspace/`）；retire 只删除 generation 根；不触碰官方 keyring 与 ExoCore canonical 数据。AGY process work_dir（cwd）默认即 staging workspace；配置 `work_dir` 后为外部目录，不属于 generation-private，其中普通文件与 ambient `.agents` 定制归用户（MCP/plugins 源仍在 spawn 前拒绝），Runtime 不登记、不导出、不清理。
 - 关联：ExoCore 编排 Plan（已归档）`../ExoCore/Plan/Archived/AGY_Runtime_Current_Turn_Attachments_Plan.md`；X1 真实证据见 `../ExoCore/Plan/AGY_Runtime_Current_Turn_Attachments_acceptance_report.md`。
 """
 
@@ -136,8 +136,12 @@ class AntigravityAdapter:
         memory_mcp_root: Path,
         mailbox_ttl_seconds: float = 120.0,
         reserved_artifacts: tuple[ReservedControlArtifact, ...] = RESERVED_CONTROL_ARTIFACTS,
+        work_dir: Path | None = None,
     ) -> None:
         self.data_root = Path(data_root).resolve()
+        # External AGY process cwd. Its ordinary files belong to the user:
+        # nothing here registers, exports or retires them.
+        self.work_dir = Path(work_dir).resolve() if work_dir is not None else None
         self.data_root.mkdir(parents=True, exist_ok=True)
         self.supervisor = supervisor
         self.memory_mcp_root = Path(memory_mcp_root).resolve()
@@ -1219,7 +1223,7 @@ class AntigravityAdapter:
                 raise ProviderAdapterError("agy_workspace_invalid", fatal_generation=True)
         else:
             workspace.mkdir(parents=True)
-        self._require_profile_only_mcp_control(profile, workspace)
+        self._require_profile_only_mcp_control(profile, self._process_work_dir(root))
         CanonicalControlStore(root).prepare()
         mailbox = EphemeralMailbox(
             root / "mailbox",
@@ -1412,17 +1416,29 @@ class AntigravityAdapter:
             or self._is_link_or_reparse(layout_workspace)
         ):
             raise ProviderAdapterError("agy_workspace_invalid", fatal_generation=True)
-        self._require_profile_only_mcp_control(layout_profile, layout_workspace)
+        self._require_profile_only_mcp_control(
+            layout_profile, self._process_work_dir(root)
+        )
         control_store = CanonicalControlStore(root)
         for artifact in self._reserved_artifacts_for(metadata):
             if not control_store.verify(artifact):
                 raise ProviderAdapterError("agy_security_artifact_invalid", fatal_generation=True)
 
-    @classmethod
-    def _require_profile_only_mcp_control(cls, profile: Path, workspace: Path) -> None:
-        """Reject alternate MCP/plugin customization sources before AGY acquisition."""
+    def _process_work_dir(self, root: Path) -> Path:
+        """AGY process cwd: the configured external directory or the staging workspace."""
 
-        for customization_root in (workspace / ".agents", profile / ".agents"):
+        return self.work_dir or root / "workspace"
+
+    @classmethod
+    def _require_profile_only_mcp_control(cls, profile: Path, work_dir: Path) -> None:
+        """Reject alternate MCP/plugin customization sources before AGY acquisition.
+
+        ``work_dir`` is the actual process cwd, where AGY discovers workspace
+        customizations. Other ambient sources there (skills, rules) are
+        accepted by decision D2 of the work-dir externalization plan.
+        """
+
+        for customization_root in (work_dir / ".agents", profile / ".agents"):
             direct_mcp = customization_root / "mcp_config.json"
             plugins = customization_root / "plugins"
             if (
@@ -1520,7 +1536,7 @@ class AntigravityAdapter:
             binding_id=str(metadata["binding_id"]),
             root=root,
             profile=root / "profile",
-            workspace=root / "workspace",
+            work_dir=self._process_work_dir(root),
             agent_name=str(metadata["agent_name"]),
             provider_session_id=provider_session_id,
             execution_options=options,

@@ -88,6 +88,7 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
         scenario="normal",
         reserved_artifacts=None,
         memory_mcp_root=None,
+        work_dir=None,
     ):
         fixture = Path(__file__).resolve().parents[1] / "fixtures" / "fake_agy.py"
         environment = {
@@ -114,6 +115,8 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
         }
         if reserved_artifacts is not None:
             adapter_kwargs["reserved_artifacts"] = reserved_artifacts
+        if work_dir is not None:
+            adapter_kwargs["work_dir"] = work_dir
         adapter = AntigravityAdapter(
             self.data_root,
             AgyProcessSupervisor(process_config),
@@ -759,6 +762,94 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
             spawn_count,
         )
         self.assertTrue(workspace_mcp.exists())
+
+    def process_cwds(self) -> dict[str, list[str]]:
+        """Fixture-reported cwd of every preflight and session process."""
+
+        cwds: dict[str, list[str]] = {}
+        for item in self.evidence():
+            if item["kind"] in {"version", "models", "quota", "spawn"}:
+                cwds.setdefault(item["kind"], []).append(item["cwd"])
+        return cwds
+
+    def assert_all_cwds(self, expected: Path) -> None:
+        cwds = self.process_cwds()
+        self.assertEqual(set(cwds), {"version", "models", "quota", "spawn"})
+        for kind, values in cwds.items():
+            for value in values:
+                with self.subTest(process=kind):
+                    self.assertTrue(os.path.samefile(value, expected))
+
+    async def test_default_process_work_dir_is_the_staging_workspace(self) -> None:
+        service, _ = self.build_service()
+        await service.ensure_generation(self.binding_id, self.spec)
+        first = await collect(service, self.binding_id, self.turn(bootstrap={"history": []}))
+        self.assertEqual(first[-1].event_type, "done")
+
+        self.assert_all_cwds(self.generation_root() / "workspace")
+
+    async def test_external_work_dir_is_process_cwd_and_survives_retire(self) -> None:
+        work_dir = self.root / "user-work"
+        user_file = work_dir / "notes" / "keep.txt"
+        user_file.parent.mkdir(parents=True)
+        user_file.write_text("user-owned", encoding="utf-8")
+        service, _ = self.build_service(work_dir=work_dir)
+        await service.ensure_generation(self.binding_id, self.spec)
+        first = await collect(service, self.binding_id, self.turn(bootstrap={"history": []}))
+        self.assertEqual(first[-1].event_type, "done")
+
+        self.assert_all_cwds(work_dir)
+        # Generation-private state stays under the generation root.
+        generation_root = self.generation_root()
+        for private in ("profile", "mailbox", "control", "workspace"):
+            with self.subTest(private=private):
+                self.assertTrue((generation_root / private).is_dir())
+        self.assertEqual(
+            sorted(path.name for path in work_dir.iterdir()),
+            ["notes"],
+        )
+
+        retired = await service.retire(self.binding_id, "work dir retirement")
+
+        self.assertTrue(retired.changed)
+        self.assertFalse(generation_root.exists())
+        self.assertEqual(user_file.read_text(encoding="utf-8"), "user-owned")
+
+    async def test_external_work_dir_mcp_sources_are_rejected_before_spawn(self) -> None:
+        cases = (
+            ("direct", "mcp_config.json", False),
+            ("plugin", "plugins", True),
+        )
+        for name, leaf, is_directory in cases:
+            with self.subTest(source=name):
+                work_dir = self.root / f"user-work-{name}"
+                work_dir.mkdir()
+                self.binding_id = uuid4()
+                service, _ = self.build_service(work_dir=work_dir)
+                await service.ensure_generation(self.binding_id, self.spec)
+                target = work_dir / ".agents" / leaf
+                if is_directory:
+                    target.mkdir(parents=True)
+                else:
+                    target.parent.mkdir(parents=True)
+                    target.write_text("{}", encoding="utf-8")
+                spawn_count = len(
+                    [item for item in self.evidence() if item["kind"] == "spawn"]
+                )
+
+                rejected = await collect(
+                    service, self.binding_id, self.turn(bootstrap={"history": []})
+                )
+
+                self.assertEqual(
+                    rejected[-1].payload,
+                    {"code": "agy_uncontrolled_mcp_source_forbidden"},
+                )
+                self.assertEqual(
+                    len([item for item in self.evidence() if item["kind"] == "spawn"]),
+                    spawn_count,
+                )
+                self.assertTrue(target.exists())
 
     async def test_registered_reserved_artifact_heals_from_canonical_backing(self) -> None:
         artifact = ReservedControlArtifact("canonical_demo.txt", "reserved/demo.txt")

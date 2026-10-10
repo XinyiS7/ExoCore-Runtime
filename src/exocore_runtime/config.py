@@ -40,6 +40,9 @@ class RuntimeConfig:
     agy_close_timeout: float = 5.0
     agy_mailbox_ttl: float = 120.0
     memory_mcp_root: Path | None = None
+    # AGY process cwd. ``None`` keeps the generation-private staging workspace;
+    # an external directory is user-owned and never cleaned by retire.
+    agy_work_dir: Path | None = None
 
     def __post_init__(self) -> None:
         try:
@@ -63,12 +66,17 @@ class RuntimeConfig:
                 raise ValueError(f"{name} must be positive")
         if self.agy_idle_timeout > self.agy_hard_timeout:
             raise ValueError("AGY idle timeout cannot exceed hard timeout")
+        if self.agy_work_dir is not None and (
+            not self.agy_work_dir.is_absolute() or not self.agy_work_dir.is_dir()
+        ):
+            raise ValueError("AGY work dir must be an existing absolute directory")
 
     def __repr__(self) -> str:
         return (
             f"RuntimeConfig(host={self.host!r}, port={self.port!r}, "
             "token='[REDACTED]', state_path='[PRIVATE]', "
-            "provider_data_root='[PRIVATE]', memory_mcp_root='[PRIVATE]')"
+            "provider_data_root='[PRIVATE]', memory_mcp_root='[PRIVATE]', "
+            "agy_work_dir='[PRIVATE]')"
         )
 
     @property
@@ -83,6 +91,7 @@ class RuntimeConfig:
     def from_env(cls) -> "RuntimeConfig":
         provider_root = os.environ.get("EXOCORE_RUNTIME_PROVIDER_DATA_ROOT")
         memory_mcp_root = os.environ.get("EXOCORE_RUNTIME_MEMORY_MCP_ROOT")
+        agy_work_dir = os.environ.get("EXOCORE_RUNTIME_AGY_WORK_DIR")
         return cls(
             host=os.environ.get("EXOCORE_RUNTIME_HOST", "127.0.0.1"),
             port=int(os.environ.get("EXOCORE_RUNTIME_PORT", "8766")),
@@ -96,4 +105,5 @@ class RuntimeConfig:
             agy_close_timeout=float(os.environ.get("EXOCORE_RUNTIME_AGY_CLOSE_TIMEOUT", "5")),
             agy_mailbox_ttl=float(os.environ.get("EXOCORE_RUNTIME_AGY_MAILBOX_TTL", "120")),
             memory_mcp_root=Path(memory_mcp_root) if memory_mcp_root else None,
+            agy_work_dir=Path(agy_work_dir) if agy_work_dir else None,
         )

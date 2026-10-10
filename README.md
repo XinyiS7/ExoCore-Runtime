@@ -23,6 +23,8 @@ Defaults:
 
 Optional AGY configuration uses `EXOCORE_RUNTIME_AGY_EXECUTABLE`, `EXOCORE_RUNTIME_PROVIDER_DATA_ROOT`, and the bounded `EXOCORE_RUNTIME_AGY_*_TIMEOUT` variables defined in `RuntimeConfig`.
 
+`EXOCORE_RUNTIME_AGY_WORK_DIR` (optional, existing absolute directory) sets the AGY process work_dir (cwd) for every session of the instance. Unset, the cwd is the generation-private staging workspace. Set, relative-path files the agent writes land there, stay user-owned and survive retire; generation-private state (profile, mailbox, control, staging workspace, captured artifacts) stays under the provider data root either way. AGY also loads ambient `.agents` customizations from that directory.
+
 ## Startup contract (Django + Runtime)
 
 Daily local topology:
