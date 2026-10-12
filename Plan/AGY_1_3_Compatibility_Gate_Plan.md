@@ -37,7 +37,7 @@
 | 同会话续聊 | `--conversation <id>` 返回同一 `conversation_id` |
 | Runtime 全量确定性测试（改动前） | 319 项：318 通过 + 1 项既有 host-symlink 环境跳过 |
 
-上游 changelog（`agy changelog`，离线权威）在 1.2.8–1.3.0 窗口内与本适配器相关的条目：1.2.16 生图改由内置 `image-generator` 子代理执行（见 §4 后续）、1.2.10 步骤标题 `Errored`→`Failed`（显示层，已实测不影响）、1.2.9 headless 等待后台任务至 `--print-timeout`（其 30 分钟上限高于本仓 180s hard timeout）、1.2.7 默认工具面退役 `find_by_name`/`grep_search`/`list_dir`（`AGENT_TOOLS` 未声明它们，且显式 `tools:` 声明实测仍被承认）。
+上游 changelog（`agy changelog`，离线权威）在 1.2.8–1.3.0 窗口内与本适配器相关的条目：1.2.16 生图改由内置 `image-generator` 子代理执行（见 §4 后续）、1.2.10 步骤标题 `Errored`→`Failed`（显示层，已实测不影响）、1.2.9 headless 等待后台任务至 `--print-timeout`（其 30 分钟上限现与本仓 1800s disaster ceiling 对齐）、1.2.7 默认工具面退役 `find_by_name`/`grep_search`/`list_dir`（`AGENT_TOOLS` 未声明它们，且显式 `tools:` 声明实测仍被承认）。
 
 ---
 

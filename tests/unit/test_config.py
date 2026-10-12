@@ -31,6 +31,8 @@ class RuntimeConfigTests(unittest.TestCase):
             "127.0.0.1", 8766, "canary-token", Path("state.db")
         )
         self.assertLess(45, config.agy_idle_timeout)
+        self.assertEqual(config.agy_idle_timeout, 60)
+        self.assertEqual(config.agy_hard_timeout, 1800)
         self.assertLessEqual(config.agy_idle_timeout, config.agy_hard_timeout)
         with self.assertRaisesRegex(ValueError, "cannot exceed hard timeout"):
             RuntimeConfig(

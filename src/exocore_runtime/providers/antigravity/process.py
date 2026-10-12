@@ -112,7 +112,7 @@ class AgyProcessConfig:
     command_prefix: tuple[str, ...]
     init_timeout_seconds: float = 15.0
     idle_timeout_seconds: float = 60.0
-    hard_timeout_seconds: float = 180.0
+    hard_timeout_seconds: float = 1800.0
     close_timeout_seconds: float = 5.0
     result_settle_seconds: float = 0.1
     require_official_executable: bool = True
@@ -251,12 +251,12 @@ class AgyProcessSupervisor:
                 ) from exc
             started = time.monotonic()
             while True:
-                elapsed = time.monotonic() - started
-                remaining = self.config.hard_timeout_seconds - elapsed
-                if remaining <= 0:
-                    raise ProviderAdapterError("agy_hard_timeout", terminal_status="indeterminate")
-                timeout = min(self.config.idle_timeout_seconds, remaining)
-                tag, line = await self._next_item(session, timeout, "agy_idle_timeout")
+                timeout, timeout_code = self._turn_wait_budget(
+                    elapsed=time.monotonic() - started,
+                    idle_timeout=self.config.idle_timeout_seconds,
+                    hard_timeout=self.config.hard_timeout_seconds,
+                )
+                tag, line = await self._next_item(session, timeout, timeout_code)
                 if tag == "stderr":
                     raise ProviderAdapterError("agy_stderr", terminal_status="indeterminate")
                 if line is None:
@@ -833,6 +833,25 @@ class AgyProcessSupervisor:
             if payload.get("event") == "result":
                 raise ProviderAdapterError("agy_duplicate_result", terminal_status="indeterminate")
             raise ProviderAdapterError("agy_event_after_result", terminal_status="indeterminate")
+
+    @staticmethod
+    def _turn_wait_budget(
+        *,
+        elapsed: float,
+        idle_timeout: float,
+        hard_timeout: float,
+    ) -> tuple[float, str]:
+        """Return the next inactivity wait without mislabeling the hard ceiling."""
+
+        remaining = hard_timeout - elapsed
+        if remaining <= 0:
+            raise ProviderAdapterError(
+                "agy_hard_timeout",
+                terminal_status="indeterminate",
+            )
+        if remaining <= idle_timeout:
+            return remaining, "agy_hard_timeout"
+        return idle_timeout, "agy_idle_timeout"
 
     async def _next_item(
         self,
