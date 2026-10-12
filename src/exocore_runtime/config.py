@@ -35,7 +35,7 @@ class RuntimeConfig:
     provider_data_root: Path | None = None
     agy_executable: str | None = None
     agy_init_timeout: float = 15.0
-    agy_idle_timeout: float = 60.0
+    agy_idle_timeout: float = 300.0
     agy_hard_timeout: float = 1800.0
     agy_close_timeout: float = 5.0
     agy_mailbox_ttl: float = 120.0
@@ -100,7 +100,7 @@ class RuntimeConfig:
             provider_data_root=Path(provider_root) if provider_root else None,
             agy_executable=os.environ.get("EXOCORE_RUNTIME_AGY_EXECUTABLE") or None,
             agy_init_timeout=float(os.environ.get("EXOCORE_RUNTIME_AGY_INIT_TIMEOUT", "15")),
-            agy_idle_timeout=float(os.environ.get("EXOCORE_RUNTIME_AGY_IDLE_TIMEOUT", "60")),
+            agy_idle_timeout=float(os.environ.get("EXOCORE_RUNTIME_AGY_IDLE_TIMEOUT", "300")),
             agy_hard_timeout=float(os.environ.get("EXOCORE_RUNTIME_AGY_HARD_TIMEOUT", "1800")),
             agy_close_timeout=float(os.environ.get("EXOCORE_RUNTIME_AGY_CLOSE_TIMEOUT", "5")),
             agy_mailbox_ttl=float(os.environ.get("EXOCORE_RUNTIME_AGY_MAILBOX_TTL", "120")),

@@ -111,7 +111,7 @@ class _JobObjectExtendedLimitInformation(ctypes.Structure):
 class AgyProcessConfig:
     command_prefix: tuple[str, ...]
     init_timeout_seconds: float = 15.0
-    idle_timeout_seconds: float = 60.0
+    idle_timeout_seconds: float = 300.0
     hard_timeout_seconds: float = 1800.0
     close_timeout_seconds: float = 5.0
     result_settle_seconds: float = 0.1
