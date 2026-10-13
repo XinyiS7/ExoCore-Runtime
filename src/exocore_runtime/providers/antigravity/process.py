@@ -45,6 +45,11 @@ _FORBIDDEN_AUTH_ENV = frozenset(
 )
 _VERSION_PATTERN = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 _LOGGER = logging.getLogger(__name__)
+# Init failures after which a stale ``agy models`` cache may be the real cause:
+# AGY withdraws models server-side while a long-lived Runtime keeps its
+# first-preflight snapshot.
+_INIT_FAILURE_CODES = frozenset({"agy_init_stderr", "agy_init_eof"})
+_STDERR_LOG_LIMIT = 300
 _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
 _PROCESS_TERMINATE = 0x0001
@@ -69,6 +74,13 @@ def _tool_step(parsed: object) -> dict | None:
     if not isinstance(step, dict) or step.get("step_type") != "tool":
         return None
     return step
+
+
+def _log_init_stderr(line: bytes | None) -> None:
+    """Keep a bounded local copy of the init stderr line for diagnosis only."""
+
+    excerpt = (line or b"").decode("utf-8", errors="replace").strip()
+    _LOGGER.warning("[agy-init] stderr: %s", excerpt[:_STDERR_LOG_LIMIT])
 
 
 class _JobObjectBasicLimitInformation(ctypes.Structure):
@@ -212,6 +224,11 @@ class AgyProcessSupervisor:
             try:
                 session = await self._spawn(layout)
             except ProviderAdapterError as exc:
+                # ``_spawn`` has already disposed the failed process. Only a
+                # confirmed withdrawal replaces the init error; the resume
+                # wrapper below never sees it.
+                if exc.code in _INIT_FAILURE_CODES and await self._model_withdrawn(layout):
+                    raise ProviderAdapterError("frozen_execution_unavailable") from exc
                 if (
                     layout.provider_session_id is not None
                     and exc.code
@@ -620,6 +637,29 @@ class AgyProcessSupervisor:
             self.quota_snapshot = await self._probe_quota_snapshot(environment, work_dir)
             self._preflight_complete = True
 
+    async def _model_withdrawn(self, layout: GenerationLayout) -> bool:
+        """Re-read ``agy models`` after an init failure.
+
+        True only when the refresh succeeds and the requested slug is gone. A
+        failed refresh leaves the cache untouched so the caller keeps its
+        original init error.
+        """
+
+        try:
+            models_stdout = await self._run_bounded(
+                (*self.config.command_prefix, "models"),
+                self._isolated_environment(layout.profile),
+                layout.work_dir,
+                "agy_models_unavailable",
+                allow_stderr=True,
+            )
+            slugs = self._parse_models(models_stdout)
+        except ProviderAdapterError as exc:
+            _LOGGER.warning("[agy-init] model refresh failed (%s)", exc.code)
+            return False
+        self.available_model_slugs = slugs
+        return layout.execution_options.provider_model_slug not in slugs
+
     async def _probe_quota_snapshot(
         self, environment: dict[str, str], work_dir: Path
     ) -> dict[str, int]:
@@ -757,6 +797,7 @@ class AgyProcessSupervisor:
                 "agy_init_timeout",
             )
             if tag == "stderr":
+                _log_init_stderr(line)
                 raise ProviderAdapterError("agy_init_stderr", fatal_generation=True)
             if line is None:
                 raise ProviderAdapterError("agy_init_eof", fatal_generation=True)
@@ -808,6 +849,7 @@ class AgyProcessSupervisor:
             if tag == "stderr" and line is None:
                 continue
             if tag == "stderr":
+                _log_init_stderr(line)
                 raise ProviderAdapterError("agy_init_stderr", fatal_generation=True)
             if line is None:
                 raise ProviderAdapterError("agy_exit_after_init", fatal_generation=True)

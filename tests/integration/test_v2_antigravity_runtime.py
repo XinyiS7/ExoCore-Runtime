@@ -17,6 +17,9 @@ from exocore_runtime.service import RuntimeService
 from exocore_runtime.state_store import RuntimeStateStore
 
 
+_PROCESS_LOGGER = "exocore_runtime.providers.antigravity.process"
+
+
 async def collect(service, binding_id, request):
     return [event async for event in service.stream_turn(binding_id, request)]
 
@@ -63,6 +66,7 @@ class V2AntigravityRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 "FAKE_AGY_SCENARIO": scenario,
                 "FAKE_AGY_EVIDENCE": str(self.evidence_path),
                 "FAKE_AGY_CONVERSATION": "11111111-2222-3333-4444-555555555555",
+                "FAKE_AGY_WITHDRAWN_MARKER": str(self.root / "withdrawn-marker"),
                 "PYTHONPATH": str(Path(__file__).resolve().parents[2] / "src"),
             },
         )
@@ -307,6 +311,58 @@ class V2AntigravityRuntimeTests(unittest.IsolatedAsyncioTestCase):
         index = spawn["argv"].index("--conversation")
         self.assertEqual(spawn["argv"][index + 1], session_id)
 
+
+    async def test_init_stderr_after_server_withdrawal_reports_frozen_execution_unavailable(self) -> None:
+        service, adapter = self.build_service("model_withdrawn")
+        await service.ensure_generation(self.binding_id, self.spec)
+        with self.assertLogs(_PROCESS_LOGGER, level="WARNING") as logs:
+            events = await collect(
+                service, self.binding_id, self.turn(bootstrap={"history": []})
+            )
+        self.assertEqual(events[-1].payload, {"code": "frozen_execution_unavailable"})
+        self.assertNotIn("gemini-3.1-pro-high", adapter.supervisor.available_model_slugs)
+        self.assertEqual(len([item for item in self.evidence() if item["kind"] == "models"]), 2)
+        self.assertTrue(any("invalid model selection" in line for line in logs.output))
+        self.assertFalse(
+            any("invalid model selection" in json.dumps(event.payload) for event in events)
+        )
+
+    async def test_init_stderr_with_listed_model_keeps_original_code(self) -> None:
+        service, adapter = self.build_service("init_stderr_model_listed")
+        await service.ensure_generation(self.binding_id, self.spec)
+        events = await collect(service, self.binding_id, self.turn(bootstrap={"history": []}))
+        self.assertEqual(events[-1].payload, {"code": "agy_init_stderr"})
+        self.assertIn("gemini-3.1-pro-high", adapter.supervisor.available_model_slugs)
+        self.assertEqual(len([item for item in self.evidence() if item["kind"] == "models"]), 2)
+
+    async def test_failed_model_refresh_keeps_original_init_code(self) -> None:
+        service, adapter = self.build_service("model_withdrawn_refresh_fails")
+        await service.ensure_generation(self.binding_id, self.spec)
+        events = await collect(service, self.binding_id, self.turn(bootstrap={"history": []}))
+        self.assertEqual(events[-1].payload, {"code": "agy_init_stderr"})
+        self.assertIn("gemini-3.1-pro-high", adapter.supervisor.available_model_slugs)
+
+    async def test_resume_after_server_withdrawal_is_not_rewritten(self) -> None:
+        service, _ = self.build_service()
+        await service.ensure_generation(self.binding_id, self.spec)
+        await collect(service, self.binding_id, self.turn(bootstrap={"history": []}))
+        await service.shutdown()
+
+        withdrawn, _ = self.build_service("model_withdrawn")
+        events = await collect(withdrawn, self.binding_id, self.turn(thinking="low"))
+        self.assertEqual(events[-1].payload, {"code": "frozen_execution_unavailable"})
+        spawn = [item for item in self.evidence() if item["kind"] == "spawn"][-1]
+        self.assertIn("--conversation", spawn["argv"])
+
+    async def test_resume_init_stderr_with_listed_model_stays_wrapped(self) -> None:
+        service, _ = self.build_service()
+        await service.ensure_generation(self.binding_id, self.spec)
+        await collect(service, self.binding_id, self.turn(bootstrap={"history": []}))
+        await service.shutdown()
+
+        failing, _ = self.build_service("init_stderr_model_listed")
+        events = await collect(failing, self.binding_id, self.turn(thinking="low"))
+        self.assertEqual(events[-1].payload, {"code": "provider_session_unavailable"})
 
 if __name__ == "__main__":
     unittest.main()
