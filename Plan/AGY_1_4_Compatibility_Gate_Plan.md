@@ -1,7 +1,7 @@
 # AGY 1.4.x 兼容门禁放宽
 
 > Issue: XinyiS7/ExoCore#64（P1 · area:runtime · bug）
-> **状态：R2（按 Solaire R1 REVISE 修正），待冻结 acceptance spec 后施工。** 真实小量调用已获 Alicia 施工授权（2026-10-16）。
+> **状态：已被 Alicia 决定取代（2026-10-16）：不做 §2 真机取样与新 fixture/回放测试；只放宽门禁到 `<1.5` 并把 `bad_version` 改戳 1.5.0，真实功能验证由 Alicia 自己在现有会话中手动完成；agent 不建临时 G045 会话、消息或数据库数据，不做 capture / probe / 真实 G045 回合。** 下文保留为 R2 原稿。
 > **范围：** 仅 ExoCore-Runtime 单仓；不涉及 ExoCore / Desktop、wire 形状、`RUNTIME_CAPABILITIES`、Argon。
 > **动因：** 官方 AGY 已自动升级到 1.4.0，现行门禁 `>=1.1.20,<1.4` 在 preflight 拒绝（`agy_version_unsupported`），Endpoint 7（`gemini-3.8-flash` → `gemini-3.8-flash-high`）不可用。Alicia 要求先恢复现有 Gemini 3.8 在 AGY 上可用。
 > **前例：** `Plan/AGY_1_3_Compatibility_Gate_Plan.md`（1.3 放宽，Runtime `97fc5dd`）；本文不修改该文件。

@@ -1196,8 +1196,8 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_startup_faults_fail_before_user_stdin_and_timeout_process_is_reaped(self) -> None:
         scenarios = {
-            # bad_version stamps the next minor (1.4.0), one above the newest
-            # captured line, so the fail-closed boundary stays under test.
+            # bad_version stamps the next minor (1.5.0), one above the newest
+            # accepted line, so the fail-closed boundary stays under test.
             "bad_version": "agy_version_unsupported",
             "version_stderr": "agy_version_failed",
             "models_missing": "agy_models_unavailable",

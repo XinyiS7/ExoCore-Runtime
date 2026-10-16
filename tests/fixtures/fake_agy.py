@@ -150,8 +150,8 @@ def main():
         if scenario == "bad_version":
             # Stamps the first version outside the accepted envelope. The gate
             # is an exclusive minor bound, so this must stay one minor above
-            # the newest captured line (1.3.0 -> 1.4.0).
-            print("1.4.0")
+            # the newest accepted line (1.4.x -> 1.5.0).
+            print("1.5.0")
             return 0
         print("1.1.20")
         return 0
