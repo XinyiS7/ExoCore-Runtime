@@ -8,9 +8,9 @@
 
 ## Verdict
 
-**PASS / USER-SMOKE-PENDING**
+**FINAL PASS**
 
-Source and regression gates pass. Final PASS and issue closure require Alicia's one-message smoke through an existing G045 conversation using Endpoint 7 and `gemini-3.8-flash` after restarting Runtime.
+Source, regression, deployment, and Alicia-owned real smoke gates all pass.
 
 ## Gate Results
 
@@ -21,7 +21,7 @@ Source and regression gates pass. Final PASS and issue closure require Alicia's 
 | G3 No behavioral drift | PASS | Production delta is only the upper-bound constant and explanatory text; no wire, capability, parser, argv, environment, model, persistence, or lifecycle change. |
 | G4 Documentation consistency | PASS | `process.py`, `ndjson.py`, `AGENTS.md`, and `README.md` agree on `>=1.1.20,<1.5`; Plan records Alicia's reduced scope. No new capture, fixture, test module, or probe. |
 | G5 Mechanical regression | PASS | Focused adapter suite 51/51; final full suite 357 PASS + 1 existing host-symlink skip; diff check clean. |
-| G6 Alicia-owned real smoke | PENDING | No acceptance agent created a G045 conversation/message or paid probe. |
+| G6 Alicia-owned real smoke | PASS | After restarting Runtime, Alicia confirmed an existing AGY G045 conversation communicated normally with no `agy_version_unsupported` (`XinyiS7/ExoCore#64`, comment `6212967867`). No acceptance agent created a G045 conversation/message or paid probe. |
 
 ## Independent Verification Notes
 
@@ -32,6 +32,6 @@ Source and regression gates pass. Final PASS and issue closure require Alicia's 
 
 ## Deploy Handoff
 
-`DEPLOY_STEP: Alicia restarts run-runtime in her normal visible service pane; no migration.`
+`DEPLOY_STEP: completed — Alicia restarted run-runtime in her normal visible service pane; no migration.`
 
-After restart, Alicia sends one ordinary message in an existing G045 conversation with Endpoint 7 / `gemini-3.8-flash`. A normal terminal response without `agy_version_unsupported` upgrades this report to final PASS.
+Alicia completed the existing-conversation smoke: AGY communication was normal and no `agy_version_unsupported` occurred.
