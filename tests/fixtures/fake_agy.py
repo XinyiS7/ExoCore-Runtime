@@ -107,10 +107,11 @@ def quota_response():
     }
 
 
-# Server-side withdrawal of the 3.1 Pro slug, observed only after the first
+# Server-side withdrawal of the 3.1 Pro model, observed only after the first
 # spawn attempt: the preflight ``models`` call still lists it, the spawn is
-# rejected on stderr, and later ``models`` calls no longer list it.
-WITHDRAWN_SLUG = "gemini-3.1-pro-high"
+# rejected on stderr, and later ``models`` calls no longer list it. The
+# withdrawal is model-wide, so it covers every tier slug of that model.
+WITHDRAWN_MODEL = "gemini-3.1-pro"
 WITHDRAWAL_SCENARIOS = {"model_withdrawn", "model_withdrawn_refresh_fails"}
 INIT_STDERR_SCENARIOS = WITHDRAWAL_SCENARIOS | {"init_stderr_model_listed"}
 
@@ -168,9 +169,12 @@ def main():
         if withdrawn and scenario == "model_withdrawn_refresh_fails":
             return 7
         print("gemini-3.8-flash-high   Gemini 3.8 Flash (High)")
+        print("gemini-3.8-flash-medium Gemini 3.8 Flash (Medium)")
+        print("gemini-3.8-flash-low    Gemini 3.8 Flash (Low)")
         print("gemini-3.6-flash-high   Gemini 3.6 Flash (High)")
         if not withdrawn:
             print("gemini-3.1-pro-high     Gemini 3.1 Pro (High)")
+            print("gemini-3.1-pro-medium   Gemini 3.1 Pro (Medium)")
             print("gemini-3.1-pro-low      Gemini 3.1 Pro (Low)")
         return 0
     if argument_value("-p") == "/quota":
@@ -224,11 +228,12 @@ def main():
     if scenario == "init_timeout":
         time.sleep(60)
         return 0
-    if scenario in INIT_STDERR_SCENARIOS and argument_value("--model") == WITHDRAWN_SLUG:
+    requested_slug = argument_value("--model") or ""
+    if scenario in INIT_STDERR_SCENARIOS and requested_slug.startswith(f"{WITHDRAWN_MODEL}-"):
         if scenario in WITHDRAWAL_SCENARIOS:
             withdrawn_marker().write_text("withdrawn\n", encoding="utf-8")
         print(
-            f'Error: invalid model selection (--model "{WITHDRAWN_SLUG}" --effort "high")',
+            f'Error: invalid model selection (--model "{requested_slug}")',
             file=sys.stderr,
             flush=True,
         )

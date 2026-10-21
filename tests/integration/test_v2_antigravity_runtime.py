@@ -96,7 +96,7 @@ class V2AntigravityRuntimeTests(unittest.IsolatedAsyncioTestCase):
             return []
         return [json.loads(line) for line in self.evidence_path.read_text(encoding="utf-8").splitlines()]
 
-    async def test_medium_thinking_runs_at_the_high_tier(self) -> None:
+    async def test_medium_thinking_runs_at_the_medium_tier(self) -> None:
         service, _ = self.build_service()
         await service.ensure_generation(self.binding_id, self.spec)
         events = await collect(
@@ -104,10 +104,13 @@ class V2AntigravityRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(events[-1].event_type, "done")
         resolved = next(event for event in events if event.event_type == "execution_resolved")
-        self.assertEqual(resolved.payload["effective_provider_model_slug"], "gemini-3.1-pro-high")
-        self.assertEqual(resolved.payload["effective_effort"], "high")
+        self.assertEqual(resolved.payload["effective_provider_model_slug"], "gemini-3.1-pro-medium")
+        self.assertEqual(resolved.payload["effective_effort"], "medium")
         argv = next(item for item in self.evidence() if item["kind"] == "spawn")["argv"]
-        self.assertEqual(argv[argv.index("--effort") + 1], "high")
+        self.assertEqual(argv[argv.index("--model") + 1], "gemini-3.1-pro-medium")
+        # The tier travels in the slug alone; AGY rejects ``--effort`` for some
+        # tiers (``gemini-4-argon-low``), so no effort flag is ever sent.
+        self.assertNotIn("--effort", argv)
 
     async def test_slug_missing_from_agy_models_fails_closed_before_spawn(self) -> None:
         service, _ = self.build_service()
@@ -116,6 +119,24 @@ class V2AntigravityRuntimeTests(unittest.IsolatedAsyncioTestCase):
             service,
             self.binding_id,
             self.turn(model="gemini-3.7-flash", bootstrap={"history": []}),
+        )
+        self.assertEqual(events[-1].payload, {"code": "frozen_execution_unavailable"})
+        self.assertFalse(any(item["kind"] == "spawn" for item in self.evidence()))
+
+    async def test_missing_tier_fails_closed_without_downgrading(self) -> None:
+        # ``gemini-3.6-flash`` is listed at its high tier only, so asking for a
+        # level that resolves to another tier must fail instead of quietly
+        # falling back to the tier that happens to exist.
+        service, _ = self.build_service()
+        await service.ensure_generation(self.binding_id, self.spec)
+        events = await collect(
+            service,
+            self.binding_id,
+            self.turn(
+                model="gemini-3.6-flash",
+                thinking="low",
+                bootstrap={"history": []},
+            ),
         )
         self.assertEqual(events[-1].payload, {"code": "frozen_execution_unavailable"})
         self.assertFalse(any(item["kind"] == "spawn" for item in self.evidence()))
@@ -151,25 +172,41 @@ class V2AntigravityRuntimeTests(unittest.IsolatedAsyncioTestCase):
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
         self.assertEqual(metadata["provider_session_id"], generation.provider_session_id)
 
+        # A level change now changes the AGY model+tier pair, so it respawns
+        # and resumes the same conversation instead of reusing the process.
         second = self.turn(thinking="high")
         await collect(service, self.binding_id, second)
         spawns = [item for item in self.evidence() if item["kind"] == "spawn"]
-        self.assertEqual(len(spawns), 1)
+        self.assertEqual(len(spawns), 2)
+        argv = spawns[-1]["argv"]
+        self.assertEqual(argv[argv.index("--model") + 1], "gemini-3.1-pro-high")
+        self.assertNotIn("--effort", argv)
+        self.assertIn("--conversation", argv)
+        self.assertEqual(argv[argv.index("--conversation") + 1], generation.provider_session_id)
 
-        # Every thinking level runs at the high tier, so a level change alone
-        # leaves the frozen execution untouched and reuses the process.
+        # ``max`` folds onto the same high tier, so the frozen execution is
+        # untouched and the running process is reused.
+        same_pair = self.turn(thinking="max")
+        await collect(service, self.binding_id, same_pair)
+        spawns = [item for item in self.evidence() if item["kind"] == "spawn"]
+        self.assertEqual(len(spawns), 2)
+
         same_tier = self.turn(thinking="low")
         await collect(service, self.binding_id, same_tier)
         spawns = [item for item in self.evidence() if item["kind"] == "spawn"]
-        self.assertEqual(len(spawns), 1)
+        self.assertEqual(len(spawns), 3)
+        self.assertEqual(
+            spawns[-1]["argv"][spawns[-1]["argv"].index("--model") + 1],
+            "gemini-3.1-pro-low",
+        )
 
         third = self.turn(model="gemini-3.8-flash")
         await collect(service, self.binding_id, third)
         spawns = [item for item in self.evidence() if item["kind"] == "spawn"]
-        self.assertEqual(len(spawns), 2)
+        self.assertEqual(len(spawns), 4)
         argv = spawns[-1]["argv"]
-        self.assertEqual(argv[argv.index("--model") + 1], "gemini-3.8-flash-high")
-        self.assertEqual(argv[argv.index("--effort") + 1], "high")
+        self.assertEqual(argv[argv.index("--model") + 1], "gemini-3.8-flash-medium")
+        self.assertNotIn("--effort", argv)
         self.assertIn("--conversation", spawns[-1]["argv"])
         index = spawns[-1]["argv"].index("--conversation")
         self.assertEqual(spawns[-1]["argv"][index + 1], generation.provider_session_id)

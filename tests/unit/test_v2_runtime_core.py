@@ -40,15 +40,22 @@ def request(*, request_id=None, thinking="auto", model="gemini-3.1-pro-preview",
 
 
 class CapabilityPolicyTests(unittest.TestCase):
-    def test_every_thinking_level_resolves_to_the_high_tier(self) -> None:
-        for thinking in ("off", "auto", "low", "medium", "high", "max"):
+    def test_every_thinking_level_resolves_to_its_agy_tier(self) -> None:
+        expected = {
+            "off": ("gemini-3.1-pro-low", "low"),
+            "low": ("gemini-3.1-pro-low", "low"),
+            "medium": ("gemini-3.1-pro-medium", "medium"),
+            "auto": ("gemini-3.1-pro-medium", "medium"),
+            "high": ("gemini-3.1-pro-high", "high"),
+            "max": ("gemini-3.1-pro-high", "high"),
+        }
+        for thinking, pair in expected.items():
             with self.subTest(thinking=thinking):
                 resolution = resolve_execution("gemini-3.1-pro-preview", thinking)
                 self.assertEqual(
-                    (resolution.provider_model_slug, resolution.effort),
-                    ("gemini-3.1-pro-high", "high"),
+                    (resolution.provider_model_slug, resolution.effort), pair
                 )
-                self.assertEqual(resolution.resolver_policy_revision, "agy-gemini-high-v2")
+                self.assertEqual(resolution.resolver_policy_revision, "agy-gemini-tier-v3")
 
     def test_gemini_model_names_map_by_rule(self) -> None:
         cases = {
@@ -62,7 +69,7 @@ class CapabilityPolicyTests(unittest.TestCase):
         for requested, slug in cases.items():
             with self.subTest(requested=requested):
                 self.assertEqual(
-                    resolve_execution(requested, "auto").provider_model_slug,
+                    resolve_execution(requested, "high").provider_model_slug,
                     slug,
                 )
 

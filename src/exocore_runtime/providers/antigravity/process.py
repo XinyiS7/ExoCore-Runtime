@@ -732,8 +732,6 @@ class AgyProcessSupervisor:
             layout.agent_name,
             "--model",
             layout.execution_options.provider_model_slug,
-            "--effort",
-            layout.execution_options.effort,
             "--input-format",
             "stream-json",
             "--output-format",
