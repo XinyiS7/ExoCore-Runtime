@@ -1,4 +1,19 @@
-"""Official AGY process supervision with isolated argv, environment, and cleanup."""
+"""Official AGY process supervision with isolated argv, environment, and cleanup.
+
+更改指南（Change Guide）
+---------------------
+
+- **模型目录是进程级缓存**：`agy models` 本身是实时拉取，但 supervisor 在进程启动时
+  拓一次 `available_model_slugs` 并一直复用。AGY 侧新增 / 恢复模型（例如
+  `gemini-4-argon`）后，未重启的 Runtime 会在 spawn 之前把每个请求拒为
+  `frozen_execution_unavailable`（fail-closed，不降级）。此时**重启 Runtime**，
+  不要再去改 ExoCore 白名单——白名单早已就位。另一种同症状成因是订阅账户回落
+  导致目录变短，先用默认 profile 跑 `agy models` 做对照。
+- **档位只在 slug 里**：`--model <base>-<low|medium|high>` 由 `capabilities.py` 决定，
+  spawn 不再传 `--effort`（`gemini-4-argon-low` 会硬拒该 flag）。
+- **新模型接入顺序**：ExoCore `provider_profiles.py` → `EndpointProvisioningService.update(endpoint)`
+  触发 `apply_profile` → 重启 Runtime 刷新目录。
+"""
 
 from __future__ import annotations
 
