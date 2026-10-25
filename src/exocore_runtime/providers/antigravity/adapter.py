@@ -72,7 +72,7 @@ from exocore_runtime.providers.antigravity.renderer import (
     AGENT_TOOLS,
     ALLOW_POLICY,
     DENY_POLICY,
-    LEGACY_AGENT_TOOLSETS,
+    LEGACY_AGENT_DECLARATIONS,
     MCP_SERVER_NAME,
     extract_rendered_system_instructions,
     generation_agent_name,
@@ -99,12 +99,14 @@ class _AgentDeclarationUpgrade:
     current_hash: str
 
 
-def _declaration_shape_label(tools: tuple[str, ...] | None) -> str:
+def _declaration_shape_label(
+    tools: tuple[str, ...] | None,
+    transport_trailer: bool,
+) -> str:
     """Stable label for a declaration shape in the upgrade log line."""
 
-    if tools is None:
-        return "pre-cp2-no-tools-block"
-    return "tools:" + ",".join(tools)
+    label = "pre-cp2-no-tools-block" if tools is None else "tools:" + ",".join(tools)
+    return label + "+transport-trailer" if transport_trailer else label
 
 
 @dataclass
@@ -898,7 +900,15 @@ class AntigravityAdapter:
             content = raw.decode("utf-8", errors="strict")
         except (OSError, UnicodeDecodeError) as exc:
             raise ProviderAdapterError("agy_custom_agent_invalid", fatal_generation=True) from exc
-        if self._declaration_instructions(content, agent_name, AGENT_TOOLS, project_rules) is not None:
+        current = self._declaration_instructions(content, agent_name, AGENT_TOOLS, project_rules)
+        # The trailer-free current framing also frames a rules-free legacy file
+        # (its trailer would read as part of the body), so the current shape is
+        # only claimed when the recovered body is the generation's own.
+        if (
+            current is not None
+            and hashlib.sha256(current.encode("utf-8")).hexdigest()
+            == generation.system_instructions_sha256
+        ):
             return content, None
         self._require_matching_identity_fields(generation, metadata)
         durable_hash = metadata.get("agent_markdown_sha256")
@@ -933,7 +943,7 @@ class AntigravityAdapter:
         leaves a half-upgraded generation behind.
         """
 
-        for legacy_tools in LEGACY_AGENT_TOOLSETS:
+        for legacy_tools, transport_trailer in LEGACY_AGENT_DECLARATIONS:
             if legacy_tools is None and (
                 project_rules is not None or self._has_canonical_project_rules(root)
             ):
@@ -942,7 +952,11 @@ class AntigravityAdapter:
                 # runtime never produced.
                 continue
             instructions = self._declaration_instructions(
-                content, agent_name, legacy_tools, project_rules
+                content,
+                agent_name,
+                legacy_tools,
+                project_rules,
+                transport_trailer=transport_trailer,
             )
             if instructions is None:
                 continue
@@ -956,7 +970,7 @@ class AntigravityAdapter:
             current_hash = hashlib.sha256(current.encode("utf-8")).hexdigest()
             return current, _AgentDeclarationUpgrade(
                 generation_id=str(metadata.get("generation_id", "")),
-                legacy_shape=_declaration_shape_label(legacy_tools),
+                legacy_shape=_declaration_shape_label(legacy_tools, transport_trailer),
                 previous_hash=previous_hash,
                 current_hash=current_hash,
             )
@@ -1004,13 +1018,17 @@ class AntigravityAdapter:
         if hashlib.sha256(raw).hexdigest() != recorded_hash:
             raise ProviderAdapterError("agy_artifact_identity_mismatch", fatal_generation=True)
         expected_body = spec.system_instructions.strip()
-        for legacy_tools in LEGACY_AGENT_TOOLSETS:
+        for legacy_tools, transport_trailer in LEGACY_AGENT_DECLARATIONS:
             if legacy_tools is None and (
                 spec.project_rules is not None or self._has_canonical_project_rules(root)
             ):
                 continue
             instructions = self._declaration_instructions(
-                content, agent_name, legacy_tools, spec.project_rules
+                content,
+                agent_name,
+                legacy_tools,
+                spec.project_rules,
+                transport_trailer=transport_trailer,
             )
             if instructions is None:
                 continue
@@ -1021,7 +1039,7 @@ class AntigravityAdapter:
             metadata["agent_markdown_sha256"] = current_hash
             return _AgentDeclarationUpgrade(
                 generation_id=str(expected["generation_id"]),
-                legacy_shape=_declaration_shape_label(legacy_tools),
+                legacy_shape=_declaration_shape_label(legacy_tools, transport_trailer),
                 previous_hash=recorded_hash,
                 current_hash=current_hash,
             )
@@ -1033,6 +1051,8 @@ class AntigravityAdapter:
         agent_name: str,
         tools: tuple[str, ...] | None,
         project_rules: str | None,
+        *,
+        transport_trailer: bool = False,
     ) -> str | None:
         """Extract the instructions body for one declaration shape, or None."""
 
@@ -1042,6 +1062,7 @@ class AntigravityAdapter:
                 content,
                 project_rules=project_rules,
                 tools=tools,
+                transport_trailer=transport_trailer,
             )
         except ValueError:
             return None

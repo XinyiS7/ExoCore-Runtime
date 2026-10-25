@@ -278,7 +278,9 @@ def main():
             request_number=turn_number,
             stdin_sha256=hashlib.sha256(line.encode("utf-8")).hexdigest(),
             current_user_occurrences=content.count("CURRENT-USER-CANARY"),
-            bootstrap_present="ExoCorePriorContinuity" in content,
+            # Bootstrap renders at least one section ahead of the closing
+            # current-user turn; a bare later turn has no sections at all.
+            bootstrap_present=content.count("\n--- end ") > 1,
             ephemeral_in_stdin="EPHEMERAL-CANARY" in content,
             attachment_paths=sorted(set(re.findall(r'path="([^"]+)"', content))),
             hook_injected=injected,

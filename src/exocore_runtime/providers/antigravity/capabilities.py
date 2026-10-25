@@ -7,7 +7,7 @@ from exocore_runtime.errors import ProviderAdapterError
 
 
 RESOLVER_POLICY_REVISION = "agy-gemini-tier-v3"
-SECURITY_POLICY_REVISION = "agy-tool-perm-v6"
+SECURITY_POLICY_REVISION = "agy-tool-perm-v7"
 LAUNCH_ENVIRONMENT_REVISION = "agy-isolated-env-v1"
 
 # AGY sells fixed model+tier pairs, so an ExoCore thinking level selects one of
