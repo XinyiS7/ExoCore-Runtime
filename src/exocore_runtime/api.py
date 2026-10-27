@@ -58,6 +58,7 @@ def create_app(
             idle_timeout_seconds=config.agy_idle_timeout,
             hard_timeout_seconds=config.agy_hard_timeout,
             close_timeout_seconds=config.agy_close_timeout,
+            diagnostic_secret_values=(config.token,),
         )
         runtime_provider: RuntimeProviderAdapter | Mapping[str, RuntimeProviderAdapter] = {
             "fake": DeterministicFakeAdapter(),

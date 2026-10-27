@@ -316,6 +316,14 @@ def main():
             evidence("child", child_pid=child.pid)
             time.sleep(60)
             continue
+        if scenario == "unknown_error_step":
+            emit({"event": "step_update", "step_update": {
+                "conversation_id": conversation_id, "step_index": turn_number * 10 + 3,
+                "step_type": "error_message", "state": "DONE",
+                "error": {"status": "RESOURCE_EXHAUSTED", "code": 429},
+            }})
+            continue
+
         if scenario == "malformed_stream":
             print("{malformed", flush=True)
             continue

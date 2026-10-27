@@ -3,6 +3,9 @@
 更改指南（Change Guide）
 ---------------------
 
+- **失败原始留痕**：turn失败记录保存在provider数据目录同级diagnostics/antigravity，
+  按binding/request关联，仅最后记录与result；凭据脱敏但仍属于私密会话数据。
+  retire不清理该目录；不进入wire或模型上下文，磁盘错误只显式告警不改终局。
 - **模型目录是进程级缓存**：`agy models` 本身是实时拉取，但 supervisor 在进程启动时
   拓一次 `available_model_slugs` 并一直复用。AGY 侧新增 / 恢复模型（例如
   `gemini-4-argon`）后，未重启的 Runtime 会在 spawn 之前把每个请求拒为
@@ -40,6 +43,7 @@ from exocore_runtime.contracts import (
     ProviderGeneration,
 )
 from exocore_runtime.errors import ProviderAdapterError
+from exocore_runtime.providers.antigravity.diagnostics import FailureDiagnostics
 from exocore_runtime.providers.antigravity.ndjson import (
     AgyTurnNormalizer,
     parse_init,
@@ -144,6 +148,7 @@ class AgyProcessConfig:
     result_settle_seconds: float = 0.1
     require_official_executable: bool = True
     environment_overrides: Mapping[str, str] = field(default_factory=dict, repr=False)
+    diagnostic_secret_values: tuple[str, ...] = field(default=(), repr=False)
 
     @classmethod
     def official(cls, executable: str | None = None, **kwargs) -> "AgyProcessConfig":
@@ -272,6 +277,12 @@ class AgyProcessSupervisor:
             session.provider_session_id,
             session.layout.mcp_tool_names,
         )
+        diagnostics = FailureDiagnostics(
+            session.layout, request_id,
+            {**os.environ, **self.config.environment_overrides},
+            provider_session_id=session.provider_session_id,
+            secret_values=self.config.diagnostic_secret_values,
+        )
         pending_captures: dict[int, dict] = {}
         try:
             try:
@@ -289,11 +300,14 @@ class AgyProcessSupervisor:
                     hard_timeout=self.config.hard_timeout_seconds,
                 )
                 tag, line = await self._next_item(session, timeout, timeout_code)
+                diagnostics.observe(tag, line)
                 if tag == "stderr":
                     raise ProviderAdapterError("agy_stderr", terminal_status="indeterminate")
                 if line is None:
                     raise ProviderAdapterError("agy_unexpected_eof", terminal_status="indeterminate")
                 parsed = parse_line(line)
+                if parsed.get("event") == "result":
+                    diagnostics.mark_result()
                 events = normalizer.consume(parsed)
                 if capture_tool_result is not None:
                     step = _tool_step(parsed)
@@ -306,7 +320,7 @@ class AgyProcessSupervisor:
                         if isinstance(step_index, int) and step_index >= 0:
                             pending_captures[step_index] = step
                 if normalizer.result_seen:
-                    await self._assert_quiet_after_result(session)
+                    await self._assert_quiet_after_result(session, diagnostics)
                     if capture_tool_result is not None and pending_captures:
                         for pending_step in pending_captures.values():
                             payload = await capture_tool_result(
@@ -331,6 +345,8 @@ class AgyProcessSupervisor:
                             "agy_terminal_missing",
                             terminal_status="indeterminate",
                         )
+                    if terminals[0].event_type == "error":
+                        diagnostics.persist(terminals[0].payload["code"])
                     # Record the request-scoped process candidate before the
                     # claim is released: a cancel interleaving at that await
                     # must observe the candidate, not a fencable active claim.
@@ -345,6 +361,7 @@ class AgyProcessSupervisor:
             await self._finish_cancelled_stream_cleanup(binding_id, request_id, original_error)
             raise
         except ProviderAdapterError as original_error:
+            diagnostics.persist(original_error.code)
             try:
                 await self.close_binding(binding_id, force=True)
             except BaseException:
@@ -869,7 +886,9 @@ class AgyProcessSupervisor:
                 raise ProviderAdapterError("agy_exit_after_init", fatal_generation=True)
             raise ProviderAdapterError("agy_event_before_user", fatal_generation=True)
 
-    async def _assert_quiet_after_result(self, session: _ProcessSession) -> None:
+    async def _assert_quiet_after_result(
+        self, session: _ProcessSession, diagnostics: FailureDiagnostics | None = None,
+    ) -> None:
         deadline = time.monotonic() + self.config.result_settle_seconds
         while True:
             remaining = deadline - time.monotonic()
@@ -881,6 +900,8 @@ class AgyProcessSupervisor:
                 return
             if tag == "stderr" and line is None:
                 continue
+            if diagnostics is not None:
+                diagnostics.observe(tag, line)
             if tag == "stderr":
                 raise ProviderAdapterError("agy_stderr", terminal_status="indeterminate")
             if line is None:

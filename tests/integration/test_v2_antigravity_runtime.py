@@ -1,3 +1,4 @@
+import os
 import json
 from pathlib import Path
 import sys
@@ -400,6 +401,51 @@ class V2AntigravityRuntimeTests(unittest.IsolatedAsyncioTestCase):
         failing, _ = self.build_service("init_stderr_model_listed")
         events = await collect(failing, self.binding_id, self.turn(thinking="low"))
         self.assertEqual(events[-1].payload, {"code": "provider_session_unavailable"})
+
+
+    async def failure_evidence(self, scenario, code):
+        service, _ = self.build_service(scenario)
+        await service.ensure_generation(self.binding_id, self.spec)
+        request = self.turn(bootstrap={"history": []})
+        events = await collect(service, self.binding_id, request)
+        self.assertEqual(events[-1].payload, {"code": code})
+        path = self.root / "diagnostics" / "antigravity" / str(self.binding_id) / f"{request.request_id}.json"
+        evidence = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(evidence["binding_id"], str(self.binding_id))
+        self.assertEqual(evidence["request_id"], str(request.request_id))
+        self.assertEqual(evidence["provider_session_id"], "11111111-2222-3333-4444-555555555555")
+        self.assertEqual(evidence["error_code"], code)
+        return evidence
+
+    async def test_unknown_step_keeps_the_original_error_record(self):
+        evidence = await self.failure_evidence("unknown_error_step", "agy_unknown_step")
+        step = json.loads(evidence["last_record"]["raw_text"])["step_update"]
+        self.assertEqual(step["step_type"], "error_message")
+        self.assertEqual(step["error"], {"status": "RESOURCE_EXHAUSTED", "code": 429})
+        self.assertEqual(evidence["result_record"], None)
+
+    async def test_failed_result_keeps_original_status_and_response(self):
+        evidence = await self.failure_evidence("result_error", "agy_result_error")
+        result = json.loads(evidence["result_record"]["raw_text"])["result"]
+        self.assertEqual((result["status"], result["response"]), ("ERROR", "fixture-answer"))
+        self.assertEqual(evidence["last_record"], evidence["result_record"])
+
+    async def test_stderr_keeps_original_line(self):
+        evidence = await self.failure_evidence("stderr", "agy_stderr")
+        self.assertEqual(evidence["last_record"]["channel"], "stderr")
+        self.assertEqual(evidence["last_record"]["raw_text"], "fixture stderr warning" + os.linesep)
+
+    async def test_result_tail_keeps_both_result_and_trigger(self):
+        evidence = await self.failure_evidence("event_after_result", "agy_event_after_result")
+        self.assertEqual(json.loads(evidence["result_record"]["raw_text"])["result"]["status"], "SUCCESS")
+        self.assertEqual(json.loads(evidence["last_record"]["raw_text"])["step_update"]["text_delta"], "late")
+
+    async def test_success_does_not_persist_diagnostics(self):
+        service, _ = self.build_service()
+        await service.ensure_generation(self.binding_id, self.spec)
+        events = await collect(service, self.binding_id, self.turn(bootstrap={"history": []}))
+        self.assertEqual(events[-1].event_type, "done")
+        self.assertEqual(list(self.root.glob("diagnostics/**/*.json")), [])
 
 if __name__ == "__main__":
     unittest.main()
