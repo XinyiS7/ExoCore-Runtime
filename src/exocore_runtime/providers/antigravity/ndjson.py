@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 from typing import Any
 
 from exocore_runtime.contracts import ProviderEvent, ProviderGeneration
 from exocore_runtime.errors import ProviderAdapterError
 from exocore_runtime.providers.antigravity.mcp_policy import MCP_SERVER_NAME
+
+_LOGGER = logging.getLogger(__name__)
+_STALE_ERROR_LOG_LIMIT = 300
 
 
 _LIFECYCLE_STEP_TYPES = frozenset({"user_input", "checkpoint", "system_message"})
@@ -173,6 +177,12 @@ class AgyTurnNormalizer:
         self.conversation_id = conversation_id
         self.active_mcp_tool_names = frozenset(active_mcp_tool_names)
         self.result_seen = False
+        # A result frame may replay an error the provider already reported in an
+        # earlier turn (observed: an old 429 quota message carried across
+        # models). Only a turn that produced answer text proves the request ran,
+        # so an uncorroborated error then cannot describe this turn.
+        self.produced_answer = False
+        self.ignored_result_error: str | None = None
         self._step_usage_by_index: dict[int, dict[str, int]] = {}
 
     def consume(self, payload: dict[str, Any]) -> list[ProviderEvent]:
@@ -225,7 +235,10 @@ class AgyTurnNormalizer:
                 return [ProviderEvent(event_type="lifecycle", payload=lifecycle)]
             if not isinstance(text, str):
                 raise ProviderAdapterError("agy_malformed_text_delta", terminal_status="indeterminate")
-            return [ProviderEvent(event_type=_TEXT_STEP_TYPES[step_type], payload={"text": text})]
+            event_type = _TEXT_STEP_TYPES[step_type]
+            if event_type == "content_delta":
+                self.produced_answer = True
+            return [ProviderEvent(event_type=event_type, payload={"text": text})]
         if step_type in _LIFECYCLE_STEP_TYPES:
             return [ProviderEvent(event_type="lifecycle", payload=lifecycle)]
         if step_type == "unknown":
@@ -285,6 +298,21 @@ class AgyTurnNormalizer:
                 events.append(ProviderEvent(event_type="usage", payload=aggregated_usage))
 
         if status == "SUCCESS":
+            events.append(
+                ProviderEvent(
+                    event_type="done",
+                    payload={"finish_reason": "stop"},
+                )
+            )
+        elif self.produced_answer:
+            # Keep the raw error for private diagnosis, but do not fail a turn
+            # whose answer already arrived: no error step was raised for it.
+            raw_error = result.get("error")
+            self.ignored_result_error = raw_error if isinstance(raw_error, str) else ""
+            _LOGGER.warning(
+                "[agy-result] ignored uncorroborated result error: %s",
+                self.ignored_result_error[:_STALE_ERROR_LOG_LIMIT],
+            )
             events.append(
                 ProviderEvent(
                     event_type="done",

@@ -600,25 +600,30 @@ def main():
             "cache_read_tokens": 50 if turn_number > 1 else 0,
             "total_tokens": 110,
         }
-        emit(
-            {
-                "event": "step_update",
-                "step_update": {
-                    "conversation_id": conversation_id,
-                    "step_index": turn_number * 10 + 4,
-                    "step_type": "agent_response",
-                    "state": "DONE",
-                    "text_delta": "fixture-answer",
-                    "usage": step_usage,
-                },
-            }
-        )
+        if scenario != "result_error_no_text":
+            emit(
+                {
+                    "event": "step_update",
+                    "step_update": {
+                        "conversation_id": conversation_id,
+                        "step_index": turn_number * 10 + 4,
+                        "step_type": "agent_response",
+                        "state": "DONE",
+                        "text_delta": "fixture-answer",
+                        "usage": step_usage,
+                    },
+                }
+            )
         result = {
             "event": "result",
             "result": {
                 "conversation_id": conversation_id,
-                "status": "ERROR" if scenario == "result_error" else "SUCCESS",
+                "status": "ERROR" if scenario in {"result_error", "result_error_no_text"} else "SUCCESS",
                 "response": "fixture-answer",
+                "error": (
+                    "Individual quota reached. Resets in 21h14m24s."
+                    if scenario in {"result_error", "result_error_no_text"} else None
+                ),
                 "num_turns": turn_number,
                 "usage": {
                     "input_tokens": 100 * turn_number,

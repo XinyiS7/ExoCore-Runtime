@@ -424,11 +424,26 @@ class V2AntigravityRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(step["error"], {"status": "RESOURCE_EXHAUSTED", "code": 429})
         self.assertEqual(evidence["result_record"], None)
 
-    async def test_failed_result_keeps_original_status_and_response(self):
-        evidence = await self.failure_evidence("result_error", "agy_result_error")
+    async def test_delivered_answer_with_a_stale_result_error_completes(self):
+        service, _ = self.build_service("result_error")
+        await service.ensure_generation(self.binding_id, self.spec)
+        request = self.turn(bootstrap={"history": []})
+        events = await collect(service, self.binding_id, request)
+        self.assertEqual(events[-1].event_type, "done")
+        self.assertEqual(events[-1].payload, {"finish_reason": "stop"})
+        evidence = json.loads(
+            (self.root / "diagnostics" / "antigravity" / str(self.binding_id)
+             / f"{request.request_id}.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(evidence["error_code"], "agy_result_error_ignored")
         result = json.loads(evidence["result_record"]["raw_text"])["result"]
         self.assertEqual((result["status"], result["response"]), ("ERROR", "fixture-answer"))
         self.assertEqual(evidence["last_record"], evidence["result_record"])
+
+    async def test_result_error_without_any_answer_still_fails(self):
+        evidence = await self.failure_evidence("result_error_no_text", "agy_result_error")
+        result = json.loads(evidence["result_record"]["raw_text"])["result"]
+        self.assertEqual(result["status"], "ERROR")
 
     async def test_stderr_keeps_original_line(self):
         evidence = await self.failure_evidence("stderr", "agy_stderr")

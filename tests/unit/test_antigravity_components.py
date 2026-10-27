@@ -961,3 +961,64 @@ class AntigravityComponentTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StaleResultErrorTests(unittest.TestCase):
+    """A result error with no corroborating step must not fail a delivered turn."""
+
+    conversation = "11111111-2222-3333-4444-555555555555"
+
+    def step(self, index, step_type, text=None):
+        step = {
+            "conversation_id": self.conversation,
+            "step_index": index,
+            "step_type": step_type,
+            "state": "DONE",
+        }
+        if text is not None:
+            step["text_delta"] = text
+        return {"event": "step_update", "step_update": step}
+
+    def result(self, status):
+        return {"event": "result", "result": {
+            "conversation_id": self.conversation,
+            "status": status,
+            "response": "answer",
+            "error": "Individual quota reached. Resets in 21h14m24s.",
+        }}
+
+    def normalizer(self):
+        from exocore_runtime.providers.antigravity.ndjson import AgyTurnNormalizer
+        return AgyTurnNormalizer(self.conversation)
+
+    def test_delivered_answer_turns_a_stale_error_into_done(self):
+        normalizer = self.normalizer()
+        normalizer.consume(self.step(1, "agent_response", "answer"))
+        events = normalizer.consume(self.result("ERROR"))
+        self.assertEqual(
+            [(event.event_type, event.payload) for event in events],
+            [("done", {"finish_reason": "stop"})],
+        )
+        self.assertEqual(
+            normalizer.ignored_result_error,
+            "Individual quota reached. Resets in 21h14m24s.",
+        )
+
+    def test_error_without_answer_text_stays_a_failure(self):
+        normalizer = self.normalizer()
+        normalizer.consume(self.step(1, "user_input"))
+        events = normalizer.consume(self.result("ERROR"))
+        self.assertEqual(
+            [(event.event_type, event.payload) for event in events],
+            [("error", {"code": "agy_result_error"})],
+        )
+        self.assertEqual(normalizer.ignored_result_error, None)
+
+    def test_thinking_only_does_not_count_as_a_delivered_answer(self):
+        normalizer = self.normalizer()
+        normalizer.consume(self.step(1, "agent_thought", "thinking"))
+        events = normalizer.consume(self.result("ERROR"))
+        self.assertEqual(
+            [(event.event_type, event.payload) for event in events],
+            [("error", {"code": "agy_result_error"})],
+        )

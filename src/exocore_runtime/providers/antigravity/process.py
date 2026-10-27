@@ -347,6 +347,8 @@ class AgyProcessSupervisor:
                         )
                     if terminals[0].event_type == "error":
                         diagnostics.persist(terminals[0].payload["code"])
+                    elif normalizer.ignored_result_error is not None:
+                        diagnostics.persist("agy_result_error_ignored")
                     # Record the request-scoped process candidate before the
                     # claim is released: a cancel interleaving at that await
                     # must observe the candidate, not a fencable active claim.
