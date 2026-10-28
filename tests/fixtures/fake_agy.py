@@ -317,10 +317,18 @@ def main():
             time.sleep(60)
             continue
         if scenario == "unknown_error_step":
+            # AGY reports an ordinary failure and then keeps going, exactly like
+            # its own retry path; the turn itself still finishes normally.
             emit({"event": "step_update", "step_update": {
                 "conversation_id": conversation_id, "step_index": turn_number * 10 + 3,
                 "step_type": "error_message", "state": "DONE",
                 "error": {"status": "RESOURCE_EXHAUSTED", "code": 429},
+            }})
+        if scenario == "unknown_text_step":
+            emit({"event": "step_update", "step_update": {
+                "conversation_id": conversation_id, "step_index": turn_number * 10 + 3,
+                "step_type": "brand_new_step", "state": "DONE",
+                "text_delta": "unclassifiable answer text",
             }})
             continue
 

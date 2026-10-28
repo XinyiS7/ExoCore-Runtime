@@ -31,6 +31,7 @@ _OBSERVED_STEP_STATES = {
     "agent_thoughts": frozenset({"ACTIVE", "DONE"}),
     "tool": frozenset({"ACTIVE", "DONE", "ERROR"}),
 }
+_UNRECOGNIZED_LIMIT = 20
 _USAGE_KEYS = (
     "input_tokens",
     "output_tokens",
@@ -166,6 +167,17 @@ def parse_init(
     )
 
 
+def _note_error(value: object) -> dict[str, str] | None:
+    """Bounded, text-only summary of a provider-declared error field."""
+    if not isinstance(value, dict):
+        return None
+    note = {}
+    for key, item in sorted(value.items())[:6]:
+        if isinstance(item, (str, int, float, bool)):
+            note[str(key)[:40]] = str(item)[:200]
+    return note or None
+
+
 class AgyTurnNormalizer:
     """Consumes one turn from one ordered stdout reader."""
 
@@ -183,6 +195,10 @@ class AgyTurnNormalizer:
         # so an uncorroborated error then cannot describe this turn.
         self.produced_answer = False
         self.ignored_result_error: str | None = None
+        # Steps we do not model are kept as traceable notes instead of ending
+        # the session: AGY reports ordinary failures (and keeps retrying them)
+        # through its own step types, and stopping there cancels its recovery.
+        self.unrecognized_steps: list[dict] = []
         self._step_usage_by_index: dict[int, dict[str, int]] = {}
 
     def consume(self, payload: dict[str, Any]) -> list[ProviderEvent]:
@@ -215,7 +231,19 @@ class AgyTurnNormalizer:
             raise ProviderAdapterError("agy_malformed_step", terminal_status="indeterminate")
         allowed_states = _OBSERVED_STEP_STATES.get(step_type)
         if allowed_states is None:
-            raise ProviderAdapterError("agy_unknown_step", terminal_status="indeterminate")
+            # Only unmodeled payload that would be lost is a hard stop: an
+            # unrecognized step carrying answer text or tool data cannot be
+            # classified, so refusing is safer than silently dropping it.
+            if any(key in step for key in ("text_delta", "tool_info", "tool_name", "usage")):
+                raise ProviderAdapterError("agy_unknown_step", terminal_status="indeterminate")
+            if len(self.unrecognized_steps) < _UNRECOGNIZED_LIMIT:
+                self.unrecognized_steps.append({
+                    "step_index": step_index,
+                    "step_type": step_type,
+                    "state": state,
+                    "error": _note_error(step.get("error")),
+                })
+            return []
         if state not in allowed_states:
             raise ProviderAdapterError("agy_unknown_step_state", terminal_status="indeterminate")
         lifecycle = {

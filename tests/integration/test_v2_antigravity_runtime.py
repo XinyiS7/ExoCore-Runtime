@@ -417,12 +417,26 @@ class V2AntigravityRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(evidence["error_code"], code)
         return evidence
 
-    async def test_unknown_step_keeps_the_original_error_record(self):
-        evidence = await self.failure_evidence("unknown_error_step", "agy_unknown_step")
+    async def test_unmodeled_error_step_is_recorded_and_the_turn_still_finishes(self):
+        service, _ = self.build_service("unknown_error_step")
+        await service.ensure_generation(self.binding_id, self.spec)
+        request = self.turn(bootstrap={"history": []})
+        events = await collect(service, self.binding_id, request)
+        self.assertEqual(events[-1].event_type, "done")
+        evidence = json.loads(
+            (self.root / "diagnostics" / "antigravity" / str(self.binding_id)
+             / f"{request.request_id}.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(evidence["error_code"], "agy_info")
+        self.assertEqual(evidence["notes"], [{
+            "step_index": 13, "step_type": "error_message", "state": "DONE",
+            "error": {"code": "429", "status": "RESOURCE_EXHAUSTED"},
+        }])
+
+    async def test_unmodeled_step_carrying_unclassified_text_still_stops(self):
+        evidence = await self.failure_evidence("unknown_text_step", "agy_unknown_step")
         step = json.loads(evidence["last_record"]["raw_text"])["step_update"]
-        self.assertEqual(step["step_type"], "error_message")
-        self.assertEqual(step["error"], {"status": "RESOURCE_EXHAUSTED", "code": 429})
-        self.assertEqual(evidence["result_record"], None)
+        self.assertEqual(step["step_type"], "brand_new_step")
 
     async def test_delivered_answer_with_a_stale_result_error_completes(self):
         service, _ = self.build_service("result_error")

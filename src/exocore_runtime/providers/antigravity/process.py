@@ -346,9 +346,15 @@ class AgyProcessSupervisor:
                             terminal_status="indeterminate",
                         )
                     if terminals[0].event_type == "error":
-                        diagnostics.persist(terminals[0].payload["code"])
+                        diagnostics.persist(
+                            terminals[0].payload["code"], normalizer.unrecognized_steps
+                        )
                     elif normalizer.ignored_result_error is not None:
-                        diagnostics.persist("agy_result_error_ignored")
+                        diagnostics.persist(
+                            "agy_result_error_ignored", normalizer.unrecognized_steps
+                        )
+                    elif normalizer.unrecognized_steps:
+                        diagnostics.persist("agy_info", normalizer.unrecognized_steps)
                     # Record the request-scoped process candidate before the
                     # claim is released: a cancel interleaving at that await
                     # must observe the candidate, not a fencable active claim.
@@ -363,7 +369,7 @@ class AgyProcessSupervisor:
             await self._finish_cancelled_stream_cleanup(binding_id, request_id, original_error)
             raise
         except ProviderAdapterError as original_error:
-            diagnostics.persist(original_error.code)
+            diagnostics.persist(original_error.code, normalizer.unrecognized_steps)
             try:
                 await self.close_binding(binding_id, force=True)
             except BaseException:

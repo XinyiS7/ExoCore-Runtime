@@ -122,7 +122,7 @@ class FailureDiagnostics:
     def mark_result(self) -> None:
         self.result_record = self.last_record
 
-    def persist(self, error_code: str) -> None:
+    def persist(self, error_code: str, notes: list[dict] | None = None) -> None:
         if self.provider_error is None:
             self.read_provider_error()
         payload = {
@@ -132,6 +132,7 @@ class FailureDiagnostics:
             "last_record": self.last_record,
             "result_record": self.result_record,
             "provider_error": self.provider_error,
+            "notes": notes or [],
         }
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
