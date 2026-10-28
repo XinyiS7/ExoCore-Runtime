@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+import sqlite3
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -58,3 +59,47 @@ class FailureDiagnosticsTests(unittest.TestCase):
         self.assertEqual(result, None)
         self.assertEqual(len(logs.records), 1)
         self.assertEqual(logs.records[0].args, ("OSError", trace.path, "agy_stderr"))
+
+    def write_provider_db(self, payloads):
+        directory = self.layout.profile / ".gemini" / "antigravity-cli" / "conversations"
+        directory.mkdir(parents=True, exist_ok=True)
+        db = directory / "session.db"
+        connection = sqlite3.connect(db)
+        try:
+            connection.execute(
+                "create table steps (idx integer primary key, step_type integer, step_payload blob)"
+            )
+            for index, payload in payloads:
+                connection.execute(
+                    "insert into steps values (?, 17, ?)", (index, payload)
+                )
+            connection.commit()
+        finally:
+            connection.close()
+        return db
+
+    def test_provider_error_text_is_read_from_agy_own_database(self):
+        # The stdout frame only carries the step marker, never the message.
+        message = (
+            b"API error (attempt 1): request failed: Post https://example.invalid: "
+            b"write tcp 127.0.0.1:1->127.0.0.1:2: wsasend: forcibly closed."
+        )
+        self.write_provider_db([(7, b"\x0a\x03old"), (8, b"\xc2\x01\x20" + message)])
+        trace = FailureDiagnostics(
+            self.layout, "request", {"EXOCORE_RUNTIME_TOKEN": "private-token-value"},
+            provider_session_id="session",
+        )
+        trace.observe("stdout", b'{"event":"step_update","step_update":{"step_type":"error_message"}}\n')
+        trace.persist("agy_unknown_step")
+        data = json.loads(trace.path.read_text(encoding="utf-8"))
+        self.assertEqual(data["provider_error"]["source"], "agy_conversation_db")
+        self.assertEqual(data["provider_error"]["text"], message.decode())
+        self.assertEqual(data["provider_error"]["truncated"], False)
+
+    def test_missing_provider_database_leaves_the_record_empty(self):
+        trace = FailureDiagnostics(self.layout, "request", {}, provider_session_id="session")
+        trace.observe("stderr", b"original failure")
+        trace.persist("agy_stderr")
+        data = json.loads(trace.path.read_text(encoding="utf-8"))
+        self.assertEqual(data["provider_error"], None)
+        self.assertEqual(data["last_record"]["raw_text"], "original failure")
