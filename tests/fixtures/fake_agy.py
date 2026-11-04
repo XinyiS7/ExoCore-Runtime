@@ -148,11 +148,17 @@ def main():
         if scenario == "version_1_3_9":
             print("1.3.9")
             return 0
+        if scenario == "version_1_5_0":
+            print("1.5.0")
+            return 0
+        if scenario == "version_1_5_9":
+            print("1.5.9")
+            return 0
         if scenario == "bad_version":
             # Stamps the first version outside the accepted envelope. The gate
             # is an exclusive minor bound, so this must stay one minor above
-            # the newest accepted line (1.4.x -> 1.5.0).
-            print("1.5.0")
+            # the newest accepted line (1.5.x -> 1.6.0).
+            print("1.6.0")
             return 0
         print("1.1.20")
         return 0

@@ -1192,9 +1192,38 @@ class AntigravityAdapterTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(events[-1].event_type, "done")
 
+    async def test_verified_1_5_0_version_is_accepted(self) -> None:
+        """Alicia's official 1.5.0 upgrade widened the envelope to <1.6."""
+
+        service, _ = self.build_service("version_1_5_0")
+        await service.ensure_generation(self.binding_id, self.spec)
+
+        events = await collect(
+            service,
+            self.binding_id,
+            self.turn(bootstrap={"history": []}),
+        )
+
+        self.assertEqual(events[-1].event_type, "done")
+        self.assertEqual(len([item for item in self.evidence() if item["kind"] == "turn"]), 1)
+
+    async def test_later_1_5_patch_version_is_accepted(self) -> None:
+        """The upper bound is an exclusive minor: any 1.5.x stamp is accepted."""
+
+        service, _ = self.build_service("version_1_5_9")
+        await service.ensure_generation(self.binding_id, self.spec)
+
+        events = await collect(
+            service,
+            self.binding_id,
+            self.turn(bootstrap={"history": []}),
+        )
+
+        self.assertEqual(events[-1].event_type, "done")
+
     async def test_startup_faults_fail_before_user_stdin_and_timeout_process_is_reaped(self) -> None:
         scenarios = {
-            # bad_version stamps the next minor (1.5.0), one above the newest
+            # bad_version stamps the next minor (1.6.0), one above the newest
             # accepted line, so the fail-closed boundary stays under test.
             "bad_version": "agy_version_unsupported",
             "version_stderr": "agy_version_failed",
