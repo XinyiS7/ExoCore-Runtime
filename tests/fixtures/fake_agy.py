@@ -177,6 +177,10 @@ def main():
         print("gemini-3.8-flash-high   Gemini 3.8 Flash (High)")
         print("gemini-3.8-flash-medium Gemini 3.8 Flash (Medium)")
         print("gemini-3.8-flash-low    Gemini 3.8 Flash (Low)")
+        print("gemini-4-hydrogen-high   Gemini 4 Hydrogen (High)")
+        print("gemini-4-hydrogen-xhigh  Gemini 4 Hydrogen (XHigh)")
+        print("gemini-4-hydrogen-medium Gemini 4 Hydrogen (Medium)")
+        print("gemini-4-hydrogen-low    Gemini 4 Hydrogen (Low)")
         print("gemini-3.6-flash-high   Gemini 3.6 Flash (High)")
         if not withdrawn:
             print("gemini-3.1-pro-high     Gemini 3.1 Pro (High)")

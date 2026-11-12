@@ -7,6 +7,7 @@ from exocore_runtime.errors import ProviderAdapterError
 
 
 RESOLVER_POLICY_REVISION = "agy-gemini-tier-v3"
+SLUG_PASSTHROUGH_POLICY_REVISION = "agy-gemini-tier-v4"
 SECURITY_POLICY_REVISION = "agy-tool-perm-v7"
 LAUNCH_ENVIRONMENT_REVISION = "agy-isolated-env-v1"
 
@@ -32,17 +33,33 @@ _TIER_BY_THINKING_LEVEL = {
 _DEFAULT_TIER = "medium"
 _MODEL_PREFIX = "gemini-"
 _RELEASE_CHANNEL_SUFFIX = "-preview"
+_SUPPORTED_SLUG_EFFORTS = frozenset({"low", "medium", "high", "xhigh"})
 
 
-def resolve_execution(requested_model_id: str, requested_thinking_level: str) -> EffectiveResolution:
-    if not requested_model_id.startswith(_MODEL_PREFIX):
-        raise ProviderAdapterError(
-            "unsupported_requested_execution",
-            status_code=422,
-        )
-    tier = _TIER_BY_THINKING_LEVEL.get(requested_thinking_level, _DEFAULT_TIER)
-    base = requested_model_id.removesuffix(_RELEASE_CHANNEL_SUFFIX)
-    model_slug = f"{base}-{tier}"
+def resolve_execution(
+    requested_model_id: str,
+    requested_thinking_level: str,
+    provider_model_slug: str | None = None,
+) -> EffectiveResolution:
+    if provider_model_slug is not None:
+        tier = provider_model_slug.rsplit("-", 1)[-1]
+        if tier not in _SUPPORTED_SLUG_EFFORTS:
+            raise ProviderAdapterError(
+                "unsupported_requested_execution",
+                status_code=422,
+            )
+        model_slug = provider_model_slug
+        resolver_policy_revision = SLUG_PASSTHROUGH_POLICY_REVISION
+    else:
+        if not requested_model_id.startswith(_MODEL_PREFIX):
+            raise ProviderAdapterError(
+                "unsupported_requested_execution",
+                status_code=422,
+            )
+        tier = _TIER_BY_THINKING_LEVEL.get(requested_thinking_level, _DEFAULT_TIER)
+        base = requested_model_id.removesuffix(_RELEASE_CHANNEL_SUFFIX)
+        model_slug = f"{base}-{tier}"
+        resolver_policy_revision = RESOLVER_POLICY_REVISION
     # Provider-neutral ``ProcessExecutionOptions`` keeps ``sandbox=True`` as its
     # default; this provider deliberately opts out. The verified 1.2.5 tool
     # unlock runs the CLI directly on the host with the deny policy as the
@@ -58,6 +75,6 @@ def resolve_execution(requested_model_id: str, requested_thinking_level: str) ->
     return EffectiveResolution(
         provider_model_slug=model_slug,
         effort=tier,
-        resolver_policy_revision=RESOLVER_POLICY_REVISION,
+        resolver_policy_revision=resolver_policy_revision,
         process_options=options,
     )

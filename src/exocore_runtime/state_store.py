@@ -50,6 +50,7 @@ class RequestRecord:
     payload_hash: str
     requested_model_id: str
     requested_thinking_level: str
+    requested_provider_model_slug: str | None
     status: str
     owner_id: str | None
     resolution_status: str
@@ -148,6 +149,7 @@ class RuntimeStateStore:
                     payload_hash TEXT NOT NULL,
                     requested_model_id TEXT NOT NULL,
                     requested_thinking_level TEXT NOT NULL,
+                    requested_provider_model_slug TEXT,
                     status TEXT NOT NULL CHECK(status IN (
                         'prepared', 'sent', 'completed', 'failed', 'cancelled', 'indeterminate'
                     )),
@@ -192,6 +194,7 @@ class RuntimeStateStore:
                 """
             )
             self._ensure_provider_input_effect_column(connection)
+            self._ensure_requested_provider_model_slug_column(connection)
             connection.execute(
                 "INSERT OR IGNORE INTO runtime_meta(key, value) VALUES ('schema_version', ?)",
                 (str(SCHEMA_VERSION),),
@@ -371,6 +374,7 @@ class RuntimeStateStore:
         requested_model_id: str,
         requested_thinking_level: str,
         owner_id: str,
+        requested_provider_model_slug: str | None = None,
     ) -> tuple[RequestRecord, str]:
         with self._transaction() as connection:
             generation = connection.execute(
@@ -410,8 +414,9 @@ class RuntimeStateStore:
                 """
                 INSERT INTO requests(
                     binding_id, request_id, payload_hash, requested_model_id,
-                    requested_thinking_level, status, owner_id
-                ) VALUES (?, ?, ?, ?, ?, 'prepared', ?)
+                    requested_thinking_level, requested_provider_model_slug,
+                    status, owner_id
+                ) VALUES (?, ?, ?, ?, ?, ?, 'prepared', ?)
                 """,
                 (
                     binding_id,
@@ -419,6 +424,7 @@ class RuntimeStateStore:
                     payload_hash,
                     requested_model_id,
                     requested_thinking_level,
+                    requested_provider_model_slug,
                     owner_id,
                 ),
             )
@@ -830,6 +836,21 @@ class RuntimeStateStore:
             )
 
     @staticmethod
+    def _ensure_requested_provider_model_slug_column(
+        connection: sqlite3.Connection,
+    ) -> None:
+        """Add the optional requested provider slug to pre-existing v2 stores."""
+
+        columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(requests)").fetchall()
+        }
+        if "requested_provider_model_slug" not in columns:
+            connection.execute(
+                "ALTER TABLE requests ADD COLUMN requested_provider_model_slug TEXT"
+            )
+
+    @staticmethod
     def _canonical_payload(payload: dict[str, object]) -> str:
         return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
@@ -856,6 +877,7 @@ class RuntimeStateStore:
             payload_hash=row["payload_hash"],
             requested_model_id=row["requested_model_id"],
             requested_thinking_level=row["requested_thinking_level"],
+            requested_provider_model_slug=row["requested_provider_model_slug"],
             status=row["status"],
             owner_id=row["owner_id"],
             resolution_status=row["resolution_status"],

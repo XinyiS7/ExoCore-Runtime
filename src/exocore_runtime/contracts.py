@@ -290,6 +290,9 @@ class TurnRequest(StrictContract):
     user_message: str = Field(max_length=1_000_000, repr=False)
     requested_model_id: str = Field(min_length=1, max_length=200)
     requested_thinking_level: ThinkingLevel
+    requested_provider_model_slug: str | None = Field(
+        default=None, min_length=1, max_length=200
+    )
     bootstrap_context: dict[str, Any] | None = Field(default=None, repr=False)
     continuity_delta: tuple[ContinuityDeltaTurn, ...] = ()
     runtime_mcp_tools: tuple[RuntimeMcpTool, ...] = Field(
@@ -339,7 +342,7 @@ class TurnRequest(StrictContract):
 
 class ProcessExecutionOptions(StrictContract):
     provider_model_slug: str = Field(min_length=1, max_length=200)
-    effort: Literal["low", "medium", "high"]
+    effort: Literal["low", "medium", "high", "xhigh"]
     sandbox: StrictBool = True
     security_policy_revision: str = Field(min_length=1, max_length=100)
     profile_mode: Literal["generation_private"] = "generation_private"
@@ -351,7 +354,7 @@ class ProcessExecutionOptions(StrictContract):
 
 class EffectiveResolution(StrictContract):
     provider_model_slug: str
-    effort: Literal["low", "medium", "high"]
+    effort: Literal["low", "medium", "high", "xhigh"]
     resolver_policy_revision: str
     process_options: ProcessExecutionOptions
 
@@ -508,7 +511,7 @@ class RetireResult(StrictContract):
 class ProviderGeneration(StrictContract):
     provider_session_id: str = Field(repr=False)
     observed_model: str
-    observed_effort: Literal["low", "medium", "high"]
+    observed_effort: Literal["low", "medium", "high", "xhigh"]
 
 
 class ProviderEvent(StrictContract):

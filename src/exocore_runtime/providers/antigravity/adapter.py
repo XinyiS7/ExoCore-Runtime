@@ -167,8 +167,13 @@ class AntigravityAdapter:
         self,
         requested_model_id: str,
         requested_thinking_level: str,
+        provider_model_slug: str | None = None,
     ) -> EffectiveResolution:
-        return resolve_execution(requested_model_id, requested_thinking_level)
+        return resolve_execution(
+            requested_model_id,
+            requested_thinking_level,
+            provider_model_slug=provider_model_slug,
+        )
 
     def stage_generation(self, binding_id: str, spec: GenerationSpec) -> None:
         if spec.runtime_kind != "antigravity":

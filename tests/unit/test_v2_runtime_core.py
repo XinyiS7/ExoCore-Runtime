@@ -13,7 +13,11 @@ from exocore_runtime.contracts import (
     RuntimeMcpTool,
     TurnRequest,
 )
-from exocore_runtime.errors import ConflictError, StateResetRequiredError
+from exocore_runtime.errors import (
+    ConflictError,
+    ProviderAdapterError,
+    StateResetRequiredError,
+)
 from exocore_runtime.providers.antigravity.capabilities import (
     LAUNCH_ENVIRONMENT_REVISION,
     SECURITY_POLICY_REVISION,
@@ -56,6 +60,34 @@ class CapabilityPolicyTests(unittest.TestCase):
                     (resolution.provider_model_slug, resolution.effort), pair
                 )
                 self.assertEqual(resolution.resolver_policy_revision, "agy-gemini-tier-v3")
+
+    def test_provider_slug_passthrough_preserves_slug_and_derives_xhigh(self) -> None:
+        resolution = resolve_execution(
+            "ownership-name-is-not-provider-specific",
+            "off",
+            provider_model_slug="gemini-4-hydrogen-xhigh",
+        )
+        self.assertEqual(resolution.provider_model_slug, "gemini-4-hydrogen-xhigh")
+        self.assertEqual(resolution.effort, "xhigh")
+        self.assertEqual(
+            resolution.resolver_policy_revision,
+            "agy-gemini-tier-v4",
+        )
+        self.assertEqual(
+            resolution.process_options.provider_model_slug,
+            "gemini-4-hydrogen-xhigh",
+        )
+        self.assertEqual(resolution.process_options.effort, "xhigh")
+
+    def test_provider_slug_passthrough_rejects_unknown_effort_suffix(self) -> None:
+        with self.assertRaises(ProviderAdapterError) as caught:
+            resolve_execution(
+                "gemini-4-hydrogen",
+                "high",
+                provider_model_slug="gemini-4-hydrogen-ultra",
+            )
+        self.assertEqual(caught.exception.code, "unsupported_requested_execution")
+        self.assertEqual(caught.exception.status_code, 422)
 
     def test_gemini_model_names_map_by_rule(self) -> None:
         cases = {
@@ -286,12 +318,25 @@ class RuntimeV2ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sum(restarted_provider.resolver_calls.values()), 0)
         await restarted.shutdown()
 
-    async def test_request_hash_includes_requested_model_and_thinking(self) -> None:
+    async def test_request_hash_includes_requested_model_thinking_and_provider_slug(self) -> None:
         base = request(request_id=uuid4(), thinking="auto", bootstrap={"history": []})
         changed_thinking = base.model_copy(update={"requested_thinking_level": "high"})
         changed_model = base.model_copy(update={"requested_model_id": "other-model"})
-        self.assertNotEqual(self.service._request_hash(base), self.service._request_hash(changed_thinking))
-        self.assertNotEqual(self.service._request_hash(base), self.service._request_hash(changed_model))
+        changed_slug = base.model_copy(
+            update={"requested_provider_model_slug": "gemini-4-hydrogen-xhigh"}
+        )
+        self.assertNotEqual(
+            self.service._request_hash(base),
+            self.service._request_hash(changed_thinking),
+        )
+        self.assertNotEqual(
+            self.service._request_hash(base),
+            self.service._request_hash(changed_model),
+        )
+        self.assertNotEqual(
+            self.service._request_hash(base),
+            self.service._request_hash(changed_slug),
+        )
 
 
 class ProcessOptionsCompatibilityTests(unittest.TestCase):
@@ -307,6 +352,41 @@ class ProcessOptionsCompatibilityTests(unittest.TestCase):
 
 
 class FreshSchemaGateTests(unittest.TestCase):
+    def test_existing_v2_store_adds_nullable_requested_provider_slug(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "runtime.sqlite3"
+            store = RuntimeStateStore(path)
+            binding_id = str(uuid4())
+            turn = request()
+            store.ensure_generation(
+                binding_id,
+                GenerationSpec(
+                    bootstrap_fingerprint="bootstrap",
+                    system_instructions="system",
+                ),
+            )
+            store.claim_request(
+                binding_id,
+                str(turn.request_id),
+                "a" * 64,
+                turn.requested_model_id,
+                turn.requested_thinking_level,
+                "owner",
+            )
+            connection = sqlite3.connect(path)
+            try:
+                connection.execute(
+                    "ALTER TABLE requests DROP COLUMN requested_provider_model_slug"
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            reopened = RuntimeStateStore(path)
+            record = reopened.get_request(binding_id, str(turn.request_id))
+            self.assertIsNotNone(record)
+            self.assertIsNone(record.requested_provider_model_slug)
+
     def test_provider_session_alias_is_rejected_across_bindings(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             store = RuntimeStateStore(Path(temp_dir) / "runtime.sqlite3")

@@ -105,6 +105,7 @@ class DeterministicFakeAdapter:
         self,
         requested_model_id: str,
         requested_thinking_level: str,
+        provider_model_slug: str | None = None,
     ) -> EffectiveResolution:
         self.resolver_calls[(requested_model_id, requested_thinking_level)] += 1
         effort = "low" if requested_thinking_level == "low" else "high"

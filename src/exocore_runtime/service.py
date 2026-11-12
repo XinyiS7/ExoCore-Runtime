@@ -253,6 +253,7 @@ class RuntimeService:
                 request.requested_model_id,
                 request.requested_thinking_level,
                 self.instance_id,
+                requested_provider_model_slug=request.requested_provider_model_slug,
             )
         if disposition == "replay":
             for event in self.journal.replay(binding, request_id):
@@ -304,6 +305,7 @@ class RuntimeService:
                 resolution = provider.resolve_execution(
                     current.requested_model_id,
                     current.requested_thinking_level,
+                    provider_model_slug=current.requested_provider_model_slug,
                 )
                 resolution = resolution.model_copy(
                     update={

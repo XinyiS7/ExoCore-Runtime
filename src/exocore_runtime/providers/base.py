@@ -68,6 +68,7 @@ class RuntimeProviderAdapter(Protocol):
         self,
         requested_model_id: str,
         requested_thinking_level: str,
+        provider_model_slug: str | None = None,
     ) -> EffectiveResolution: ...
 
     def stage_generation(self, binding_id: str, spec: GenerationSpec) -> None: ...

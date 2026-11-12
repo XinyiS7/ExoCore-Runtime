@@ -81,12 +81,21 @@ class V2AntigravityRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.services.append(service)
         return service, adapter
 
-    def turn(self, *, thinking="auto", model="gemini-3.1-pro-preview", bootstrap=None, request_id=None):
+    def turn(
+        self,
+        *,
+        thinking="auto",
+        model="gemini-3.1-pro-preview",
+        provider_model_slug=None,
+        bootstrap=None,
+        request_id=None,
+    ):
         return TurnRequest(
             request_id=request_id or uuid4(),
             user_message="CURRENT-USER-CANARY",
             requested_model_id=model,
             requested_thinking_level=thinking,
+            requested_provider_model_slug=provider_model_slug,
             runtime_mcp_tools=({"name": "memory_search", "eager": True, "max_call_seconds": None},),
             bootstrap_context=bootstrap,
             ephemeral_current="EPHEMERAL-CANARY",
@@ -111,6 +120,47 @@ class V2AntigravityRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(argv[argv.index("--model") + 1], "gemini-3.1-pro-medium")
         # The tier travels in the slug alone; AGY rejects ``--effort`` for some
         # tiers (``gemini-4-argon-low``), so no effort flag is ever sent.
+        self.assertNotIn("--effort", argv)
+
+    async def test_requested_provider_slug_survives_restart_and_runs_verbatim(self) -> None:
+        service, _ = self.build_service()
+        await service.ensure_generation(self.binding_id, self.spec)
+        turn = self.turn(
+            thinking="high",
+            model="gemini-4-hydrogen",
+            provider_model_slug="gemini-4-hydrogen-xhigh",
+            bootstrap={"history": []},
+        )
+        service.store.claim_request(
+            str(self.binding_id),
+            str(turn.request_id),
+            service._request_hash(turn),
+            turn.requested_model_id,
+            turn.requested_thinking_level,
+            "dead-owner",
+            requested_provider_model_slug=turn.requested_provider_model_slug,
+        )
+
+        restarted, _ = self.build_service()
+        events = await collect(restarted, self.binding_id, turn)
+
+        resolved = next(
+            event for event in events if event.event_type == "execution_resolved"
+        )
+        self.assertEqual(
+            resolved.payload["effective_provider_model_slug"],
+            "gemini-4-hydrogen-xhigh",
+        )
+        self.assertEqual(resolved.payload["effective_effort"], "xhigh")
+        self.assertEqual(
+            resolved.payload["resolver_policy_revision"],
+            "agy-gemini-tier-v4",
+        )
+        argv = next(item for item in self.evidence() if item["kind"] == "spawn")["argv"]
+        self.assertEqual(
+            argv[argv.index("--model") + 1],
+            "gemini-4-hydrogen-xhigh",
+        )
         self.assertNotIn("--effort", argv)
 
     async def test_slug_missing_from_agy_models_fails_closed_before_spawn(self) -> None:

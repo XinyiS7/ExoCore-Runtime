@@ -59,6 +59,7 @@ class BootstrapBoundaryAdapter:
         self,
         requested_model_id: str,
         requested_thinking_level: str,
+        provider_model_slug: str | None = None,
     ) -> EffectiveResolution:
         return store_resolution()
 
