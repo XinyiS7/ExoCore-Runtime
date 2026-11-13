@@ -16,6 +16,9 @@
   spawn 不再传 `--effort`（`gemini-4-argon-low` 会硬拒该 flag）。
 - **新模型接入顺序**：ExoCore `provider_profiles.py` → `EndpointProvisioningService.update(endpoint)`
   触发 `apply_profile` → 重启 Runtime 刷新目录。
+- **GitHub CLI 凭据桥接**：Runtime 启动时从宿主 `gh auth token` 读取一次现有登录态，
+  再以 `GH_TOKEN` 注入隔离后的 AGY 子进程；不得持久化或记录 token。宿主未登录时只告警，
+  不阻断 provider 启动；登录态变化后需重启 Runtime。
 """
 
 from __future__ import annotations
@@ -95,11 +98,49 @@ def _tool_step(parsed: object) -> dict | None:
     return step
 
 
-def _log_init_stderr(line: bytes | None) -> None:
-    """Keep a bounded local copy of the init stderr line for diagnosis only."""
+def _log_init_stderr(
+    line: bytes | None,
+    secret_values: tuple[str, ...] = (),
+) -> None:
+    """Keep a bounded, credential-redacted init stderr excerpt for diagnosis."""
 
     excerpt = (line or b"").decode("utf-8", errors="replace").strip()
+    for secret in secret_values:
+        if secret:
+            excerpt = excerpt.replace(secret, "[REDACTED]")
     _LOGGER.warning("[agy-init] stderr: %s", excerpt[:_STDERR_LOG_LIMIT])
+
+
+def _resolve_github_token() -> str | None:
+    """Read the host GitHub CLI credential once, before AGY profile isolation."""
+
+    executable = shutil.which("gh")
+    if executable is None:
+        _LOGGER.warning("GitHub CLI unavailable; AGY children will not receive GH_TOKEN")
+        return None
+    try:
+        completed = subprocess.run(
+            [executable, "auth", "token", "--hostname", "github.com"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=5,
+            check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        _LOGGER.warning(
+            "GitHub CLI token lookup failed (%s); AGY children will not receive GH_TOKEN",
+            type(exc).__name__,
+        )
+        return None
+    token_lines = completed.stdout.strip().splitlines()
+    if completed.returncode != 0 or len(token_lines) != 1 or not token_lines[0]:
+        _LOGGER.warning(
+            "GitHub CLI is not authenticated; AGY children will not receive GH_TOKEN"
+        )
+        return None
+    return token_lines[0]
 
 
 class _JobObjectBasicLimitInformation(ctypes.Structure):
@@ -149,13 +190,18 @@ class AgyProcessConfig:
     require_official_executable: bool = True
     environment_overrides: Mapping[str, str] = field(default_factory=dict, repr=False)
     diagnostic_secret_values: tuple[str, ...] = field(default=(), repr=False)
+    github_token: str | None = field(default=None, repr=False)
 
     @classmethod
     def official(cls, executable: str | None = None, **kwargs) -> "AgyProcessConfig":
         resolved = shutil.which(executable or "agy")
         if resolved is None:
             raise ProviderAdapterError("agy_executable_missing", fatal_generation=True)
-        return cls(command_prefix=(str(Path(resolved).resolve()),), **kwargs)
+        return cls(
+            command_prefix=(str(Path(resolved).resolve()),),
+            github_token=_resolve_github_token(),
+            **kwargs,
+        )
 
 
 @dataclass(frozen=True)
@@ -281,7 +327,10 @@ class AgyProcessSupervisor:
             session.layout, request_id,
             {**os.environ, **self.config.environment_overrides},
             provider_session_id=session.provider_session_id,
-            secret_values=self.config.diagnostic_secret_values,
+            secret_values=(
+                *self.config.diagnostic_secret_values,
+                self.config.github_token or "",
+            ),
         )
         pending_captures: dict[int, dict] = {}
         try:
@@ -836,7 +885,10 @@ class AgyProcessSupervisor:
                 "agy_init_timeout",
             )
             if tag == "stderr":
-                _log_init_stderr(line)
+                _log_init_stderr(
+                    line,
+                    (*self.config.diagnostic_secret_values, self.config.github_token or ""),
+                )
                 raise ProviderAdapterError("agy_init_stderr", fatal_generation=True)
             if line is None:
                 raise ProviderAdapterError("agy_init_eof", fatal_generation=True)
@@ -888,7 +940,10 @@ class AgyProcessSupervisor:
             if tag == "stderr" and line is None:
                 continue
             if tag == "stderr":
-                _log_init_stderr(line)
+                _log_init_stderr(
+                    line,
+                    (*self.config.diagnostic_secret_values, self.config.github_token or ""),
+                )
                 raise ProviderAdapterError("agy_init_stderr", fatal_generation=True)
             if line is None:
                 raise ProviderAdapterError("agy_exit_after_init", fatal_generation=True)
@@ -1190,6 +1245,8 @@ class AgyProcessSupervisor:
             environment["XDG_DATA_HOME"] = str(data)
             environment["TEMP"] = str(temporary)
             environment["TMP"] = str(temporary)
+        if self.config.github_token:
+            environment["GH_TOKEN"] = self.config.github_token
         return environment
 
     @staticmethod
