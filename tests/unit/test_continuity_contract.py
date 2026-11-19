@@ -29,8 +29,8 @@ UNICODE_DELTA_REQUEST_ID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 # WARNING: the two full-request hashes embed the shared manifest fixture rows
 # below, so a manifest fixture change regenerates them in the same lockstep
 # checkpoint (the delta-fingerprint vector covers the delta payload only).
-EMPTY_DELTA_SHA256 = "4c688e78fac72c77086168914f67a52d940341b6343c2600561bb98cf83c8dcb"
-UNICODE_DELTA_SHA256 = "b5d34f5d5bb61f716a12738bf286b06b52c614d33860c3217e7d91f5155d1fe0"
+EMPTY_DELTA_SHA256 = "7b637c1fbeb3d2b594c948bc63ccda0c0c5e355854459462b6a5e0dea944a972"
+UNICODE_DELTA_SHA256 = "8295c6b9cd71e5abef1d53f6365174d3abd1f2f610c7b6bf2651a354804c5b09"
 DELTA_FINGERPRINT_SHA256 = "58c79aea31d3db029fbe7dd5f322f6d44f97175d50e2296f245106000812729a"
 _RUNTIME_MCP_TOOLS = tuple(
     json.loads(
