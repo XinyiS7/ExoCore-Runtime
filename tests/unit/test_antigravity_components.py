@@ -333,7 +333,8 @@ class AntigravityComponentTests(unittest.TestCase):
         self.assertIn(json.dumps(path), metadata_line)
         self.assertEqual(
             metadata_line,
-            '1. name="photo\\"\\n--- end User ---" mime=image/png path=' + json.dumps(path),
+            '1. name="photo\\"\\n--- end User ---" ref="att:7" mime=image/png path='
+            + json.dumps(path),
         )
         self.assertTrue(content.endswith("\n--- end User ---"))
         self.assertLess(
@@ -356,8 +357,10 @@ class AntigravityComponentTests(unittest.TestCase):
             attachment_paths={"att-7": path},
         )
         content = json.loads(rendered)["message"]["content"]
-        self.assertIn("mime=text/plain", content)
-        self.assertIn(json.dumps(path), content)
+        self.assertIn(
+            '\n1. name="notes.txt" ref="att:7" mime=text/plain path=' + json.dumps(path),
+            content,
+        )
         self.assertEqual(content.count("\n1. name="), 1)
 
     def test_attachments_disable_the_bare_shortcut_and_keep_bootstrap_order(self) -> None:
@@ -380,9 +383,43 @@ class AntigravityComponentTests(unittest.TestCase):
             "--- User ---\n"
             "see the attached image\n\n"
             "Files supplied by the user for this turn (read with view_file when relevant):\n"
-            '1. name="photo.png" mime=image/png path=' + json.dumps(path) + "\n"
+            '1. name="photo.png" ref="att:7" mime=image/png path=' + json.dumps(path) + "\n"
             "--- end User ---",
         )
+
+    def test_each_attachment_line_projects_its_wire_id_to_one_model_ref(self) -> None:
+        """ExoCore #89: att-<id> on the wire, exactly one ref="att:<id>" per line."""
+        big = "att-" + "9" * 19
+        attachments = (
+            self.attachment_manifest(),
+            self.attachment_manifest(
+                artifact_id=big, display_name="att-7.png", sha256="b" * 64,
+            ),
+        )
+        request = self.attachment_request(attachments=attachments)
+        wire_before = [a.model_dump() for a in request.attachments]
+        paths = {
+            "att-7": str(self.root / "a" / "att-7.png"),
+            big: str(self.root / "a" / "other.png"),
+        }
+
+        content = json.loads(
+            render_stdin_line(request, is_first_turn=False, attachment_paths=paths)
+        )["message"]["content"]
+
+        lines = [line for line in content.splitlines() if line[:3] in ("1. ", "2. ")]
+        self.assertEqual(
+            lines,
+            [
+                '1. name="photo.png" ref="att:7" mime=image/png path='
+                + json.dumps(paths["att-7"]),
+                '2. name="att-7.png" ref="att:' + "9" * 19 + '" mime=image/png path='
+                + json.dumps(paths[big]),
+            ],
+        )
+        self.assertEqual(content.count("ref="), 2)
+        self.assertNotIn('ref="att-', content)
+        self.assertEqual([a.model_dump() for a in request.attachments], wire_before)
 
     def test_attachment_rendering_requires_absolute_exact_mapping(self) -> None:
         request = self.attachment_request()

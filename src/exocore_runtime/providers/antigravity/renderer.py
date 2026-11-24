@@ -324,6 +324,19 @@ def _render_delta_sections(
     return [_turn_section(turn.role, turn.content, turn.timestamp) for turn in delta]
 
 
+_WIRE_ATTACHMENT_PREFIX = "att-"
+_MODEL_ATTACHMENT_PREFIX = "att:"
+
+
+def _model_attachment_ref(artifact_id: str) -> str:
+    """Project the validated wire id ``att-<id>`` to the model-visible ``att:<id>``.
+
+    Presentation only (ExoCore #89): ExoCore's ``add_to_collection`` resolves and
+    authorizes the ref; Runtime never derives it from paths or filenames.
+    """
+    return _MODEL_ATTACHMENT_PREFIX + artifact_id.removeprefix(_WIRE_ATTACHMENT_PREFIX)
+
+
 def _current_user_content(
     request: TurnRequest,
     attachment_paths: Mapping[str, str] | None,
@@ -345,6 +358,7 @@ def _current_user_content(
             raise ValueError("attachment path must be absolute")
         lines.append(
             f"{index}. name={json.dumps(attachment.display_name, ensure_ascii=False)} "
+            f"ref={json.dumps(_model_attachment_ref(attachment.artifact_id))} "
             f"mime={attachment.mime_type} "
             f"path={json.dumps(path, ensure_ascii=False)}"
         )
