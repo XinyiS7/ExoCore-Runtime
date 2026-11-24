@@ -483,6 +483,63 @@ class V2AntigravityRuntimeTests(unittest.IsolatedAsyncioTestCase):
             "error": {"code": "429", "status": "RESOURCE_EXHAUSTED"},
         }])
 
+    def spawn_count(self):
+        return sum(item["kind"] == "spawn" for item in self.evidence())
+
+    async def test_synthetic_recovered_answer_error_keeps_process_and_session(self):
+        service, _ = self.build_service("answer_error_recovered_synthetic")
+        await service.ensure_generation(self.binding_id, self.spec)
+        request = self.turn(bootstrap={"history": []})
+        events = await collect(service, self.binding_id, request)
+        self.assertEqual(
+            [event.payload["text"] for event in events if event.event_type == "content_delta"],
+            ["partial-answer", "fixture-answer"],
+        )
+        self.assertEqual(events[-1].event_type, "done")
+        self.assertEqual(
+            [event for event in events if event.event_type == "lifecycle"
+             and event.payload.get("state") == "ERROR"],
+            [],
+        )
+        evidence = json.loads(
+            (self.root / "diagnostics" / "antigravity" / str(self.binding_id)
+             / f"{request.request_id}.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(evidence["error_code"], "agy_info")
+        self.assertEqual(
+            evidence["notes"],
+            [
+                {"step_index": 12, "step_type": "agent_response", "state": "ERROR",
+                 "error": None, "answer_chars": len("partial-answer")},
+                {"step_index": 13, "step_type": "error_message", "state": "DONE",
+                 "error": None},
+            ],
+        )
+        spawned = self.spawn_count()
+        again = await collect(service, self.binding_id, self.turn())
+        self.assertEqual(again[-1].event_type, "done")
+        self.assertEqual(self.spawn_count(), spawned)
+
+    async def test_synthetic_exhausted_answer_error_fails_and_keeps_the_process(self):
+        evidence = await self.failure_evidence(
+            "answer_error_exhausted_synthetic", "agy_result_error"
+        )
+        self.assertEqual(
+            evidence["notes"][0]["answer_chars"], len("partial-answer")
+        )
+        service = self.services[-1]
+        spawned = self.spawn_count()
+        again = await collect(service, self.binding_id, self.turn())
+        self.assertEqual(again[-1].terminal_status, "failed")
+        self.assertEqual(self.spawn_count(), spawned)
+
+    async def test_synthetic_eof_after_answer_error_stays_indeterminate(self):
+        service, _ = self.build_service("answer_error_eof_synthetic")
+        await service.ensure_generation(self.binding_id, self.spec)
+        events = await collect(service, self.binding_id, self.turn(bootstrap={"history": []}))
+        self.assertEqual(events[-1].payload, {"code": "agy_unexpected_eof"})
+        self.assertEqual(events[-1].terminal_status, "indeterminate")
+
     async def test_unmodeled_step_carrying_unclassified_text_still_stops(self):
         evidence = await self.failure_evidence("unknown_text_step", "agy_unknown_step")
         step = json.loads(evidence["last_record"]["raw_text"])["step_update"]

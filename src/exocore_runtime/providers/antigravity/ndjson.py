@@ -32,6 +32,7 @@ _OBSERVED_STEP_STATES = {
     "tool": frozenset({"ACTIVE", "DONE", "ERROR"}),
 }
 _UNRECOGNIZED_LIMIT = 20
+_NOTE_STATE_LIMIT = 40
 _USAGE_KEYS = (
     "input_tokens",
     "output_tokens",
@@ -191,13 +192,19 @@ class AgyTurnNormalizer:
         self.result_seen = False
         # A result frame may replay an error the provider already reported in an
         # earlier turn (observed: an old 429 quota message carried across
-        # models). Only a turn that produced answer text proves the request ran,
-        # so an uncorroborated error then cannot describe this turn.
-        self.produced_answer = False
+        # models). Only a turn whose latest answer attempt produced text and did
+        # not fail proves the request ran, so an uncorroborated error then
+        # cannot describe this turn. Only agent_response/ERROR clears this: a
+        # thought or tool ERROR says nothing about the answer. Any later
+        # content_delta (the provider's own retry) sets it again.
+        self.latest_answer_attempt_viable = False
         self.ignored_result_error: str | None = None
-        # Steps we do not model are kept as traceable notes instead of ending
-        # the session: AGY reports ordinary failures (and keeps retrying them)
-        # through its own step types, and stopping there cancels its recovery.
+        self._answer_chars = 0
+        # Steps and step states we do not model are kept as traceable notes
+        # instead of ending the session: a step describes one attempt, and AGY
+        # reports ordinary failures (and keeps retrying them) through steps, so
+        # stopping there cancels its recovery. Only the result frame declares
+        # the provider's own terminal.
         self.unrecognized_steps: list[dict] = []
         self._step_usage_by_index: dict[int, dict[str, int]] = {}
 
@@ -236,16 +243,11 @@ class AgyTurnNormalizer:
             # classified, so refusing is safer than silently dropping it.
             if any(key in step for key in ("text_delta", "tool_info", "tool_name", "usage")):
                 raise ProviderAdapterError("agy_unknown_step", terminal_status="indeterminate")
-            if len(self.unrecognized_steps) < _UNRECOGNIZED_LIMIT:
-                self.unrecognized_steps.append({
-                    "step_index": step_index,
-                    "step_type": step_type,
-                    "state": state,
-                    "error": _note_error(step.get("error")),
-                })
+            self._note_step(step)
             return []
-        if state not in allowed_states:
-            raise ProviderAdapterError("agy_unknown_step_state", terminal_status="indeterminate")
+        # An unmodeled state of a modeled type is noted and never projected as
+        # lifecycle; its body is still validated, and text is still streamed.
+        state_modeled = state in allowed_states
         lifecycle = {
             "step_index": step_index,
             "step_type": step_type,
@@ -259,22 +261,36 @@ class AgyTurnNormalizer:
                 self._step_usage_by_index[step_index].update(projected)
         if step_type in _TEXT_STEP_TYPES:
             text = step.get("text_delta")
-            if text is None or text == "":
-                return [ProviderEvent(event_type="lifecycle", payload=lifecycle)]
-            if not isinstance(text, str):
+            if text is not None and not isinstance(text, str):
                 raise ProviderAdapterError("agy_malformed_text_delta", terminal_status="indeterminate")
-            event_type = _TEXT_STEP_TYPES[step_type]
-            if event_type == "content_delta":
-                self.produced_answer = True
-            return [ProviderEvent(event_type=event_type, payload={"text": text})]
+            events = []
+            if text:
+                event_type = _TEXT_STEP_TYPES[step_type]
+                if event_type == "content_delta":
+                    self.latest_answer_attempt_viable = True
+                    self._answer_chars += len(text)
+                events.append(ProviderEvent(event_type=event_type, payload={"text": text}))
+            elif state_modeled:
+                events.append(ProviderEvent(event_type="lifecycle", payload=lifecycle))
+            if step_type == "agent_response" and state == "ERROR":
+                self._fail_answer_attempt(step)
+            elif not state_modeled:
+                self._note_step(step)
+            return events
         if step_type in _LIFECYCLE_STEP_TYPES:
+            if not state_modeled:
+                self._note_step(step)
+                return []
             return [ProviderEvent(event_type="lifecycle", payload=lifecycle)]
         if step_type == "unknown":
             forbidden_body = any(
                 key in step for key in ("text_delta", "tool_info", "tool_name", "usage")
             )
-            if state != "DONE" or forbidden_body:
+            if forbidden_body:
                 raise ProviderAdapterError("agy_unknown_step", terminal_status="indeterminate")
+            if not state_modeled:
+                self._note_step(step)
+                return []
             return [ProviderEvent(event_type="lifecycle", payload=lifecycle)]
         if step_type == "tool":
             # Bounded lifecycle only: the projected tool name is a short
@@ -289,6 +305,9 @@ class AgyTurnNormalizer:
             raw_tool_name = step.get("tool_name")
             if not isinstance(raw_tool_name, str) or not (1 <= len(raw_tool_name) <= 100):
                 raise ProviderAdapterError("agy_malformed_step", terminal_status="indeterminate")
+            if not state_modeled:
+                self._note_step(step)
+                return []
             lifecycle["category"] = "provider_tool"
             lifecycle["tool_name"] = _project_display_tool_name(
                 raw_tool_name,
@@ -304,6 +323,35 @@ class AgyTurnNormalizer:
                 lifecycle["outcome"] = "tool_completed"
             return [ProviderEvent(event_type="lifecycle", payload=lifecycle)]
         raise ProviderAdapterError("agy_unknown_step", terminal_status="indeterminate")
+
+    def _note_step(self, step: dict[str, Any], **facts: int) -> None:
+        if len(self.unrecognized_steps) >= _UNRECOGNIZED_LIMIT:
+            return
+        self.unrecognized_steps.append({
+            "step_index": step["step_index"],
+            "step_type": step["step_type"],
+            "state": step["state"][:_NOTE_STATE_LIMIT],
+            "error": _note_error(step.get("error")),
+            **facts,
+        })
+
+    def _fail_answer_attempt(self, step: dict[str, Any]) -> None:
+        """Record one failed answer attempt without deciding the turn.
+
+        The count of answer characters streamed so far marks where the attempt
+        broke off; with the journal it shows whether a retry continued or
+        restarted the answer. Body text never enters the note or the log.
+        """
+
+        self.latest_answer_attempt_viable = False
+        self._note_step(step, answer_chars=self._answer_chars)
+        _LOGGER.warning(
+            "[agy-attempt] answer attempt failed: step_index=%d step_type=%s state=%s answer_chars=%d",
+            step["step_index"],
+            step["step_type"],
+            step["state"],
+            self._answer_chars,
+        )
 
     def _consume_result(self, result: object) -> list[ProviderEvent]:
         if not isinstance(result, dict):
@@ -332,9 +380,9 @@ class AgyTurnNormalizer:
                     payload={"finish_reason": "stop"},
                 )
             )
-        elif self.produced_answer:
+        elif self.latest_answer_attempt_viable:
             # Keep the raw error for private diagnosis, but do not fail a turn
-            # whose answer already arrived: no error step was raised for it.
+            # whose answer already arrived: no answer error step followed it.
             raw_error = result.get("error")
             self.ignored_result_error = raw_error if isinstance(raw_error, str) else ""
             _LOGGER.warning(

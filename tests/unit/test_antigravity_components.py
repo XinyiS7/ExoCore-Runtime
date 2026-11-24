@@ -652,7 +652,7 @@ class AntigravityComponentTests(unittest.TestCase):
             )
         self.assertEqual(caught.exception.code, "agy_event_after_result")
 
-    def test_ndjson_rejects_unknown_states_and_projects_only_bounded_tool_metadata(self) -> None:
+    def test_ndjson_withholds_unknown_states_and_projects_only_bounded_tool_metadata(self) -> None:
         conversation_id = "provider-session-safe-projection"
         for step_type, state in (
             ("system_message", "PRIVATE-STATE-CANARY"),
@@ -660,19 +660,20 @@ class AntigravityComponentTests(unittest.TestCase):
         ):
             with self.subTest(step_type=step_type, state=state):
                 normalizer = AgyTurnNormalizer(conversation_id)
-                with self.assertRaises(ProviderAdapterError) as caught:
-                    normalizer.consume(
-                        {
-                            "event": "step_update",
-                            "step_update": {
-                                "conversation_id": conversation_id,
-                                "step_index": 1,
-                                "step_type": step_type,
-                                "state": state,
-                            },
-                        }
-                    )
-                self.assertEqual(caught.exception.code, "agy_unknown_step_state")
+                # An unmodeled state is an attempt fact, not a turn terminal:
+                # it stays in the private notes and never reaches an event.
+                events = normalizer.consume(
+                    {
+                        "event": "step_update",
+                        "step_update": {
+                            "conversation_id": conversation_id,
+                            "step_index": 1,
+                            "step_type": step_type,
+                            "state": state,
+                        },
+                    }
+                )
+                self.assertEqual(events, [])
         normalizer = AgyTurnNormalizer(conversation_id)
         event = normalizer.consume(
             {

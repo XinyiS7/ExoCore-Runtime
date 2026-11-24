@@ -654,11 +654,8 @@ class ToolLifecycleBoundaryTests(unittest.TestCase):
             self.normalize(step)
         self.assertEqual(caught.exception.code, "agy_malformed_step")
 
-    def test_unobserved_tool_state_is_fail_closed(self) -> None:
-        with self.assertRaises(ProviderAdapterError) as caught:
-            self.normalize(tool_step(state="CANCELLED"))
-        self.assertEqual(caught.exception.code, "agy_unknown_step_state")
-        self.assertEqual(caught.exception.terminal_status, "indeterminate")
+    def test_unobserved_tool_state_is_withheld_without_ending_the_turn(self) -> None:
+        self.assertEqual(self.normalize(tool_step(state="CANCELLED")), [])
 
     def test_tool_info_bodies_never_reach_projection(self) -> None:
         normalizer = AgyTurnNormalizer(_SYNTHETIC_CONVERSATION)

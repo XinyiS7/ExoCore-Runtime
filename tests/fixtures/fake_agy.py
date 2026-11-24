@@ -113,6 +113,13 @@ def quota_response():
 # withdrawal is model-wide, so it covers every tier slug of that model.
 WITHDRAWN_MODEL = "gemini-3.1-pro"
 WITHDRAWAL_SCENARIOS = {"model_withdrawn", "model_withdrawn_refresh_fails"}
+ANSWER_ERROR_SCENARIOS = {
+    "answer_error_recovered_synthetic",
+    "answer_error_exhausted_synthetic",
+    "answer_error_eof_synthetic",
+}
+NO_ANSWER_SCENARIOS = {"result_error_no_text", "answer_error_exhausted_synthetic"}
+RESULT_ERROR_SCENARIOS = NO_ANSWER_SCENARIOS | {"result_error"}
 INIT_STDERR_SCENARIOS = WITHDRAWAL_SCENARIOS | {"init_stderr_model_listed"}
 
 
@@ -334,6 +341,27 @@ def main():
                 "step_type": "error_message", "state": "DONE",
                 "error": {"status": "RESOURCE_EXHAUSTED", "code": 429},
             }})
+        if scenario in ANSWER_ERROR_SCENARIOS:
+            # The ERROR frame is the real capture; everything after it is
+            # synthetic, because no post-ERROR output was ever captured.
+            emit({"event": "step_update", "step_update": {
+                "conversation_id": conversation_id, "step_index": turn_number * 10 + 2,
+                "step_type": "agent_response", "state": "ACTIVE",
+                "text_delta": "partial-answer",
+            }})
+            frame = json.loads(
+                Path(__file__).with_name("agy_agent_response_error.jsonl")
+                .read_text(encoding="utf-8").splitlines()[0]
+            )
+            frame["step_update"]["conversation_id"] = conversation_id
+            frame["step_update"]["step_index"] = turn_number * 10 + 2
+            emit(frame)
+            emit({"event": "step_update", "step_update": {
+                "conversation_id": conversation_id, "step_index": turn_number * 10 + 3,
+                "step_type": "error_message", "state": "DONE",
+            }})
+            if scenario == "answer_error_eof_synthetic":
+                return 11
         if scenario == "unknown_text_step":
             emit({"event": "step_update", "step_update": {
                 "conversation_id": conversation_id, "step_index": turn_number * 10 + 3,
@@ -618,7 +646,7 @@ def main():
             "cache_read_tokens": 50 if turn_number > 1 else 0,
             "total_tokens": 110,
         }
-        if scenario != "result_error_no_text":
+        if scenario not in NO_ANSWER_SCENARIOS:
             emit(
                 {
                     "event": "step_update",
@@ -636,11 +664,11 @@ def main():
             "event": "result",
             "result": {
                 "conversation_id": conversation_id,
-                "status": "ERROR" if scenario in {"result_error", "result_error_no_text"} else "SUCCESS",
+                "status": "ERROR" if scenario in RESULT_ERROR_SCENARIOS else "SUCCESS",
                 "response": "fixture-answer",
                 "error": (
                     "Individual quota reached. Resets in 21h14m24s."
-                    if scenario in {"result_error", "result_error_no_text"} else None
+                    if scenario in RESULT_ERROR_SCENARIOS else None
                 ),
                 "num_turns": turn_number,
                 "usage": {
